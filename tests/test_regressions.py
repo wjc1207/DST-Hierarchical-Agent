@@ -22,6 +22,8 @@ def grass(guid: int, distance: float, pickable: bool) -> dict:
         "dz": 0,
         "tags": ["pickable"] if pickable else [],
         "pickable": pickable,
+        "collect_path": {"status": "ready", "reason": "direct", "distance": distance,
+                         "waypoint": {"x": distance, "z": 0}},
     }
 
 
@@ -51,6 +53,13 @@ def lit_campfire(guid: int = 40, distance: float = 3.0) -> dict:
 
 
 def state(nearby: list[dict], cutgrass: int = 0) -> dict:
+    nearby = [
+        {**entity, "collect_path": {"status": "ready", "reason": "direct",
+             "distance": entity.get("distance", 0), "waypoint": {
+                 "x": entity.get("dx", entity.get("distance", 0)), "z": entity.get("dz", 0)}}}
+        if controller.collect_target_available(entity) and "collect_path" not in entity else entity
+        for entity in nearby
+    ]
     items = []
     if cutgrass:
         items.append({"prefab": "cutgrass", "count": cutgrass})
@@ -232,7 +241,8 @@ class CandidateTests(unittest.TestCase):
         body = json.loads(request.data)
         forwarded = json.loads(body["state"])
         self.assertEqual(set(body["questions"]["next_action"]["criteria"]), set(criteria))
-        self.assertIn("bounded action", body["questions"]["next_action"]["instructions"])
+        self.assertIn("semantic action", body["questions"]["next_action"]["instructions"])
+        self.assertIn("until a meaningful event", body["questions"]["next_action"]["instructions"])
         self.assertIn("decision_guidance", forwarded)
         self.assertNotIn("first_day_survival_knowledge", forwarded)
 
@@ -304,7 +314,7 @@ class CandidateTests(unittest.TestCase):
     def test_night_campfire_requires_torch_for_travel_and_collection(self) -> None:
         observed = state([lit_campfire(), grass(10, 4.0, True)])
         observed["world"]["phase"] = "night"
-        observed["navigation"]["road"] = {
+        observed["navigation"]["search"] = {
             "status": "ready",
             "target": {"x": 4.0, "z": 0.0, "distance": 4.0},
             "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
@@ -332,48 +342,6 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(dispatch["explore_current_region"]["target_z"], 4.0)
         self.assertEqual(dispatch["explore_current_region"]["frontier_z"], 12.0)
 
-    def test_observed_road_exposes_other_region_exploration(self) -> None:
-        observed = state([])
-        observed["navigation"]["current_region"] = "Forest:1"
-        observed["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 4.0, "z": 0.0, "distance": 4.0},
-            "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
-        }
-
-        criteria, dispatch = jev_agent.build_candidates(observed)
-
-        self.assertIn("explore_current_region", criteria)
-        self.assertIn("explore_other_region", criteria)
-        self.assertIn("Forest:1", criteria["explore_other_region"])
-        self.assertEqual(dispatch["explore_other_region"]["navigation_mode"], "road")
-
-    def test_road_choice_dispatches_bounded_follow_action(self) -> None:
-        observed = state([])
-        observed["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 2.0, "z": 0.0, "distance": 2.0},
-            "leg": {"x": 2.0, "z": 0.0, "distance": 2.0},
-        }
-        _, dispatch = jev_agent.build_candidates(observed)
-        with patch.object(controller, "follow_road", return_value=True) as follow:
-            moved = jev_agent.execute_action(
-                dispatch["explore_other_region"], Path("unused.log"), move_seconds=1.2,
-            )
-
-        self.assertTrue(moved)
-        follow.assert_called_once_with(Path("unused.log"), 2.0, 0.0, 2.0, 1.2)
-
-    def test_missing_road_leg_does_not_expose_other_region(self) -> None:
-        observed = state([])
-        observed["navigation"]["road"] = {
-            "status": "no_road", "target": None, "leg": None
-        }
-
-        criteria, _ = jev_agent.build_candidates(observed)
-
-        self.assertNotIn("explore_other_region", criteria)
-
     def test_area_graph_exposes_neighbor_and_recorded_return(self) -> None:
         observed = state([])
         observed["navigation"]["graph"] = {
@@ -395,16 +363,15 @@ class CandidateTests(unittest.TestCase):
         }
         criteria, dispatch = jev_agent.build_candidates(observed)
 
-        self.assertIn("explore_adjacent_1", criteria)
-        self.assertIn("rock1", criteria["explore_adjacent_1"])
-        self.assertIn("may yield gold", criteria["explore_adjacent_1"])
-        self.assertEqual(dispatch["explore_adjacent_1"]["target_node_id"], "B|rocky")
-        self.assertIn("return_previous_region", criteria)
-        self.assertEqual(dispatch["return_previous_region"]["target_node_id"], "C|grassland")
-        self.assertEqual(jev_agent.default_execution_threshold("explore_adjacent_1"), 0.15)
-        self.assertEqual(jev_agent.default_execution_threshold("return_previous_region"), 0.15)
+        self.assertIn("travel_region_1", criteria)
+        self.assertIn("rock1", criteria["travel_region_1"])
+        self.assertIn("may yield gold", criteria["travel_region_1"])
+        self.assertEqual(dispatch["travel_region_1"]["target_node_id"], "B|rocky")
+        self.assertNotIn("return_previous_region", criteria)
+        self.assertEqual(dispatch["travel_region_2"]["target_node_id"], "C|grassland")
+        self.assertEqual(jev_agent.default_execution_threshold("travel_region_1"), 0.15)
 
-    def test_graph_choice_dispatches_one_verified_leg(self) -> None:
+    def test_graph_choice_dispatches_event_driven_intent(self) -> None:
         observed = state([])
         observed["navigation"]["graph"] = {
             "adjacent": [{
@@ -414,13 +381,13 @@ class CandidateTests(unittest.TestCase):
             }],
         }
         _, dispatch = jev_agent.build_candidates(observed)
-        with patch.object(controller, "explore_leg", return_value=True) as leg:
+        with patch.object(controller, "follow_exploration", return_value=True) as follow:
             moved = jev_agent.execute_action(
-                dispatch["explore_adjacent_1"], Path("unused.log"), move_seconds=1.2,
+                dispatch["travel_region_1"], Path("unused.log"), move_seconds=1.2,
             )
         self.assertTrue(moved)
-        self.assertEqual(leg.call_args.kwargs["navigation_mode"], "graph")
-        self.assertEqual(leg.call_args.kwargs["target_node_id"], "B|rocky")
+        self.assertEqual(follow.call_args.args[1]["navigation_mode"], "graph")
+        self.assertEqual(follow.call_args.args[1]["target_node_id"], "B|rocky")
 
     def test_day_and_dusk_torch_options_depend_on_equipment(self) -> None:
         for phase in ("day", "dusk"):
@@ -878,124 +845,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual([call.kwargs["preferred_guid"] for call in pickup.call_args_list],
                          [41, 42])
 
-    def test_follow_road_combines_successive_waypoints_within_distance_budget(self) -> None:
-        def road_state(position: float, waypoint: float) -> dict:
-            observed = state([])
-            observed["player"]["position"]["x"] = position
-            observed["navigation"]["road"] = {
-                "status": "ready",
-                "target": {"x": waypoint, "z": 0.0},
-                "leg": {"x": waypoint, "z": 0.0, "distance": waypoint - position},
-            }
-            return observed
-
-        first = road_state(0.0, 2.0)
-        second = road_state(2.0, 4.0)
-        third = road_state(4.0, 6.0)
-        with (
-            patch.object(controller, "latest_state", side_effect=[
-                (first, 100), (first, 100), (second, 101),
-                (second, 101), (third, 102), (third, 102),
-            ]),
-            patch.object(controller, "explore_leg", return_value=True) as leg,
-        ):
-            moved = controller.follow_road(
-                Path("unused.log"), 2.0, 0.0, 2.0, max_distance=4.0,
-            )
-
-        self.assertTrue(moved)
-        self.assertEqual(leg.call_count, 2)
-        self.assertEqual(leg.call_args_list[0].kwargs["frontier_x"], 2.0)
-        self.assertEqual(leg.call_args_list[1].kwargs["frontier_x"], 4.0)
-
-    def test_follow_road_stops_for_new_close_resource(self) -> None:
-        first = state([])
-        first["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 2.0, "z": 0.0},
-            "leg": {"x": 2.0, "z": 0.0, "distance": 2.0},
-        }
-        second = json.loads(json.dumps(first))
-        second["player"]["position"]["x"] = 2.0
-        second["nearby"] = [grass(10, 2.0, True)]
-        second["navigation"]["road"]["target"]["x"] = 4.0
-        second["navigation"]["road"]["leg"]["x"] = 4.0
-        third = json.loads(json.dumps(second))
-        third["player"]["position"]["x"] = 4.0
-        with (
-            patch.object(controller, "latest_state", side_effect=[
-                (first, 100), (first, 100), (second, 101),
-                (second, 101), (third, 102),
-            ]),
-            patch.object(controller, "explore_leg", return_value=True) as leg,
-        ):
-            moved = controller.follow_road(Path("unused.log"), 2.0, 0.0, 2.0)
-
-        self.assertTrue(moved)
-        self.assertEqual(leg.call_count, 2)
-
-    def test_follow_road_stops_at_new_biome_not_new_topology(self) -> None:
-        def road_state(position: float, topology: str, biome: str) -> dict:
-            observed = state([])
-            observed["player"]["position"]["x"] = position
-            observed["navigation"].update({
-                "current_region": topology,
-                "current_biome": biome,
-                "road": {
-                    "status": "ready",
-                    "target": {"x": position + 2.0, "z": 0.0},
-                    "leg": {"x": position + 2.0, "z": 0.0, "distance": 2.0},
-                },
-            })
-            return observed
-
-        first = road_state(0.0, "A", "forest")
-        same_biome = road_state(2.0, "B", "forest")
-        new_biome = road_state(4.0, "B", "savanna")
-        with (
-            patch.object(controller, "latest_state", side_effect=[
-                (first, 100), (first, 100), (same_biome, 101),
-                (same_biome, 101), (new_biome, 102), (new_biome, 102),
-            ]),
-            patch.object(controller, "explore_leg", return_value=True) as leg,
-        ):
-            moved = controller.follow_road(Path("unused.log"), 2.0, 0.0, 2.0)
-
-        self.assertTrue(moved)
-        self.assertEqual(leg.call_count, 2)
-
-    def test_follow_road_stops_on_new_graph_node_with_same_biome(self) -> None:
-        def road_state(position: float, node: str) -> dict:
-            observed = state([])
-            observed["player"]["position"]["x"] = position
-            observed["navigation"].update({
-                "current_biome": "forest",
-                "graph": {"current_node": node},
-                "road": {
-                    "status": "ready",
-                    "target": {"x": position + 2.0, "z": 0.0},
-                    "leg": {"x": position + 2.0, "z": 0.0, "distance": 2.0},
-                },
-            })
-            return observed
-
-        first = road_state(0.0, "A|forest")
-        second = road_state(2.0, "B|forest")
-        with (
-            patch.object(controller, "latest_state", side_effect=[
-                (first, 100), (first, 100), (second, 101), (second, 101),
-            ]),
-            patch.object(controller, "explore_leg", return_value=True) as leg,
-        ):
-            moved = controller.follow_road(Path("unused.log"), 2.0, 0.0, 2.0)
-
-        self.assertTrue(moved)
-        self.assertEqual(leg.call_count, 1)
-
     def test_exploration_prompt_uses_biome(self) -> None:
         observed = state([])
         observed["navigation"]["current_biome"] = "rocky"
-        observed["navigation"]["road"] = {
+        observed["navigation"]["search"] = {
             "status": "ready",
             "target": {"x": 2.0, "z": 0.0, "distance": 2.0},
             "leg": {"x": 2.0, "z": 0.0, "distance": 2.0},
@@ -1050,33 +903,6 @@ class ControllerTests(unittest.TestCase):
         tap.assert_not_called()
         find_window.assert_not_called()
 
-    def test_road_exploration_stops_when_night_falls_without_torch(self) -> None:
-        before = state([lit_campfire()])
-        before["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 4.0, "z": 0.0},
-            "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
-        }
-        after = json.loads(json.dumps(before))
-        after["world"]["phase"] = "night"
-        after["player"]["position"]["x"] = 1.0
-        tap = Mock()
-        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
-        with (
-            patch.object(controller, "latest_state", side_effect=[(before, 100), (before, 105)]),
-            patch.object(controller, "find_game_window", return_value=123),
-            patch.object(controller, "focus_game"),
-            patch.object(controller, "wait_for_fresh_state", return_value=(after, 106)),
-            patch.object(controller, "tap", tap),
-            patch.object(controller, "release_movement_keys"),
-        ):
-            controller.explore_leg(
-                Path("unused.log"), 4.0, 0.0, 4.0,
-                frontier_x=4.0, frontier_z=0.0, navigation_mode="road",
-            )
-
-        self.assertEqual(tap.call_count, 1)
-
     def test_cook_food_verifies_cooked_inventory_gain(self) -> None:
         before = state([lit_campfire()])
         before["player"]["inventory"]["items"] = [{"prefab": "meat", "count": 2}]
@@ -1104,67 +930,6 @@ class ControllerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "No nearby lit cooker"):
                 controller.cook_food(Path("unused.log"))
 
-    def test_road_leg_brakes_and_waits_for_post_release_telemetry(self) -> None:
-        before = state([])
-        before["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 4.0, "z": 0.0},
-            "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
-        }
-        halfway = json.loads(json.dumps(before))
-        halfway["player"]["position"]["x"] = 2.0
-        near = json.loads(json.dumps(before))
-        near["player"]["position"]["x"] = 3.5
-        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
-        tap = Mock()
-        with (
-            patch.object(controller, "latest_state", side_effect=[
-                (before, 100), (before, 105), (halfway, 106),
-            ]),
-            patch.object(controller, "find_game_window", return_value=123),
-            patch.object(controller, "focus_game"),
-            patch.object(controller, "wait_for_fresh_state", side_effect=[
-                (halfway, 106), (near, 107),
-            ]) as fresh_wait,
-            patch.object(controller, "tap", tap),
-            patch.object(controller, "release_movement_keys"),
-        ):
-            controller.explore_leg(
-                Path("unused.log"), 4.0, 0.0, 4.0,
-                frontier_x=4.0, frontier_z=0.0, navigation_mode="road",
-            )
-
-        self.assertEqual(tap.call_count, 2)
-        self.assertTrue(all(args.args[1] <= 0.5 for args in tap.call_args_list))
-        self.assertEqual(fresh_wait.call_args_list[0].args[1], 105)
-        self.assertEqual(fresh_wait.call_args_list[1].args[1], 106)
-
-    def test_road_exploration_uses_road_leg_and_rejects_stalled_waypoint(self) -> None:
-        observed = state([])
-        observed["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 4.0, "z": 0.0},
-            "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
-        }
-        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
-        tap = Mock()
-        with (
-            patch.object(controller, "latest_state", return_value=(observed, 100)),
-            patch.object(controller, "find_game_window", return_value=123),
-            patch.object(controller, "focus_game"),
-            patch.object(controller, "wait_for_fresh_state", return_value=(observed, 101)),
-            patch.object(controller, "wait_for_state_condition", return_value=(observed, 103)),
-            patch.object(controller, "tap", tap),
-            patch.object(controller, "release_movement_keys"),
-        ):
-            for _ in range(2):
-                controller.explore_leg(
-                    Path("unused.log"), 4.0, 0.0, 4.0,
-                    frontier_x=4.0, frontier_z=0.0, navigation_mode="road",
-                )
-
-        self.assertEqual(tap.call_args_list[-1], call([controller.VK["reject_road"]], 0.08))
-
     def test_explore_walks_one_frontier_leg(self) -> None:
         before = state([])
         after = state([])
@@ -1189,7 +954,9 @@ class ControllerTests(unittest.TestCase):
                 full_leg_seconds=1.0,
             )
 
-        tap.assert_called_once_with([controller.VK["up"]], 1.0)
+        tap.assert_called_once()
+        self.assertEqual(tap.call_args.args[0], [controller.VK["up"]])
+        self.assertLess(tap.call_args.args[1] * 6.0, 4.0)
         release.assert_called_once_with()
 
     def test_graph_route_walks_only_its_live_next_leg(self) -> None:
@@ -1219,7 +986,9 @@ class ControllerTests(unittest.TestCase):
                 navigation_mode="graph", target_node_id="B|rocky",
             )
         self.assertTrue(moved)
-        tap.assert_called_once_with([controller.VK["right"]], 1.0)
+        tap.assert_called_once()
+        self.assertEqual(tap.call_args.args[0], [controller.VK["right"]])
+        self.assertLess(tap.call_args.args[1] * 6.0, 4.0)
 
     def test_region_leg_within_arrival_tolerance_does_not_micro_correct(self) -> None:
         observed = state([])
@@ -1235,33 +1004,6 @@ class ControllerTests(unittest.TestCase):
 
         self.assertFalse(moved)
         tap.assert_not_called()
-
-    def test_road_leg_does_not_reverse_after_small_overshoot(self) -> None:
-        before = state([])
-        before["navigation"]["road"] = {
-            "status": "ready",
-            "target": {"x": 2.0, "z": 0.0},
-            "leg": {"x": 2.0, "z": 0.0, "distance": 2.0},
-        }
-        after = json.loads(json.dumps(before))
-        after["player"]["position"]["x"] = 2.9
-        tap = Mock()
-        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
-        with (
-            patch.object(controller, "latest_state", side_effect=[(before, 100), (before, 105)]),
-            patch.object(controller, "find_game_window", return_value=123),
-            patch.object(controller, "focus_game"),
-            patch.object(controller, "wait_for_fresh_state", return_value=(after, 106)),
-            patch.object(controller, "tap", tap),
-            patch.object(controller, "release_movement_keys"),
-        ):
-            controller.explore_leg(
-                Path("unused.log"), 2.0, 0.0, 2.0,
-                frontier_x=2.0, frontier_z=0.0, navigation_mode="road",
-            )
-
-        self.assertEqual(tap.call_count, 1)
-        self.assertEqual(controller.ROAD_ARRIVAL_DISTANCE, 1.25)
 
     def test_two_stalled_exploration_legs_reject_current_frontier(self) -> None:
         observed = state([])
@@ -1284,11 +1026,10 @@ class ControllerTests(unittest.TestCase):
                     frontier_x=0.0, frontier_z=12.0,
                 )
 
-        self.assertEqual(tap.call_args_list, [
-            call([controller.VK["up"]], 1.0),
-            call([controller.VK["up"]], 1.0),
-            call([controller.VK["reject_frontier"]], 0.08),
+        self.assertEqual([entry.args[0] for entry in tap.call_args_list], [
+            [controller.VK["up"]], [controller.VK["up"]], [controller.VK["reject_frontier"]],
         ])
+        self.assertTrue(all(entry.args[1] * 6 < 4 for entry in tap.call_args_list[:2]))
         verified.assert_called_once()
         self.assertEqual(controller.EXPLORATION_STALL["count"], 0)
 
@@ -1309,12 +1050,15 @@ class ControllerTests(unittest.TestCase):
         ):
             controller.explore_leg(Path("unused.log"), 0.0, 4.0, 4.0)
 
-        tap.assert_called_once_with([controller.VK["right"]], 1.0)
+        tap.assert_called_once()
+        self.assertEqual(tap.call_args.args[0], [controller.VK["right"]])
+        self.assertLess(tap.call_args.args[1] * 6.0, 4.0)
 
     def test_approach_uses_longer_pulses_for_distant_targets(self) -> None:
         self.assertEqual(controller.approach_step_duration(8.0), 1.0)
-        self.assertGreater(controller.approach_step_duration(4.0), 0.70)
-        self.assertEqual(controller.approach_step_duration(1.1), 0.18)
+        self.assertGreater(controller.approach_step_duration(4.0), 0.4)
+        self.assertLess(controller.approach_step_duration(4.0), 0.6)
+        self.assertLess(controller.approach_step_duration(1.1), 0.1)
 
     def test_torch_is_not_treated_as_a_combat_weapon(self) -> None:
         self.assertFalse(controller.is_weapon_item({"prefab": "torch", "weapon": True}))
@@ -1459,8 +1203,9 @@ class ControllerTests(unittest.TestCase):
             patch.object(
                 controller,
                 "wait_for_fresh_state",
-                side_effect=[(before, 101), (after, 102)],
+                return_value=(before, 101),
             ),
+            patch.object(controller, "wait_for_state_condition", return_value=(after, 102)) as verified,
             patch.object(controller, "tap", tap),
             patch.object(controller, "release_movement_keys", release),
         ):
@@ -1468,6 +1213,8 @@ class ControllerTests(unittest.TestCase):
 
         tap.assert_called_once_with([controller.VK["interact"]], 0.08)
         release.assert_called_once_with()
+        self.assertFalse(verified.call_args.args[2](before))
+        self.assertTrue(verified.call_args.args[2](after))
 
 
 class SmokeTests(unittest.TestCase):
@@ -1504,6 +1251,70 @@ class ThresholdTests(unittest.TestCase):
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_refresh_returns_requested_state_and_old_mod_uses_heartbeat(self) -> None:
+        fresh = {"telemetry": {"on_demand": True}, "observed_at": 2}
+        for supports_refresh in (True, False):
+            with self.subTest(on_demand=supports_refresh):
+                before = {"telemetry": {"on_demand": supports_refresh}}
+                with (
+                    patch.object(controller, "latest_state", side_effect=[(before, 100), (fresh, 200)]),
+                    patch.object(controller, "tap") as tap,
+                    patch.object(controller.time, "sleep"),
+                ):
+                    result = controller.wait_for_fresh_state(Path("unused.log"), 100)
+                self.assertEqual(result, (fresh, 200))
+                if supports_refresh:
+                    tap.assert_called_once_with([controller.VK["refresh_state"]], 0.04)
+                else:
+                    tap.assert_not_called()
+
+    def test_semantic_wait_keeps_observing_until_action_finishes(self) -> None:
+        before = {"telemetry": {"on_demand": True}, "done": False}
+        after = {"telemetry": {"on_demand": True}, "done": True}
+        with (
+            patch.object(controller, "latest_state", side_effect=[
+                (before, 100), (before, 101), (after, 102),
+            ]),
+            patch.object(controller, "tap") as tap,
+            patch.object(controller.time, "sleep"),
+        ):
+            result = controller.wait_for_state_condition(
+                Path("unused.log"), 100, lambda observed: observed["done"],
+            )
+        self.assertEqual(result, (after, 102))
+        tap.assert_called_once_with([controller.VK["refresh_state"]], 0.04)
+
+    def test_unchanged_log_is_not_reparsed_and_partial_line_finishes_on_append(self) -> None:
+        first = b'[JEV_DST_STATE]{"schema":7}\n'
+        partial = b'[JEV_DST_STATE]{"schema":8}'
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "client_log.txt"
+            log_path.write_bytes(first + partial)
+            reader = telemetry.StateReader(log_path)
+            self.assertEqual(reader.read(), ({"schema": 7}, len(first)))
+            with patch.object(reader.assembler, "feed", wraps=reader.assembler.feed) as parse:
+                self.assertEqual(reader.read(), ({"schema": 7}, len(first)))
+                parse.assert_not_called()
+                with log_path.open("ab") as stream:
+                    stream.write(b"\n")
+                self.assertEqual(reader.read(), ({"schema": 8}, len(first + partial) + 1))
+                parse.assert_called_once()
+
+    def test_log_truncation_regrowth_and_replacement_do_not_keep_old_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "client_log.txt"
+            log_path.write_bytes(b'[JEV_DST_STATE]{"schema":7}\n')
+            reader = telemetry.StateReader(log_path)
+            self.assertEqual(reader.read()[0], {"schema": 7})
+            log_path.write_bytes(b'[JEV_DST_STATE]{"schema":8,"extra":true}\n')
+            self.assertEqual(reader.read()[0], {"schema": 8, "extra": True})
+            log_path.write_bytes(b'[JEV_DST_STATE]{"schema":9}\n')
+            self.assertEqual(reader.read()[0], {"schema": 9})
+            replacement = Path(directory) / "replacement.txt"
+            replacement.write_bytes(b'[JEV_DST_STATE]{"schema":6}\n')
+            replacement.replace(log_path)
+            self.assertEqual(reader.read()[0], {"schema": 6})
+
     def test_truncated_line_is_ignored_and_chunked_frame_waits_until_complete(self) -> None:
         original = {"schema": 6, "world": {"day": 1}}
         updated = {"schema": 7, "world": {"day": 2}, "blob": "x" * 7000}

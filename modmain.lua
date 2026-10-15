@@ -1,4 +1,5 @@
 local json = require("json")
+local exploration = require("jev_exploration")
 local G = GLOBAL
 local protected_call = G.pcall
 
@@ -15,15 +16,11 @@ local NAV_OBSERVE_RADIUS = SCAN_RADIUS
 local NAV_LEG_DISTANCE = 4
 local NAV_PROBE_STEP = 0.75
 local NAV_ARRIVAL_DISTANCE = 1.5
-local ROAD_ARRIVAL_DISTANCE = 1.25
 local NAV_BLACKLIST_SECONDS = 30
 local HAZARD_MEMORY_SECONDS = 90
 local HAZARD_CLEARANCE = 14
 local HAZARD_PENALTY_RANGE = 26
 local ESCAPE_PROBE_DISTANCE = 6
-local ROAD_CELL_SIZE = 2
-local ROAD_SCAN_RADIUS = 8
-local ROAD_SCAN_BUDGET = 20
 
 -- A topology node is a world-generation branch, not a biome. Classify only
 -- ground tiles whose meaning is unambiguous; roads and player-laid floors do
@@ -404,11 +401,6 @@ local function get_navigation_memory(world)
         {
             cells = {},
             target = nil,
-            road_target = nil,
-            road_cells = {},
-            road_edges = {},
-            road_blacklist = {},
-            last_road_cell = nil,
             regions = {},
             current_region = nil,
             current_region_name = nil,
@@ -422,10 +414,13 @@ local function get_navigation_memory(world)
             last_player_cell = nil,
             graph_nodes = {},
             graph_edges = {},
+            gateway_targets = {},
             current_node = nil,
             last_node_position = nil,
             return_stack = {},
             hazards = {},
+            searches = {},
+            biome_numbers = {},
         }
     end
     return world._jev_dst_navigation
@@ -476,9 +471,20 @@ end
 local function observe_hazards(player, memory, nearby)
     local px, py, pz = player.Transform:GetWorldPosition()
     local now = G.GetTime()
+    local visible = {}
+    for _, entity in ipairs(nearby or {}) do
+        if entity.guid ~= nil then visible[entity.guid] = entity end
+    end
     for guid, hazard in pairs(memory.hazards) do
-        if now - hazard.last_seen > HAZARD_MEMORY_SECONDS then
+        local entity = visible[guid]
+        -- Only clear a historical position after a complete local observation:
+        -- an old enemy outside the scan radius is NOT evidence of disappearance.
+        local checked_absent = #nearby < MAX_NEARBY and entity == nil
+            and math.sqrt((hazard.x - px)^2 + (hazard.z - pz)^2) < SCAN_RADIUS - 2
+        if now - hazard.last_seen > HAZARD_MEMORY_SECONDS or checked_absent
+            or (entity ~= nil and entity.potentialThreat ~= true) then
             memory.hazards[guid] = nil
+            exploration.count(memory, "hazards", checked_absent and "observed_absent" or "expired_or_inactive")
         end
     end
     for _, entity in ipairs(nearby or {}) do
@@ -532,7 +538,7 @@ local function frontier_candidates(player, memory)
     local now = G.GetTime()
     local candidates = {}
     for key, cell in pairs(memory.cells) do
-        if cell.passable and (memory.current_biome == nil or cell.biome == memory.current_biome)
+        if cell.passable and cell.region == memory.current_region
             and (memory.blacklist[key] or 0) <= now then
             local information_gain = 0
             for _, offset in ipairs(NAV_NEIGHBORS) do
@@ -541,10 +547,10 @@ local function frontier_candidates(player, memory)
                 end
             end
             if information_gain > 0 then
+                exploration.count(memory, "frontiers", "eligible_boundary")
                 local distance = math.sqrt((cell.x - px) * (cell.x - px) + (cell.z - pz) * (cell.z - pz))
                 local danger = hazard_penalty(memory, cell.x, cell.z)
-                if distance > NAV_ARRIVAL_DISTANCE and danger < math.huge
-                    and not hazard_segment_unsafe(memory, px, pz, cell.x, cell.z) then
+                if distance > NAV_ARRIVAL_DISTANCE and danger < math.huge then
                     local score = information_gain * 10 - distance * 0.5
                         - (cell.visits or 0) * 6 - danger
                     table.insert(candidates,
@@ -559,8 +565,13 @@ local function frontier_candidates(player, memory)
                         score = score,
                         distance = distance,
                     })
+                elseif danger == math.huge then
+                    exploration.count(memory, "frontiers", "dangerous_endpoint")
                 end
             end
+        elseif cell.passable and cell.region == memory.current_region
+            and (memory.blacklist[key] or 0) > now then
+            exploration.count(memory, "frontiers", "temporarily_blacklisted")
         end
     end
     table.sort(candidates, function(a, b)
@@ -656,10 +667,70 @@ end
 
 local observe_current_region
 local observe_current_biome
-local observe_road_cells
-local select_road_target
 local observe_area_graph
 local read_area_graph
+local graph_segment_passable
+
+-- Build one local reachability tree only when a direct frontier leg is blocked.
+-- A frontier behind a bend in the coastline is still reachable via observed land.
+local function observed_detour_paths(player, map, memory, allow_other_biomes)
+    local scope = allow_other_biomes and "observed_land" or "current_region"
+    memory.path_cache = memory.path_cache or {}
+    local cached = memory.path_cache[scope]
+    if cached ~= nil then return cached.parents, cached.start, cached.costs end
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local function safe_segment(ax, az, bx, bz)
+        if hazard_segment_unsafe(memory, ax, az, bx, bz) then
+            return false
+        end
+        local distance = math.sqrt((bx - ax) ^ 2 + (bz - az) ^ 2)
+        local steps = math.max(1, math.ceil(distance / NAV_PROBE_STEP))
+        for index = 0, steps do
+            local t = index / steps
+            if not safe_call(function()
+                return map:IsPassableAtPoint(ax + (bx - ax) * t, 0,
+                    az + (bz - az) * t, false, false)
+            end, false) then
+                return false
+            end
+        end
+        return true
+    end
+    local start, nearest = nil, NAV_CELL_SIZE * 1.5
+    for key, cell in pairs(memory.cells) do
+        local distance = math.sqrt((cell.x - px) ^ 2 + (cell.z - pz) ^ 2)
+        if cell.passable and distance < nearest
+            and (allow_other_biomes or cell.region == memory.current_region)
+            and safe_segment(px, pz, cell.x, cell.z) then
+            start, nearest = key, distance
+        end
+    end
+    if start == nil then
+        exploration.count(memory, "paths", "no_observed_start")
+        memory.path_cache[scope] = { parents = {}, costs = {} }
+        return {}, nil
+    end
+    local queue, parents, costs, head = { start }, { [start] = false }, { [start] = nearest }, 1
+    while head <= #queue and head <= 2048 do
+        local key = queue[head]
+        head = head + 1
+        local cell = memory.cells[key]
+        for _, offset in ipairs(NAV_NEIGHBORS) do
+            local next_key = nav_key(cell.gx + offset[1], cell.gz + offset[2])
+            local next_cell = memory.cells[next_key]
+            if parents[next_key] == nil and next_cell ~= nil and next_cell.passable
+                and (allow_other_biomes or next_cell.region == memory.current_region)
+                and safe_segment(cell.x, cell.z, next_cell.x, next_cell.z) then
+                parents[next_key] = key
+                costs[next_key] = costs[key] + math.sqrt((next_cell.x - cell.x) ^ 2 + (next_cell.z - cell.z) ^ 2)
+                table.insert(queue, next_key)
+            end
+        end
+    end
+    exploration.count(memory, "paths", head <= #queue and "search_budget_exhausted" or "tree_built")
+    memory.path_cache[scope] = { parents = parents, start = start, costs = costs }
+    return parents, start, costs
+end
 
 local function read_navigation(player, nearby)
     local world = G.TheWorld
@@ -668,6 +739,8 @@ local function read_navigation(player, nearby)
         return {}
     end
     local memory = get_navigation_memory(world)
+    memory.diagnostics = {}
+    memory.path_cache = {}
     local px, py, pz = player.Transform:GetWorldPosition()
     local current_ground_tile = safe_call(function()
         return map:GetTileAtPoint(px, 0, pz)
@@ -677,16 +750,59 @@ local function read_navigation(player, nearby)
     observe_navigation_cells(player, world, memory)
     observe_hazards(player, memory, nearby)
     observe_area_graph(player, map, memory, nearby)
-    local on_road = observe_road_cells(player, map, memory)
     local candidates = frontier_candidates(player, memory)
     local now = G.GetTime()
     local leg = nil
     local status = "no_frontier"
+    local detour_parents = nil
+    local function frontier_leg(candidate)
+        exploration.count(memory, "frontier_paths", "attempted")
+        local direct, reason = make_navigation_leg(player, map, candidate)
+        if direct ~= nil and not hazard_segment_unsafe(memory, px, pz, direct.x, direct.z) then
+            exploration.count(memory, "frontier_paths", "direct_ready")
+            return direct, reason
+        end
+        if reason == "arrived" then return nil, reason end
+        local failure_reason = direct ~= nil and "hazard" or "blocked"
+        exploration.count(memory, "frontier_paths", direct ~= nil and "direct_hazard" or "direct_blocked")
+        if detour_parents == nil then
+            -- Topology labels organize regions; they are not physical walls.
+            detour_parents = observed_detour_paths(player, map, memory, true)
+        end
+        local key = candidate.key
+        if key == nil or detour_parents[key] == nil then
+            exploration.count(memory, "frontier_paths", "no_observed_detour")
+            return nil, failure_reason
+        end
+        local path = {}
+        while key ~= nil and key ~= false do
+            table.insert(path, 1, memory.cells[key])
+            key = detour_parents[key]
+        end
+        local waypoint = exploration.path_waypoint(path, px, pz, NAV_ARRIVAL_DISTANCE,
+            NAV_LEG_DISTANCE * 2, function(ax, az, bx, bz)
+                return graph_segment_passable(map, ax, az, bx, bz)
+                    and not hazard_segment_unsafe(memory, ax, az, bx, bz)
+            end)
+        if waypoint then
+            local leg = make_navigation_leg(player, map, waypoint)
+            if leg then
+                leg.detour = true
+                exploration.count(memory, "frontier_paths", "detour_ready")
+                return leg, nil
+            end
+        end
+        exploration.count(memory, "frontier_paths", "no_safe_next_leg")
+        return nil, failure_reason
+    end
 
+    if memory.target ~= nil and memory.cells[memory.target.key] ~= nil
+        and memory.cells[memory.target.key].region ~= memory.current_region then
+        memory.target = nil
+    end
     if memory.target ~= nil then
-        leg, status = make_navigation_leg(player, map, memory.target)
+        leg, status = frontier_leg(memory.target)
         if hazard_penalty(memory, memory.target.x, memory.target.z) == math.huge
-            or hazard_segment_unsafe(memory, px, pz, memory.target.x, memory.target.z)
             or (leg ~= nil and hazard_segment_unsafe(memory, px, pz, leg.x, leg.z)) then
             memory.target = nil
             leg = nil
@@ -696,13 +812,15 @@ local function read_navigation(player, nearby)
         elseif status == "blocked" then
             memory.blacklist[memory.target.key] = now + NAV_BLACKLIST_SECONDS
             memory.target = nil
+        elseif status == "hazard" then
+            memory.target = nil -- a moving threat is not a terrain failure
         end
     end
 
     if memory.target == nil then
         for _, candidate in ipairs(candidates) do
             if (memory.blacklist[candidate.key] or 0) <= now then
-                local candidate_leg, candidate_status = make_navigation_leg(player, map, candidate)
+                local candidate_leg, candidate_status = frontier_leg(candidate)
                 if candidate_leg ~= nil
                     and not hazard_segment_unsafe(memory, px, pz,
                         candidate_leg.x, candidate_leg.z) then
@@ -728,12 +846,19 @@ local function read_navigation(player, nearby)
         local px, py, pz = player.Transform:GetWorldPosition()
         target.distance = math.sqrt((target.x - px) * (target.x - px) + (target.z - pz) * (target.z - pz))
     end
-    local road_target, road_leg, road_status = select_road_target(player, map, memory, on_road)
     local area_graph = read_area_graph(player, map, memory)
-    if road_leg ~= nil and hazard_segment_unsafe(memory, px, pz,
-        road_leg.x, road_leg.z) then
-        road_target, road_leg, road_status = nil, nil, "hazard"
-    end
+    local search = exploration.search(memory, candidates, area_graph.current,
+        px, pz, now, frontier_leg,
+        function(ax, az, bx, bz)
+            local steps = math.max(1, math.ceil(math.sqrt((bx - ax)^2 + (bz - az)^2) / NAV_PROBE_STEP))
+            for i = 0, steps do
+                local t = i / steps
+                if not safe_call(function()
+                    return map:IsPassableAtPoint(ax + (bx - ax)*t, 0, az + (bz - az)*t, false, false)
+                end, false) then return false end
+            end
+            return not hazard_segment_unsafe(memory, ax, az, bx, bz)
+        end)
     local known_regions = 0
     for _ in pairs(memory.regions) do
         known_regions = known_regions + 1
@@ -746,11 +871,15 @@ local function read_navigation(player, nearby)
     end
     table.sort(biomes_seen)
     local hazards = {}
+    local hazard_memory = { retained = 0, oldest_age = 0 }
     for _, hazard in pairs(memory.hazards) do
+        hazard_memory.retained = hazard_memory.retained + 1
+        hazard_memory.oldest_age = math.max(hazard_memory.oldest_age, round(G.GetTime() - hazard.last_seen, 1))
         table.insert(hazards, { guid = hazard.guid, prefab = hazard.prefab,
             x = round(hazard.x, 2), z = round(hazard.z, 2),
             age = round(G.GetTime() - hazard.last_seen, 1) })
     end
+    memory.diagnostics.hazard_memory = hazard_memory
     table.sort(hazards, function(a, b)
         return (a.x - px) ^ 2 + (a.z - pz) ^ 2
             < (b.x - px) ^ 2 + (b.z - pz) ^ 2
@@ -760,7 +889,9 @@ local function read_navigation(player, nearby)
     end
     return
     {
-        mode = "region_and_road",
+        mode = "topology_regions",
+        diagnostics = memory.diagnostics,
+        search = search,
         current_region = memory.current_region,
         current_region_name = memory.current_region_name,
         known_regions = known_regions,
@@ -771,7 +902,6 @@ local function read_navigation(player, nearby)
         graph = area_graph,
         hazards = hazards,
         escape_routes = read_escape_routes(player, map, nearby),
-        on_road = on_road,
         status = status,
         cell_size = NAV_CELL_SIZE,
         observed_cells = observed_cells,
@@ -787,30 +917,13 @@ local function read_navigation(player, nearby)
         } or nil,
         leg = leg ~= nil and
         {
+            detour = leg.detour == true,
             x = round(leg.x, 2),
             z = round(leg.z, 2),
             dx = round(leg.dx, 2),
             dz = round(leg.dz, 2),
             distance = round(leg.distance, 2),
         } or nil,
-        road =
-        {
-            status = road_status,
-            target = road_target ~= nil and
-            {
-                x = round(road_target.x, 2),
-                z = round(road_target.z, 2),
-                distance = round(road_target.distance, 2),
-            } or nil,
-            leg = road_leg ~= nil and
-            {
-                x = round(road_leg.x, 2),
-                z = round(road_leg.z, 2),
-                dx = round(road_leg.dx, 2),
-                dz = round(road_leg.dz, 2),
-                distance = round(road_leg.distance, 2),
-            } or nil,
-        },
     }
 end
 
@@ -848,7 +961,6 @@ observe_current_region = function(player, map, memory)
             memory.current_region_name = data.task_id or data.layout_id or observed
             memory.pending_region = nil
             memory.pending_region_samples = 0
-            memory.road_target = nil
         end
     else
         memory.pending_region = nil
@@ -901,7 +1013,6 @@ observe_current_biome = function(player, map, memory)
             memory.current_biome = observed
             memory.pending_biome = nil
             memory.pending_biome_samples = 0
-            memory.target = nil
         end
     else
         memory.pending_biome = nil
@@ -911,7 +1022,8 @@ observe_current_biome = function(player, map, memory)
 end
 
 local function graph_node_id(region, biome)
-    return region ~= nil and biome ~= nil and region .. "|" .. biome or nil
+    -- Terrain changes inside a mixed worldgen room do not create new regions.
+    return region
 end
 
 local function ensure_graph_node(memory, id, region, biome)
@@ -924,7 +1036,7 @@ local function ensure_graph_node(memory, id, region, biome)
     return node
 end
 
-local function graph_segment_passable(map, ax, az, bx, bz)
+graph_segment_passable = function(map, ax, az, bx, bz)
     local dx, dz = bx - ax, bz - az
     local distance = math.sqrt(dx * dx + dz * dz)
     local steps = math.max(1, math.ceil(distance / NAV_PROBE_STEP))
@@ -934,21 +1046,6 @@ local function graph_segment_passable(map, ax, az, bx, bz)
             return map:IsPassableAtPoint(ax + dx * fraction, 0, az + dz * fraction,
                 false, false)
         end, false) then
-            return false
-        end
-    end
-    return true
-end
-
-local function graph_segment_in_node(map, ax, az, bx, bz, node_id)
-    local dx, dz = bx - ax, bz - az
-    local distance = math.sqrt(dx * dx + dz * dz)
-    local steps = math.max(1, math.ceil(distance / NAV_PROBE_STEP))
-    for step = 0, steps do
-        local fraction = step / steps
-        local x, z = ax + dx * fraction, az + dz * fraction
-        local observed = graph_node_id(observed_region_at(map, x, z), biome_at(map, x, z))
-        if observed ~= nil and observed ~= node_id then
             return false
         end
     end
@@ -1022,9 +1119,7 @@ observe_area_graph = function(player, map, memory, nearby)
 
     local current_id = graph_node_id(memory.current_region, memory.current_biome)
     local raw_region = observed_region_at(map, px, pz)
-    local raw_biome = biome_at(map, px, pz)
-    if current_id == nil or (raw_region ~= nil and raw_region ~= memory.current_region)
-        or (raw_biome ~= nil and raw_biome ~= memory.current_biome) then
+    if current_id == nil or (raw_region ~= nil and raw_region ~= memory.current_region) then
         return
     end
     local node = ensure_graph_node(memory, current_id,
@@ -1076,84 +1171,74 @@ local function graph_resources(node)
     return resources
 end
 
-local function graph_route_leg(player, map, memory, current_id, side_x, side_z,
+local function graph_route_leg(player, map, memory, side_x, side_z,
     destination_x, destination_z)
     local px, py, pz = player.Transform:GetWorldPosition()
     local distance_to_side = math.sqrt((side_x - px) ^ 2 + (side_z - pz) ^ 2)
     if distance_to_side <= NAV_ARRIVAL_DISTANCE then
-        return make_navigation_leg(player, map,
+        local leg, reason = make_navigation_leg(player, map,
             { x = destination_x, z = destination_z }, NAV_ARRIVAL_DISTANCE)
+        if leg ~= nil and not hazard_segment_unsafe(memory, px, pz, leg.x, leg.z) then
+            exploration.count(memory, "graph_paths", "gateway_ready")
+            return leg
+        end
+        exploration.count(memory, "graph_paths", reason or "unsafe_gateway")
+        return nil
     end
     local direct = make_navigation_leg(player, map,
         { x = side_x, z = side_z }, NAV_ARRIVAL_DISTANCE)
-    if direct ~= nil and graph_segment_in_node(map, px, pz,
-        direct.x, direct.z, current_id) then
+    if direct ~= nil and not hazard_segment_unsafe(memory, px, pz, direct.x, direct.z) then
+        exploration.count(memory, "graph_paths", "direct_ready")
         return direct
     end
-
-    -- If the direct line is blocked, use only observed cells of this node.
-    local start_key, start_distance = nil, math.huge
+    exploration.count(memory, "graph_paths", direct ~= nil and "direct_hazard" or "direct_blocked")
+    -- Use safe observed land even if a detour crosses another known topology
+    -- room. An observed region crossing still yields to JEV during execution.
+    local parents, start = observed_detour_paths(player, map, memory, true)
+    if start == nil then return nil end
     local goal_key, goal_distance = nil, math.huge
     for key, cell in pairs(memory.cells) do
-        if cell.passable and cell.node == current_id then
-            local from_player = math.sqrt((cell.x - px) ^ 2 + (cell.z - pz) ^ 2)
-            if from_player < start_distance and from_player <= NAV_CELL_SIZE * 1.5
-                and graph_segment_passable(map, px, pz, cell.x, cell.z)
-                and graph_segment_in_node(map, px, pz, cell.x, cell.z, current_id) then
-                start_key, start_distance = key, from_player
-            end
+        if cell.passable and parents[key] ~= nil then
             local from_side = math.sqrt((cell.x - side_x) ^ 2 + (cell.z - side_z) ^ 2)
-            if from_side < goal_distance then
+            if from_side < goal_distance and from_side <= NAV_CELL_SIZE
+                and graph_segment_passable(map, cell.x, cell.z, side_x, side_z)
+                and not hazard_segment_unsafe(memory, cell.x, cell.z, side_x, side_z) then
                 goal_key, goal_distance = key, from_side
             end
         end
     end
-    if start_key == nil or goal_key == nil or goal_distance > NAV_CELL_SIZE then
-        return nil
-    end
-    local queue, parent, head = { start_key }, { [start_key] = false }, 1
-    while head <= #queue and parent[goal_key] == nil do
-        local key = queue[head]
-        head = head + 1
-        local cell = memory.cells[key]
-        for _, offset in ipairs(NAV_NEIGHBORS) do
-            local next_key = nav_key(cell.gx + offset[1], cell.gz + offset[2])
-            local neighbor = memory.cells[next_key]
-            if parent[next_key] == nil and neighbor ~= nil and neighbor.passable
-                and neighbor.node == current_id and graph_segment_passable(map,
-                    cell.x, cell.z, neighbor.x, neighbor.z) and graph_segment_in_node(
-                    map, cell.x, cell.z, neighbor.x, neighbor.z, current_id) then
-                parent[next_key] = key
-                table.insert(queue, next_key)
-            end
-        end
-    end
-    if parent[goal_key] == nil then
+    if goal_key == nil then
+        exploration.count(memory, "graph_paths", "no_safe_observed_gateway_path")
         return nil
     end
     local path = {}
     local next_key = goal_key
     while next_key ~= nil and next_key ~= false do
-        table.insert(path, 1, next_key)
-        next_key = parent[next_key]
+        table.insert(path, 1, memory.cells[next_key])
+        next_key = parents[next_key]
     end
-    for index = 2, #path do
-        local next_cell = memory.cells[path[index]]
-        local candidate = make_navigation_leg(player, map, next_cell,
-            NAV_ARRIVAL_DISTANCE)
-        if candidate ~= nil and graph_segment_in_node(map, px, pz,
-            candidate.x, candidate.z, current_id) then
+    local waypoint = exploration.path_waypoint(path, px, pz, NAV_ARRIVAL_DISTANCE,
+        NAV_LEG_DISTANCE * 2, function(ax, az, bx, bz)
+            return graph_segment_passable(map, ax, az, bx, bz)
+                and not hazard_segment_unsafe(memory, ax, az, bx, bz)
+        end)
+    if waypoint then
+        local candidate = make_navigation_leg(player, map, waypoint, NAV_ARRIVAL_DISTANCE)
+        if candidate then
+            exploration.count(memory, "graph_paths", "detour_ready")
+            candidate.detour = true
             return candidate
         end
     end
+    exploration.count(memory, "graph_paths", "no_safe_next_leg")
     return nil
 end
 
 read_area_graph = function(player, map, memory)
     local current_id = memory.current_node
     local node = current_id ~= nil and memory.graph_nodes[current_id] or nil
-    local graph = { current_node = current_id, known_nodes = 0,
-        adjacent = {}, return_route = nil }
+    local graph = { current_node = current_id, known_nodes = 0, routes = {} }
+    exploration.summarize(memory, NAV_CELL_SIZE, NAV_NEIGHBORS)
     for _ in pairs(memory.graph_nodes) do
         graph.known_nodes = graph.known_nodes + 1
     end
@@ -1162,216 +1247,124 @@ read_area_graph = function(player, map, memory)
     end
     graph.current = { id = node.id, biome = node.biome, topology = node.region,
         observed_cells = node.observed_cells, entries = node.entries,
-        resources_seen = graph_resources(node) }
+        resources_seen = graph_resources(node), name = node.name,
+        explored_area = node.explored_area, terrain = node.terrain,
+        unknown_boundary_cells = node.unknown_boundary_cells,
+        boundary_complete = node.boundary_complete }
     local px, py, pz = player.Transform:GetWorldPosition()
     local routes = {}
+    local gateways = {}
     for _, entrances in pairs(memory.graph_edges) do
         for _, entrance in ipairs(entrances) do
             if entrance.a_id == current_id or entrance.b_id == current_id then
+                exploration.count(memory, "graph_paths", "gateways_considered")
                 local other_id = entrance.a_id == current_id and entrance.b_id or entrance.a_id
                 local side_x = entrance.a_id == current_id and entrance.ax or entrance.bx
                 local side_z = entrance.a_id == current_id and entrance.az or entrance.bz
                 local other_x = entrance.a_id == current_id and entrance.bx or entrance.ax
                 local other_z = entrance.a_id == current_id and entrance.bz or entrance.az
-                local leg = graph_route_leg(player, map, memory, current_id,
+                local leg = graph_route_leg(player, map, memory,
                     side_x, side_z, other_x, other_z)
                 if leg ~= nil and not hazard_segment_unsafe(memory, px, pz,
-                    leg.x, leg.z) and hazard_penalty(memory, leg.x, leg.z) < math.huge
+                    leg.x, leg.z)
                     and hazard_penalty(memory, other_x, other_z) < math.huge then
                     local other = memory.graph_nodes[other_id]
                     local distance = math.sqrt((side_x - px) ^ 2 + (side_z - pz) ^ 2)
                     local route = { status = "ready", node_id = other_id,
+                        gateway_id = current_id .. ">" .. other_id .. ":"
+                            .. tostring(side_x) .. ":" .. tostring(side_z)
+                            .. ":" .. tostring(other_x) .. ":" .. tostring(other_z),
                         biome = other.biome, topology = other.region,
                         entered = other.entries > 0, resources_seen = graph_resources(other),
                         distance = round(distance, 2),
                         target = { x = round(other_x, 2), z = round(other_z, 2) },
                         leg = { x = round(leg.x, 2), z = round(leg.z, 2),
-                            distance = round(leg.distance, 2) } }
-                    local previous = routes[other_id]
-                    if previous == nil or route.distance < previous.distance then
-                        routes[other_id] = route
-                    end
+                            distance = round(leg.distance, 2), detour = leg.detour == true } }
+                    gateways[other_id] = gateways[other_id] or {}
+                    table.insert(gateways[other_id], route)
+                elseif leg ~= nil then
+                    exploration.count(memory, "graph_paths", "dangerous_gateway_or_leg")
                 end
             end
         end
     end
-    local return_id = memory.return_stack[#memory.return_stack]
-    graph.return_route = return_id ~= nil and routes[return_id] or nil
-    for id, route in pairs(routes) do
-        if id ~= return_id then
-            table.insert(graph.adjacent, route)
-        end
+    local selections = memory.gateway_targets[current_id] or {}
+    memory.gateway_targets[current_id] = selections
+    for other_id, candidates in pairs(gateways) do
+        routes[other_id] = exploration.select_gateway(candidates, selections[other_id])
+        selections[other_id] = routes[other_id].gateway_id
     end
-    table.sort(graph.adjacent, function(a, b)
-        return a.distance == b.distance and a.node_id < b.node_id
-            or a.distance < b.distance
-    end)
-    while #graph.adjacent > 4 do
-        table.remove(graph.adjacent)
-    end
+    -- Include all reachable known destinations, not a separate return action.
+    graph.routes = exploration.destinations(memory, current_id, routes)
     return graph
 end
 
-local function is_road_point(map, x, z)
-    local road_manager = G.RoadManager
-    if road_manager ~= nil and safe_call(function()
-        return road_manager:IsOnRoad(x, 0, z)
-    end, false) then
-        return true
+local function read_collection_paths(player, nearby)
+    local world = G.TheWorld
+    local map = world ~= nil and world.Map or nil
+    if map == nil then
+        return
     end
-    local tile = safe_call(function() return map:GetTileAtPoint(x, 0, z) end, nil)
-    return tile ~= nil and G.GROUND_ROADWAYS ~= nil and G.GROUND_ROADWAYS[tile] == true
-end
-
-observe_road_cells = function(player, map, memory)
+    local memory = get_navigation_memory(world)
     local px, py, pz = player.Transform:GetWorldPosition()
-    local pgx = math.floor(px / ROAD_CELL_SIZE + 0.5)
-    local pgz = math.floor(pz / ROAD_CELL_SIZE + 0.5)
-    local road_here = is_road_point(map, px, pz)
-    local player_key = nav_key(pgx, pgz)
-    if road_here and memory.last_road_cell ~= player_key then
-        local cell = memory.road_cells[player_key] or
-            { gx = pgx, gz = pgz, x = px, z = pz, visits = 0 }
-        cell.x = px
-        cell.z = pz
-        cell.gx = pgx
-        cell.gz = pgz
-        cell.road = true
-        cell.visits = (cell.visits or 0) + 1
-        memory.road_cells[player_key] = cell
-        memory.last_road_cell = player_key
-    elseif not road_here then
-        memory.last_road_cell = nil
+    local parents, costs = nil, nil
+    local function safe_segment(ax, az, bx, bz)
+        return graph_segment_passable(map, ax, az, bx, bz)
+            and not hazard_segment_unsafe(memory, ax, az, bx, bz)
     end
-    local scan = {}
-    for gx = pgx - 4, pgx + 4 do
-        for gz = pgz - 4, pgz + 4 do
-            local x = gx * ROAD_CELL_SIZE
-            local z = gz * ROAD_CELL_SIZE
-            local distance = math.sqrt((x - px) * (x - px) + (z - pz) * (z - pz))
-            local key = nav_key(gx, gz)
-            if distance <= ROAD_SCAN_RADIUS and memory.road_cells[key] == nil then
-                table.insert(scan, { key = key, x = x, z = z, distance = distance })
-            end
+    for _, record in ipairs(nearby) do
+        local collectible = record.pickable == true
+        for _, tag in ipairs(record.tags) do
+            collectible = collectible or tag == "_inventoryitem" or tag == "pickable"
         end
-    end
-    table.sort(scan, function(a, b) return a.distance < b.distance end)
-    for i = 1, math.min(ROAD_SCAN_BUDGET, #scan) do
-        local sample = scan[i]
-        memory.road_cells[sample.key] =
-        {
-            gx = math.floor(sample.x / ROAD_CELL_SIZE + 0.5),
-            gz = math.floor(sample.z / ROAD_CELL_SIZE + 0.5),
-            x = sample.x,
-            z = sample.z,
-            road = is_road_point(map, sample.x, sample.z),
-            visits = 0,
-        }
-    end
-    return road_here
-end
-
-select_road_target = function(player, map, memory, on_road)
-    local px, py, pz = player.Transform:GetWorldPosition()
-    local now = G.GetTime()
-    local target = memory.road_target
-    local leg = nil
-    local status = "no_road"
-    if target ~= nil then
-        leg, status = make_navigation_leg(player, map, target, ROAD_ARRIVAL_DISTANCE)
-        if status == "arrived" then
-            local cell = memory.road_cells[target.key]
-            if cell ~= nil and on_road then
-                cell.visits = (cell.visits or 0) + 1
+        if collectible and (record.pickable == nil or record.pickable == true) then
+            local tx, tz = px + record.dx, pz + record.dz
+            local path = { status = "unknown", reason = "no_observed_land_path" }
+            record.collect_path = path
+            if not safe_call(function()
+                return map:IsPassableAtPoint(tx, 0, tz, false, false)
+            end, false) then
+                path.status, path.reason = "blocked", "target_not_on_passable_ground"
+            elseif safe_segment(px, pz, tx, tz) then
+                path.status, path.reason = "ready", "direct"
+                path.distance = record.distance
+                path.waypoint = { x = round(tx, 2), z = round(tz, 2), distance = record.distance }
             else
-                memory.road_blacklist[target.key] = now + NAV_BLACKLIST_SECONDS
-            end
-            memory.road_target = nil
-        elseif status == "blocked" then
-            memory.road_blacklist[target.key] = now + NAV_BLACKLIST_SECONDS
-            memory.road_target = nil
-        end
-    end
-    if memory.road_target == nil then
-        local starts = {}
-        for key, cell in pairs(memory.road_cells) do
-            if cell.road and (memory.road_blacklist[key] or 0) <= now then
-                local distance = math.sqrt((cell.x - px) * (cell.x - px) + (cell.z - pz) * (cell.z - pz))
-                if distance <= (on_road and 3 or ROAD_SCAN_RADIUS)
-                    and (not on_road or distance < 0.5
-                        or is_road_point(map, (px + cell.x) / 2, (pz + cell.z) / 2)) then
-                    table.insert(starts, { key = key, distance = distance })
+                if parents == nil then
+                    local start
+                    parents, start, costs = observed_detour_paths(player, map, memory, true)
+                    costs = costs or {}
                 end
-            end
-        end
-        table.sort(starts, function(a, b) return a.distance < b.distance end)
-        for _, start in ipairs(starts) do
-            local queue = { start.key }
-            local parent = { [start.key] = false }
-            local head = 1
-            local goal_key = nil
-            while head <= #queue do
-                local key = queue[head]
-                head = head + 1
-                local cell = memory.road_cells[key]
-                if (cell.visits or 0) == 0 and (memory.road_blacklist[key] or 0) <= now then
-                    goal_key = key
-                    break
+                local best, best_cost = nil, math.huge
+                for key in pairs(parents) do
+                    local cell = memory.cells[key]
+                    local distance = math.sqrt((cell.x - tx) ^ 2 + (cell.z - tz) ^ 2)
+                    if distance <= NAV_CELL_SIZE * 1.5 and costs[key] ~= nil
+                        and costs[key] + distance < best_cost
+                        and safe_segment(cell.x, cell.z, tx, tz) then
+                        best, best_cost = key, costs[key] + distance
+                    end
                 end
-                for _, offset in ipairs(NAV_NEIGHBORS) do
-                    local next_key = nav_key(cell.gx + offset[1], cell.gz + offset[2])
-                    local next_cell = memory.road_cells[next_key]
-                    if parent[next_key] == nil and next_cell ~= nil and next_cell.road
-                        and (memory.road_blacklist[next_key] or 0) <= now then
-                        local edge_key = key < next_key and key .. ">" .. next_key
-                            or next_key .. ">" .. key
-                        local connected = memory.road_edges[edge_key]
-                        if connected == nil then
-                            connected = is_road_point(map, (cell.x + next_cell.x) / 2,
-                                (cell.z + next_cell.z) / 2)
-                            if connected then
-                                memory.road_edges[edge_key] = true
-                            end
-                        end
-                        if connected then
-                            parent[next_key] = key
-                            table.insert(queue, next_key)
+                if best ~= nil then
+                    local waypoints = { { x = tx, z = tz } }
+                    while best ~= nil and best ~= false do
+                        table.insert(waypoints, 1, memory.cells[best])
+                        best = parents[best]
+                    end
+                    local waypoint = exploration.path_waypoint(waypoints, px, pz, 0.4,
+                        NAV_LEG_DISTANCE * 2, safe_segment)
+                    if waypoint then
+                        local distance = math.sqrt((waypoint.x - px) ^ 2 + (waypoint.z - pz) ^ 2)
+                        if distance > 0.4 and safe_segment(px, pz, waypoint.x, waypoint.z) then
+                            path.status, path.reason, path.distance = "ready", "detour", round(best_cost, 2)
+                            path.waypoint = { x = round(waypoint.x, 2), z = round(waypoint.z, 2),
+                                distance = round(distance, 2) }
                         end
                     end
                 end
             end
-            if goal_key ~= nil then
-                local next_key = goal_key
-                while parent[next_key] ~= false and parent[next_key] ~= start.key do
-                    next_key = parent[next_key]
-                end
-                local cell = memory.road_cells[next_key]
-                local candidate =
-                {
-                    key = next_key,
-                    x = cell.x,
-                    z = cell.z,
-                }
-                local candidate_leg, candidate_status = make_navigation_leg(
-                    player, map, candidate, ROAD_ARRIVAL_DISTANCE)
-                if candidate_leg ~= nil then
-                    memory.road_target = candidate
-                    leg = candidate_leg
-                    status = "ready"
-                    break
-                elseif candidate_status == "blocked" then
-                    memory.road_blacklist[candidate.key] = now + NAV_BLACKLIST_SECONDS
-                end
-            end
         end
-    elseif leg ~= nil then
-        status = "ready"
     end
-    target = memory.road_target
-    if target ~= nil then
-        target.distance = math.sqrt((target.x - px) * (target.x - px) + (target.z - pz) * (target.z - pz))
-    end
-    return target, leg, status
 end
 
 local function make_state(player)
@@ -1379,11 +1372,15 @@ local function make_state(player)
     local world = G.TheWorld ~= nil and G.TheWorld.state or {}
     local camera = read_camera()
     local nearby = read_nearby(player)
+    local navigation = read_navigation(player, nearby)
+    read_collection_paths(player, nearby)
+    navigation.collection_paths = true
 
     return
     {
-        schema = 7,
+        schema = 10,
         observed_at = round(G.GetTime(), 3),
+        telemetry = { on_demand = true, sample_interval = SAMPLE_INTERVAL },
         player =
         {
             guid = player.GUID,
@@ -1405,7 +1402,7 @@ local function make_state(player)
         },
         camera = camera,
         work = player._jev_dst_work,
-        navigation = read_navigation(player, nearby),
+        navigation = navigation,
         crafting = read_crafting(player),
         nearby = nearby,
     }
@@ -1463,25 +1460,6 @@ local function reject_current_frontier()
     memory.blacklist[key] = G.GetTime() + NAV_BLACKLIST_SECONDS
     memory.target = nil
     print("[JEV_DST_ACTION]reject_frontier:blacklisted key=" .. tostring(key))
-    emit_state(player)
-end
-
-local function reject_current_road_target()
-    local player = G.ThePlayer
-    local world = G.TheWorld
-    if player == nil or not player:IsValid() or world == nil then
-        print("[JEV_DST_ACTION_ERROR]reject_road:world_or_player_unavailable")
-        return
-    end
-    local memory = get_navigation_memory(world)
-    if memory.road_target == nil then
-        print("[JEV_DST_ACTION]reject_road:no_target")
-        return
-    end
-    local key = memory.road_target.key
-    memory.road_blacklist[key] = G.GetTime() + NAV_BLACKLIST_SECONDS
-    memory.road_target = nil
-    print("[JEV_DST_ACTION]reject_road:blacklisted key=" .. tostring(key))
     emit_state(player)
 end
 
@@ -2148,8 +2126,14 @@ G.TheInput:AddKeyUpHandler(G.KEY_F10, attack_nearest_hostile)
 G.TheInput:AddKeyUpHandler(G.KEY_F11, equip_best_weapon)
 G.TheInput:AddKeyUpHandler(G.KEY_F12, build_science_machine)
 G.TheInput:AddKeyUpHandler(G.KEY_F5, reject_current_frontier)
-G.TheInput:AddKeyUpHandler(G.KEY_F4, reject_current_road_target)
 G.TheInput:AddKeyUpHandler(G.KEY_F3, cook_one_food)
+G.TheInput:AddKeyUpHandler(G.KEY_F2, function() emit_state(G.ThePlayer) end)
+G.TheInput:AddKeyUpHandler(G.KEY_F1, function()
+    if G.TheWorld ~= nil and G.ThePlayer ~= nil then
+        exploration.reject(get_navigation_memory(G.TheWorld), G.GetTime())
+        emit_state(G.ThePlayer)
+    end
+end)
 
 -- ThePlayer is often still nil while player prefabs are being initialized on a
 -- joining client. Poll from the world instead of making a one-shot comparison.

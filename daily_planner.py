@@ -60,6 +60,8 @@ def planning_context(state: dict, history: list[dict]) -> dict:
                 "distance": entity.get("distance"),
                 "activeThreat": entity.get("activeThreat", False),
                 "pickable": entity.get("pickable"),
+                "collect_path_status": (entity.get("collect_path") or {}).get("status"),
+                "collect_path_reason": (entity.get("collect_path") or {}).get("reason"),
             }
             for entity in nearby[:20]
         ],

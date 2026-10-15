@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import controller
+import timing_log as timing
 from daily_planner import DailyPlanner
+from decision_prefetch import DecisionPrefetch, current_action, compatible
 
 
 DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone"
@@ -262,6 +264,7 @@ def action_allowed(state: dict, action_kind: str) -> tuple[bool, str]:
 
     return True, ""
 
+@timing.timed("decision.candidates")
 def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     """Return [criteria, dispatch]. Generate available actions. """
     criteria: Dict[str, str] = {}
@@ -272,11 +275,7 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         prefab = str(entity.get("prefab", ""))
         if prefab not in SAFE_COLLECT_PREFABS:
             continue
-        tags = set(entity.get("tags", []))
-        if prefab in PICKABLE_SOURCE_PREFABS:
-            if entity.get("pickable") is not True:
-                continue
-        elif "pickable" not in tags and "_inventoryitem" not in tags:
+        if not controller.collect_target_available(entity) or not controller.collect_target_reachable(state, entity):
             continue
         current = nearest_by_prefab.get(prefab)
         if current is None or float(entity.get("distance", 999)) < float(current.get("distance", 999)):
@@ -290,7 +289,8 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             if prefab in {"log", "rocks"} else ""
         )
         criteria[action_id] = (
-            f"Approach and collect the nearest observed {prefab}, {distance:.2f} world units away. "
+            f"Approach and collect the nearest reachable observed {prefab}, {distance:.2f} world units away. "
+            f"Verified land-route length: {float(entity['collect_path'].get('distance', distance)):.2f} units. "
             f"{SAFE_COLLECT_PREFABS[prefab]} Choose only when its benefit exceeds exploration risk."
             f"{leftover_note}"
         )
@@ -303,16 +303,26 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     navigation = state.get("navigation", {})
     biome = navigation.get("current_biome") or "unidentified terrain"
     topology = navigation.get("current_region") or "unknown"
+    graph = navigation.get("graph") or {}
+    current_area = graph.get("current") or {}
+    area_name = current_area.get("name") or f"{biome} ({topology})"
+    area_size = current_area.get("explored_area")
+    coverage = (f" Observed area: {float(area_size):.0f} square world units; total area unknown."
+                if area_size is not None else " Observed area not reported.")
     frontier_target = navigation.get("target")
     frontier_leg = navigation.get("leg")
     if navigation.get("status") == "ready" and frontier_target and frontier_leg:
         criteria["explore_current_region"] = (
-            f"Survey the unexplored edge of the current terrain biome ({biome}); already here. "
+            f"Continue searching the current topology region {area_name}; already here. "
             f"The local frontier target is at "
             f"({float(frontier_target.get('x', 0)):.2f}, {float(frontier_target.get('z', 0)):.2f}), "
-            f"{float(frontier_target.get('distance', 0)):.2f} units away. Walk only the next "
-            f"{float(frontier_leg.get('distance', 0)):.2f}-unit leg, then stop and reconsider all actions. "
-            f"This explores the present terrain type rather than following a road outward."
+            f"{float(frontier_target.get('distance', 0)):.2f} units away. Begin with the next "
+            f"{float(frontier_leg.get('distance', 0)):.2f}-unit leg, then keep this intent while nothing new occurs. "
+            "Return for a decision on new useful resources, threats, region/phase changes, "
+            "or path failure; otherwise keep exploring without a time or distance decision timer. "
+            f"Look for local resources rather than making sustained outward progress."
+            + coverage
+            + (" The next leg follows observed land around an obstruction." if frontier_leg.get("detour") else "")
         )
         dispatch["explore_current_region"] = {
             "kind": "explore",
@@ -323,7 +333,6 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             "frontier_x": frontier_target.get("x"),
             "frontier_z": frontier_target.get("z"),
         }
-    graph = navigation.get("graph") or {}
     biome_resource_hints = {
         "forest": "trees and saplings",
         "grassland": "grass and saplings",
@@ -333,20 +342,40 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         "deciduous_forest": "deciduous trees and scattered food",
         "desert": "desert resources, but do not assume an oasis",
     }
-    for index, route in enumerate((graph.get("adjacent") or [])[:4], start=1):
+    # Legacy frames remain readable, but returning is never a separate decision.
+    routes = graph.get("routes")
+    if routes is None:
+        routes = [*(graph.get("adjacent") or []), graph.get("return_route") or {}]
+    seen_destinations = set()
+    for index, route in enumerate(routes, start=1):
         if route.get("status") != "ready" or not route.get("target") or not route.get("leg"):
             continue
         if not controller.graph_route_available(str(route.get("node_id") or "")):
             continue
+        if not route.get("node_id") or route["node_id"] in seen_destinations:
+            continue
+        seen_destinations.add(route["node_id"])
         destination = route.get("biome") or "unknown terrain"
         observed = ", ".join(route.get("resources_seen") or []) or "none recorded"
-        hint = biome_resource_hints.get(destination, "no specific terrain prior")
-        action_id = f"explore_adjacent_{index}"
+        terrain = route.get("terrain") or {}
+        hint = biome_resource_hints.get(destination)
+        if hint is None:
+            hint = "; ".join(biome_resource_hints[k] for k in sorted(terrain)
+                             if terrain[k] and k in biome_resource_hints) or "no specific terrain prior"
+        action_id = f"travel_region_{index}"
+        name = route.get("name") or route["node_id"]
+        area = route.get("explored_area")
+        explored = f"{float(area):.0f} square world units" if area is not None else "not reported"
+        boundary = "fully observed" if route.get("boundary_complete") else "not fully observed"
         criteria[action_id] = (
-            f"Go to observed adjacent area {route['node_id']} ({destination}), "
-            f"about {float(route.get('distance', 0)):.1f} units to its boundary. "
+            f"Go to known region {name} ({destination}; ID {route['node_id']}). "
+            f"Observed area: {explored}; boundary {boundary}; "
+            f"{'previously entered' if route.get('entered') else 'discovered, not yet entered'}. "
+            f"The route has {int(route.get('hops', 1))} region connection(s); "
+            f"about {float(route.get('distance', 0)):.1f} units to the next exit, not the final destination. "
             f"Resources actually seen there: {observed}. Terrain-based possibilities, "
-            f"not observations: {hint}. Walk only the next verified leg, then reconsider."
+            f"not observations: {hint}. Follow verified short legs toward this destination "
+            "until arrival or a meaningful event, without periodically asking for another decision."
         )
         dispatch[action_id] = {
             "kind": "explore", "navigation_mode": "graph",
@@ -356,49 +385,32 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             "frontier_x": route["target"]["x"],
             "frontier_z": route["target"]["z"],
         }
-    return_route = graph.get("return_route") or {}
-    if (return_route.get("status") == "ready" and return_route.get("target")
-            and return_route.get("leg") and controller.graph_route_available(
-                str(return_route.get("node_id") or ""))):
-        destination = return_route.get("biome") or "unknown terrain"
-        observed = ", ".join(return_route.get("resources_seen") or []) or "none recorded"
-        criteria["return_previous_region"] = (
-            f"Return along a recorded connection to previously visited area "
-            f"{return_route['node_id']} ({destination}); about "
-            f"{float(return_route.get('distance', 0)):.1f} units to its boundary. "
-            f"Resources previously observed there: {observed}. "
-            "Walk only the next verified leg, then reconsider."
-        )
-        dispatch["return_previous_region"] = {
-            "kind": "explore", "navigation_mode": "graph",
-            "target_node_id": return_route["node_id"],
-            "target_x": return_route["leg"]["x"],
-            "target_z": return_route["leg"]["z"],
-            "leg_distance": return_route["leg"]["distance"],
-            "frontier_x": return_route["target"]["x"],
-            "frontier_z": return_route["target"]["z"],
-        }
-
-    road = navigation.get("road") or {}
-    road_target = road.get("target") or {}
-    road_leg = road.get("leg") or {}
-    if road.get("status") == "ready" and road_target and road_leg:
+    search = navigation.get("search") or {}
+    search_target = search.get("target") or {}
+    search_leg = search.get("leg") or {}
+    if (search.get("status") == "ready" and search_target and search_leg
+            and search.get("strategy") != "road"
+            and not current_area.get("boundary_complete") and not search.get("boundary_complete")):
         criteria["explore_other_region"] = (
-            f"Follow an observed road from {biome} terrain (topology {topology}) to look for another biome. "
-            f"The next road waypoint is {float(road_target.get('distance', 0)):.2f} units away; "
-            f"begin with its {float(road_leg.get('distance', 0)):.2f}-unit leg, then follow live "
-            "road waypoints for at most 10 units before reconsidering all actions. Stop sooner "
-            "for a new terrain biome, a close new resource, a threat, a phase change, or darkness. "
-            "A road may end without finding a new biome."
+            f"Search for a NEW region by investigating unknown exits of {area_name}. "
+            f"Current strategy: {search.get('strategy', 'directional')}; preserve the outward heading "
+            "across intervening collection or crafting. Advance directionally; bypass obstacles and follow a safe "
+            "boundary side when blocked, resuming the original heading when possible. "
+            f"Next waypoint: {float(search_target.get('distance', 0)):.2f} units away. "
+            f"Begin with the next {float(search_leg.get('distance', 0)):.2f}-unit leg, "
+            "then continue the same intent without another decision unless a new resource, "
+            "threat, region/phase change or path failure occurs. There is no periodic "
+            "time/distance decision timer. Known destinations remain separate choices. " + coverage
         )
         dispatch["explore_other_region"] = {
             "kind": "explore",
-            "navigation_mode": "road",
-            "target_x": road_leg.get("x"),
-            "target_z": road_leg.get("z"),
-            "leg_distance": road_leg.get("distance"),
-            "frontier_x": road_target.get("x"),
-            "frontier_z": road_target.get("z"),
+            "navigation_mode": "search",
+            "search_region_id": search.get("region_id") or current_area.get("id"),
+            "target_x": search_leg.get("x"),
+            "target_z": search_leg.get("z"),
+            "leg_distance": search_leg.get("distance"),
+            "frontier_x": search_target.get("x"),
+            "frontier_z": search_target.get("z"),
         }
 
     counts = inventory_counts(state)
@@ -581,17 +593,40 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     dispatch["wait"] = {"kind": "wait"}
 
     # filter out any actions that are blocked by hard safety rules
-    criteria = {
-        k: v for k, v in criteria.items()
-        if action_allowed(state, dispatch[k]["kind"])[0]
-        and (dispatch[k]["kind"] != "explore" or controller.exploration_hazard_on_leg(
-            state, float(dispatch[k]["target_x"]), float(dispatch[k]["target_z"]),
-        ) is None)
-    }
+    rejected = {}
+    for key in list(criteria):
+        allowed, reason = action_allowed(state, dispatch[key]["kind"])
+        if allowed and dispatch[key]["kind"] == "explore":
+            hazard = controller.exploration_hazard_on_leg(
+                state, float(dispatch[key]["target_x"]), float(dispatch[key]["target_z"]))
+            if hazard is not None:
+                allowed, reason = False, "next leg approaches remembered or visible threat"
+        if not allowed:
+            rejected[key] = reason
+            del criteria[key]
+    timing.annotate(candidate_rejections=rejected)
     dispatch = {k: v for k, v in dispatch.items() if k in criteria}
     return criteria, dispatch
 
 
+def candidate_context(state: dict, keys) -> dict:
+    """Explain absent movement without secrets, raw prompts or guessing a route."""
+    nav = state.get("navigation", {})
+    graph, search = nav.get("graph") or {}, nav.get("search") or {}
+    routes = graph.get("routes")
+    if routes is None:
+        routes = [*(graph.get("adjacent") or []), *([graph["return_route"]] if graph.get("return_route") else [])]
+    return {
+        "keys": list(keys), "count": len(keys), "only_wait": set(keys) == {"wait"},
+        "frontier_status": nav.get("status"), "frontier_count": nav.get("frontier_count"),
+        "search_status": search.get("status"),
+        "boundary_complete": (graph.get("current") or {}).get("boundary_complete"),
+        "known_regions": graph.get("known_nodes"), "reported_routes": len(routes),
+        "path_diagnostics": nav.get("diagnostics", {}),
+    }
+
+
+@timing.timed("decision.state_compact")
 def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
     world = state.get("world", {})
     player = state.get("player", {})
@@ -616,7 +651,10 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
             "At night near a lit fire, unequip a torch to save fuel only if staying near that fire; keep it equipped when moving away.",
             "Prefer a useful safe action over repeated waiting, but do not take unnecessary risks for optional resources.",
             "A nearby potentialThreat may attack on approach even when activeThreat is false; avoid routes through remembered hazards.",
+            "Regions are game topology rooms, not individual ground tiles; mixed terrain can belong to one region. Names have stable topology IDs, and observed area is not total area or a completion percentage.",
+            "Current-region search finds local resources. New-region search investigates unknown exits, preserving its heading across short interruptions; known-region travel is separate and includes returning. When local resources no longer meet needs, consider unknown exits or known regions with useful resources rather than repeatedly surveying the same area.",
             "A daily_plan is strategic advice from a separate planner, not a command. Make the fastest safe next-action choice from current facts; do not generate or revise a plan.",
+            "When execution_context is present, choose the action to run after the current bounded action; use observed facts only. The controller will revalidate it before execution.",
         ],
         "day": world.get("day"),
         "phase": world.get("phase"),
@@ -629,6 +667,7 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
         "dead": vitals.get("dead"),
         "position": player.get("position"),
         "navigation": state.get("navigation", {}),
+        "execution_context": state.get("_jev_execution_context"),
         "inventory": counts,
         "safe_food_count": sum(counts.get(prefab, 0) for prefab in SAFE_FOOD_PREFABS),
         "cookable_raw_count": sum(counts.get(prefab, 0) for prefab in COOKABLE_FOOD_PRODUCTS),
@@ -652,6 +691,8 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
                 "distance": entity.get("distance"),
                 "tags": entity.get("tags", []),
                 "pickable": entity.get("pickable"),
+                "collect_path_status": (entity.get("collect_path") or {}).get("status"),
+                "collect_path_reason": (entity.get("collect_path") or {}).get("reason"),
                 "work_required": entity.get("work_required"),
                 "attackable": entity.get("attackable", False),
                 "activeThreat": entity.get("activeThreat", False),
@@ -665,6 +706,7 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
     return compact
 
 
+@timing.timed("decision.request")
 def call_jev(
     api_url: str, api_key: str, model: str, state: dict,
     criteria: Dict[str, str], daily_plan: Optional[dict] = None,
@@ -677,7 +719,8 @@ def call_jev(
                 "type": "choice",
                 "instructions": (
                     "Choose exactly one action key from the supplied criteria. Treat each key as "
-                    "one bounded action, even when the controller performs several verified substeps. "
+                    "one semantic action, even when the controller performs several verified substeps. "
+                    "Exploration continues until a meaningful event, not until the next short movement leg. "
                     "Decide the next action quickly from current state and criteria; do not plan ahead. "
                     "Obey hard rules and immediate survival needs. Treat daily_plan, when present, "
                     "as optional strategic guidance, never as permission to ignore current facts. "
@@ -699,8 +742,13 @@ def call_jev(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        with timing.span("api.response_headers"):
+            response = urllib.request.urlopen(request, timeout=20)
+        with response:
+            with timing.span("api.read_body"):
+                response_body = response.read()
+            with timing.span("api.parse_response"):
+                payload = json.loads(response_body.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:1000]
         raise RuntimeError(f"JEV API HTTP {exc.code}: {detail}") from exc
@@ -713,32 +761,19 @@ def call_jev(
     return {"response": payload, "answer": answer}
 
 
+@timing.timed("action.execute")
 def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> bool:
     kind = action["kind"]
     if kind == "collect":
         return controller.collect(log_path, action["prefab"], preferred_guid=action.get("guid"))
     elif kind == "explore":
         if action.get("navigation_mode") == "road":
-            return controller.follow_road(
-                log_path,
-                float(action["frontier_x"]),
-                float(action["frontier_z"]),
-                float(action["leg_distance"]),
-                move_seconds,
-            )
-        return controller.explore_leg(
-            log_path,
-            float(action["target_x"]),
-            float(action["target_z"]),
-            float(action["leg_distance"]),
-            move_seconds,
-            frontier_x=float(action["frontier_x"]),
-            frontier_z=float(action["frontier_z"]),
-            navigation_mode=action.get("navigation_mode", "region"),
-            target_node_id=action.get("target_node_id"),
-        )
+            raise ValueError("Road-following exploration has been removed; update the mod")
+        return controller.follow_exploration(log_path, action, move_seconds,
+                                             baseline=action.get("_decision_state"))
     elif kind == "wait":
-        time.sleep(1.0)
+        with timing.span("action.wait"):
+            time.sleep(1.0)
     elif kind == "craft_torch":
         controller.craft_torch(log_path)
     elif kind == "equip_torch":
@@ -777,7 +812,7 @@ def default_execution_threshold(choice: str, state: Optional[dict] = None) -> fl
     if choice in {"flee_from_nearest_hostile", "wait"}:
         return 0.0
     if choice in {"explore", "explore_current_region", "explore_other_region",
-                  "return_previous_region"} or choice.startswith("explore_adjacent_"):
+                  "return_previous_region"} or choice.startswith(("explore_adjacent_", "travel_region_")):
         return 0.15
     if choice == "attack_nearest_hostile":
         return 0.45
@@ -793,52 +828,150 @@ def default_execution_threshold(choice: str, state: Optional[dict] = None) -> fl
 def run_decision_cycle(
     args, api_url: str, api_key: str, model: str,
     planner: Optional[DailyPlanner] = None,
+    prefetch: Optional[DecisionPrefetch] = None,
 ) -> bool:
     """Run one sense-decide-act cycle. Return True at a terminal game state."""
-    state, _ = controller.latest_state(args.log)
+    with timing.span("cycle.observe"):
+        state, _ = controller.latest_state(args.log)
     world = state.get("world", {})
     vitals = state.get("player", {}).get("vitals", {})
+    timing.annotate(day=world.get("day"), phase=world.get("phase"), model=model)
     if vitals.get("dead"):
+        timing.annotate(outcome="terminal")
         print("goal_failed: player is dead; control loop stopped")
         return True
-    daily_plan = planner.update(state) if planner is not None else None
+    with timing.span("planner.update"):
+        daily_plan = planner.update(state) if planner is not None else None
     criteria, dispatch = build_candidates(state)
-    result = call_jev(api_url, api_key, model, state, criteria, daily_plan)
+    timing.annotate(decision_source="synchronous")
+    cached = prefetch.take(state, dispatch) if prefetch is not None else None
+    if cached is None:
+        if prefetch is not None:
+            with timing.span("decision.prefetch_refresh"):
+                state, _ = controller.latest_state(args.log)
+                world = state.get("world", {})
+                timing.annotate(day=world.get("day"), phase=world.get("phase"))
+                if state.get("player", {}).get("vitals", {}).get("dead"):
+                    timing.annotate(outcome="terminal")
+                    return True
+                criteria, dispatch = build_candidates(state)
+        request_started = time.monotonic()
+        decision_state = state
+        decision_candidates = list(criteria)
+        result = call_jev(api_url, api_key, model, state, criteria, daily_plan)
+        selected = dispatch.get(result["answer"]["choice"])
+        decision_seconds = time.monotonic() - request_started
+    else:
+        result, selected, decision_seconds = cached
+        decision_state = prefetch.source
+        decision_candidates = list(prefetch.dispatch)
     answer = result["answer"]
     choice = answer["choice"]
     confidence = float(answer.get("confidence", 0))
+    timing.annotate(action=choice, confidence=confidence)
+    context = candidate_context(decision_state, decision_candidates)
+    timing.annotate(decision_candidates=context)
+    if context["only_wait"]:
+        print("only_wait_available " + json.dumps(context, ensure_ascii=False, separators=(",", ":")))
     print(
         f"day={world.get('day')} phase={world.get('phase')} "
         f"model={result['response'].get('model', model)} "
-        f"choice={choice} confidence={confidence:.3f}"
+        f"choice={choice} confidence={confidence:.3f} decision_time={decision_seconds:.2f}s"
     )
     if args.show_probabilities:
         print(json.dumps(answer.get("probabilities", {}), indent=2, sort_keys=True))
 
-    if choice not in dispatch:
+    if selected is None:
         raise RuntimeError(f"JEV selected unknown action: {choice}")
     if not args.execute:
+        timing.annotate(outcome="dry_run")
         print("dry_run: no game input sent")
         return False
+
+    # Both synchronous and prefetched responses can outlive their observations.
+    # Rebuild legal actions, match the same semantic target, and execute the
+    # current verified leg rather than stale coordinates or a reordered index.
+    with timing.span("decision.revalidate"):
+        state, _ = controller.latest_state(args.log)
+        if state.get("player", {}).get("vitals", {}).get("dead"):
+            timing.annotate(outcome="terminal")
+            print("goal_failed: player died while awaiting the decision")
+            return True
+        if cached is not None and not compatible(prefetch.source, state):
+            timing.annotate(outcome="skipped")
+            print("action_skipped: state changed while awaiting prefetched response")
+            return False
+        _, fresh_dispatch = build_candidates(state)
+        match = current_action(selected, fresh_dispatch)
+    if match is None:
+        timing.annotate(outcome="skipped")
+        print("action_skipped: chosen target or prerequisites changed; asking JEV again")
+        return False
+    current_choice, selected = match
+    if selected["kind"] == "explore":
+        selected = {**selected, "_decision_state": decision_state}
+    timing.annotate(current_action=current_choice)
 
     threshold = (
         args.min_confidence
         if args.min_confidence is not None
-        else default_execution_threshold(choice, state)
+        else default_execution_threshold(current_choice, state)
     )
     print(f"execution_threshold={threshold:.2f}")
     if confidence < threshold:
+        timing.annotate(outcome="abstained")
         print(f"abstained: confidence below {threshold:.2f}")
         return False
 
+    def checkpoint(observed, reason):
+        kind = selected["kind"]
+        if prefetch is None:
+            return True
+        eligible = ((kind == "explore" and reason == "exploration_event")
+                    or (kind in {"collect", "eat_safe_food", "cook_food", "craft_axe", "craft_pickaxe"}
+                        and reason == "verified"))
+        if not eligible:
+            return True
+        if kind == "eat_safe_food" and observed is not None:
+            # A composite eat can first verify cooking. Prefetch only once
+            # hunger actually rises, after the food has been consumed.
+            old_hunger = float(state.get("player", {}).get("vitals", {}).get("hunger") or 0)
+            new_hunger = float(observed.get("player", {}).get("vitals", {}).get("hunger") or 0)
+            if new_hunger <= old_hunger:
+                return True
+        try:
+            with timing.span("decision.prefetch_checkpoint"):
+                if observed is None:
+                    _, position = controller.latest_state(args.log)
+                    observed, _ = controller.wait_for_fresh_state(args.log, position, timeout=0.15)
+                if (observed.get("player", {}).get("vitals", {}).get("dead")
+                        or controller.nearest_hostile(observed, maximum_distance=12.0)
+                        or controller.night_travel_without_torch(observed)):
+                    prefetch.discard("danger_or_darkness")
+                    return False
+                upcoming, actions = build_candidates(observed)
+                request_state = {**observed, "_jev_execution_context": {
+                    "current_action": current_choice, "stage": reason,
+                    "decision_applies": "after_current_bounded_action",
+                }}
+                with timing.span("decision.prefetch_submit"):
+                    prefetch.submit(request_state, upcoming, actions, daily_plan)
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"jev_prefetch_checkpoint_skipped error={type(exc).__name__}")
+        return True
+
     try:
-        executed = execute_action(dispatch[choice], args.log, args.move_seconds)
+        with controller.observe_action(checkpoint if prefetch is not None else None):
+            executed = execute_action(selected, args.log, args.move_seconds)
     except (RuntimeError, OSError, ValueError):
+        if prefetch is not None:
+            prefetch.discard("action_failed")
         if planner is not None:
             planner.record_action(state, choice, "failed")
         raise
     if planner is not None:
         planner.record_action(state, choice, "executed" if executed else "skipped")
+    timing.annotate(outcome="executed" if executed else "skipped")
     print("action_executed" if executed else "action_skipped: state changed before execution")
     return False
 
@@ -847,6 +980,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", type=Path, help="Path to the .env file")
     parser.add_argument("--log", type=Path, default=controller.DEFAULT_LOG)
+    parser.add_argument("--timing-log", type=Path, default=timing.DEFAULT_LOG,
+                        help="Per-cycle JSONL timing log (default: logs/timing.jsonl beside this script)")
+    parser.add_argument("--timing-details", action="store_true",
+                        help="Also print individual timing spans after each cycle")
+    parser.add_argument("--no-prefetch", action="store_true",
+                        help="Disable next-decision prefetch for a serial timing baseline")
     parser.add_argument("--execute", action="store_true", help="Execute the selected action")
     parser.add_argument(
         "--min-confidence",
@@ -869,7 +1008,7 @@ def main() -> int:
         "--move-seconds",
         type=float,
         default=1.0,
-        help="Duration of each exploratory movement (default: 1.0, range: 0.2-2.0)",
+        help="Exploration pulse duration scale and cap (default: 1.0, range: 0.2-2.0)",
     )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -886,6 +1025,7 @@ def main() -> int:
                     "distance": 3.0,
                     "tags": ["pickable"],
                     "pickable": True,
+                    "collect_path": {"status": "ready", "waypoint": {"x": 3.0, "z": 0}},
                 }
             ],
         }
@@ -908,8 +1048,10 @@ def main() -> int:
         assert "collect_berrybush" not in depleted_criteria
         loose_resources = dict(sample)
         loose_resources["nearby"] = [
-            {"guid": 102, "prefab": "log", "distance": 2.0, "tags": ["_inventoryitem"]},
-            {"guid": 103, "prefab": "rocks", "distance": 2.5, "tags": ["_inventoryitem"]},
+            {"guid": 102, "prefab": "log", "distance": 2.0, "tags": ["_inventoryitem"],
+             "collect_path": {"status": "ready", "waypoint": {"x": 2.0, "z": 0}}},
+            {"guid": 103, "prefab": "rocks", "distance": 2.5, "tags": ["_inventoryitem"],
+             "collect_path": {"status": "ready", "waypoint": {"x": 2.5, "z": 0}}},
         ]
         loose_criteria, loose_dispatch = build_candidates(loose_resources)
         assert loose_dispatch["collect_log"] == {"kind": "collect", "prefab": "log", "guid": 102}
@@ -1014,34 +1156,55 @@ def main() -> int:
         if planner is None and args.execute:
             print("daily_planner_disabled: DEEPSEEK_API_KEY not set")
 
+    print(f"timing_log={args.timing_log.resolve()}")
+
+    prefetch = DecisionPrefetch(
+        lambda state, criteria, plan: call_jev(api_url, api_key, model, state, criteria, plan)
+    ) if args.loop and args.execute and not args.no_prefetch else None
+    print(f"jev_prefetch={'enabled' if prefetch is not None else 'disabled'}")
+
+    try:
+        return run_control_loop(args, api_url, api_key, model, planner, prefetch)
+    finally:
+        if prefetch is not None:
+            prefetch.close()
+        if planner is not None:
+            planner.close()
+
+
+def run_control_loop(args, api_url, api_key, model, planner, prefetch):
     cycle = 0
     consecutive_errors = 0
     while True:
         cycle += 1
         if args.loop:
             print(f"cycle={cycle}")
-        try:
-            terminal = run_decision_cycle(args, api_url, api_key, model, planner)
-            consecutive_errors = 0
-        except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
-            if not args.loop:
-                raise
-            consecutive_errors += 1
-            retry_base = max(args.interval, 1.0)
-            retry_delay = min(retry_base * (2 ** min(consecutive_errors - 1, 3)), 30.0)
-            print(
-                f"cycle_error={exc}; retrying_in={retry_delay:.1f}s",
-                file=sys.stderr,
-            )
-            time.sleep(retry_delay)
-            continue
+        with timing.CycleTrace(cycle, args.timing_log, args.timing_details):
+            try:
+                terminal = run_decision_cycle(args, api_url, api_key, model, planner, prefetch)
+                consecutive_errors = 0
+            except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
+                timing.annotate(outcome="retry_error", error_type=type(exc).__name__)
+                if prefetch is not None:
+                    prefetch.discard("cycle_error")
+                if not args.loop:
+                    raise
+                consecutive_errors += 1
+                retry_base = max(args.interval, 1.0)
+                retry_delay = min(retry_base * (2 ** min(consecutive_errors - 1, 3)), 30.0)
+                print(
+                    f"cycle_error={exc}; retrying_in={retry_delay:.1f}s",
+                    file=sys.stderr,
+                )
+                with timing.span("loop.retry_backoff", seconds=retry_delay):
+                    time.sleep(retry_delay)
+                continue
 
-        if terminal or not args.loop:
-            if planner is not None:
-                planner.close()
-            return 0
-        if args.interval > 0:
-            time.sleep(args.interval)
+            if terminal or not args.loop:
+                return 0
+            if args.interval > 0:
+                with timing.span("loop.cooldown", seconds=args.interval):
+                    time.sleep(args.interval)
 
 
 if __name__ == "__main__":

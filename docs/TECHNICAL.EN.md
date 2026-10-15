@@ -1,4 +1,4 @@
-# JEV DST Agent technical reference (1.4.2)
+# JEV DST Agent technical reference (1.5.3)
 
 [Project README](../README.EN.md) · [中文技术说明](TECHNICAL.md)
 
@@ -16,13 +16,123 @@ Once per second, the client mod writes one JSON record to `client_log.txt` with:
 - inventory and equipped items;
 - whether a torch or campfire can be crafted;
 - nearby useful items, resources, light sources and threats.
-- observed region and road state, persistent targets and current legs.
+- observed regions, persistent exploration headings, targets and current legs.
 
 Short records start with `[JEV_DST_STATE]`. Records longer than the safe game-log
 line size are emitted as numbered `[JEV_DST_CHUNK]` lines and reassembled by
 Python. A trailing tab added by the game log is removed from each part first.
 The controller and watcher accept only complete, valid JSON records;
 truncated lines left by older Mod versions are ignored.
+
+### Action handoff and latency
+
+Version 1.4.3 advertises `telemetry.on_demand`. After observing this capability,
+the controller uses the reserved F2 key to request an immediate snapshot instead
+of waiting for the next heartbeat. A fresh-state wait requests one snapshot;
+semantic completion checks request updates at most about every 0.2 seconds and
+poll the log every 0.02 seconds. Older mods continue using their periodic records.
+
+The log reader parses only appended data, retains partial lines and chunked
+frames, and detects truncation or replacement. Focusing an already foreground
+game no longer adds a delay. Collection waits for an actual outcome after one
+Space input so rapid snapshots do not cause repeated interaction during an
+unfinished animation. Movement still requires a post-release observation.
+
+Version 1.4.4 enables next-decision prefetch in execution loops. Single decisions
+and dry runs remain sequential. `decision_time` reports full request latency;
+`cycle_timing` reports actual blocking time. The loop cooldown remains zero and
+DeepSeek planning runs in the background. Update and reload the mod for snapshots
+and coastline detours.
+
+### Next-decision prefetch
+
+Exploration is now event-driven: movement checkpoints obtain fresh observations
+for safety and event detection only, not per-leg model requests. The next JEV
+request may be submitted only when an event ends the current exploration intent.
+`--no-prefetch` does not disable event detection.
+Collection, eating, cooking and basic tool crafting may also submit after their
+completion condition is observed; short actions provide little overlap. Long
+work actions do not prefetch when chopping or mining first starts. Background
+threads never send game inputs.
+
+At most one prefetch is retained, with a three-second lifetime. Phase, inventory,
+health, threat and position changes invalidate it. Before execution, both normal
+and prefetched decisions are matched against freshly generated legal candidates
+by collection GUID, destination node or local frontier identity. Unknown-exit
+search is matched by its source region rather than a changing temporary waypoint.
+An area's
+list index cannot silently change the chosen destination. Invalid results fall
+back to a new JEV request; the controller never selects a replacement action.
+Use `--no-prefetch` for a serial baseline.
+
+Timing records include `decision_source`, `prefetch_request_ms`, remaining
+`prefetch_wait_ms`, and overlapping `prefetch_hidden_ms`. `prefetch_timing` stores
+the worker's separate API breakdown; do not add it to main-thread elapsed time.
+Slow requests and frequent state changes can still cause pauses.
+
+### Collection paths and temporarily unavailable targets
+
+Version 1.4.5 emits schema 9. Collectible entities carry `collect_path`, including
+`status`, `reason`, verified route `distance` and the next `waypoint`. `ready`
+requires a continuous passable land route, not just a passable destination.
+`blocked` means the target's ground is impassable; `unknown` means no safe route
+was found in current observations. A blocked direct segment can detour through
+observed passable cells across terrain types while avoiding known threats. The
+2048-cell search tree is built at most once per snapshot for all collectible
+targets. Unknown routes are reconsidered on later observations.
+
+Only ready, unpaused targets become JEV collection candidates. A nearby blocked
+target does not hide a farther reachable item of the same prefab. Candidates
+include both straight-line and route distances; JEV and DeepSeek state summaries
+include route status and reason. Execution follows live waypoints and measures
+progress toward the waypoint, allowing detours to temporarily increase distance
+to the resource. Automatic work-drop pickup uses the same filtering.
+
+Two stalled movements, backtracking, exhausting the approach step budget, or an
+interaction verification timeout pause the player/target GUID pair for 30 seconds
+and skip the action without global error backoff. Moving the player six units,
+moving the target two units, or expiration allows reconsideration if a route is
+ready. Logs include the pause reason and approach waypoints. Losing a route is
+not treated as completing collection. Update both Mod and Python: targets with
+missing route data are not exposed. Lack of a currently known route does not
+prove permanent unreachability.
+
+Approach pulses are capped at 0.5 seconds, with at most 1.5 seconds waiting for
+post-release telemetry. A feedback timeout pauses the target with
+`approach_feedback_timeout` rather than entering global retry backoff.
+
+### Per-stage timing logs
+
+Each cycle appends a record to `logs/timing.jsonl` beside the script and prints a
+`cycle_timing` summary. Add `--timing-details` to print individual spans, or use
+`--timing-log .\logs\my-run.jsonl` to change the destination.
+
+Records include `run_id`, `cycle`, UTC timestamp, selected action, and timings for
+observation, planner updates, candidates, JEV requests, execution, window lookup
+and focus, keyboard holds, fresh-state waits, completion checks, cooldowns and
+retry backoff. API timing separates response headers, body reading and JSON
+parsing. Header latency includes connection, network and server processing;
+it does not isolate model inference. Work actions distinguish acknowledgement,
+completion and drop collection; collection approach spans include step, distance
+and target GUID.
+
+`totals` contains call counts, inclusive `total_ms`, exclusive `self_ms` and
+`max_ms` per stage. `spans` contains start offsets, durations, parent IDs and
+outcomes. Log polling is aggregated without a span per poll. Detail is capped at
+512 spans per cycle; `dropped_spans` reports omitted detail. Parent times include
+child times, so action, fresh-wait and verification times must not be added
+together. Verification includes animation and state feedback. Cycle totals
+include cooldown or backoff but exclude timing-log output itself.
+
+Errors, timeouts, interrupts, dry runs, abstentions and skipped actions are also
+recorded. Error records include exception types, not messages. Credentials,
+headers, full state and model text are not recorded. Logs are Git-ignored;
+file-write failure prints a warning without stopping control. Inspect the latest
+cycle's aggregates with:
+
+```powershell
+(Get-Content .\logs\timing.jsonl -Tail 1 | ConvertFrom-Json).totals | Format-List
+```
 
 ## Install the mod
 
@@ -95,7 +205,8 @@ versus live resource selection, GUID handoff, fallback selection, and collection
 completion when inventory increases while the harvested plant remains visible.
 
 Collection movement uses distance-scaled pulses: up to one second while far
-away, braking to 0.18 seconds near interaction range. An active pursuer within
+away, braking to 0.04 seconds near interaction range and requiring post-release
+telemetry before correcting direction. An active pursuer within
 five world units interrupts collection immediately. When pursued at close range,
 an unarmed character receives only a flee action; a carried weapon can be
 equipped, and attack is exposed only while a weapon is already equipped. Fleeing
@@ -114,7 +225,7 @@ Exploration also avoids recently observed hostiles. The Mod marks entities
 with DST's `hostile` tag as `potentialThreat` even before they attack and
 remembers their positions for 90 seconds. Frontiers within 14 units are
 excluded; those 14–26 units away receive a distance-based score penalty.
-Dangerous persistent targets, adjacent-area legs, and road legs are withheld.
+Dangerous persistent targets and known-region legs are withheld.
 Immediately before every movement pulse, the controller checks the whole leg
 against fresh and remembered threats, preventing a post-flee return toward the
 same enemy. Hazard memories expire instead of blocking an area permanently.
@@ -270,75 +381,163 @@ next cycle begins, so actions never overlap. Day 2 is not a terminal state: the
 loop continues indefinitely and stops only on death or when interrupted with
 `Ctrl+C`. Transient errors retry with bounded exponential backoff.
 
-Exploration offers two semantic actions instead of four directions:
-`explore_current_region` surveys the current ground-tile biome, while
-`explore_other_region` follows an observed road toward another biome.
-The road action is omitted when no reachable, unexplored road continuation is
-known. A road is a travel cue, not proof that a new region is ahead.
+### Topology regions and unknown-exit search (1.5.0)
 
-The Mod samples ground tiles, topology IDs, roads and passability only around
-the player; it does not read the entire unexplored world map. Topology remains
-available as world-generation context, not as a biome label. `current_biome`
-classifies forest, grassland, savanna, swamp, rocky ground, deciduous forest,
-desert and dirt from actual ground tiles. On roads or artificial flooring it
-samples adjacent natural ground; a biome change needs two consecutive samples.
-`biomes_seen` lists observed terrain types. Spawn and mixed areas cannot be
-identified from a single tile; desert ground alone cannot distinguish an oasis.
-Observed road segments form a small graph: the route may backtrack over
-visited segments to reach an unvisited branch, but visited segments alone do
-not create an exploration action.
+Schema 10 keys regions by `GetTopologyIDAtPoint` alone, not topology plus tile
+type. Mixed ground inside one room stays one region; separate rooms with the
+same ground type are not merged. Only nearby terrain, topology and
+passability are sampled, not the unexplored world map.
 
-The Mod also builds an incremental area graph. A node is keyed by topology ID
-plus terrain type and records observed cells, entries, and resources actually
-seen there. A passable observed boundary or a verified crossing connects two
-nodes; up to three gateways are retained per pair. Telemetry includes only the
-current node, up to four actionable adjacent routes, and one recorded return
-route—not the entire graph. JEV can choose `explore_adjacent_1` and similar
-actions to enter a discovered neighbor, or `return_previous_region` to
-backtrack through a recorded connection. Prompts distinguish observed resources
-from terrain-based possibilities. Each choice moves only one verified leg and
-then returns control to JEV. A blocked direct route may use known cells of the
-current node; road exploration remains available to discover unknown nodes and
-stops when a new graph node is entered.
+JEV can choose all three categories concurrently:
 
-This is not yet a strict connected-component map: disconnected same-terrain
-patches inside one topology block can share a node ID, but an action is offered
-only for a known passable gateway. Graph memory resets when the world is reloaded.
+- `explore_current_region`: search the current topology room for local resources.
+- `explore_other_region`: investigate unknown exits directionally, even
+  when other regions have already been discovered.
+- `travel_region_N`: go to a discovered region, including previously visited
+  regions. There is no separate return action.
 
-For current-region exploration, the Mod divides nearby terrain into four-unit
-cells and remembers observed cells. A frontier is a known passable cell in the
-current ground-tile biome adjacent to at least one unknown cell. Its baseline score is:
+`navigation.graph.current` includes terrain composition, actual resources,
+entries, observed area and boundary status. Names such as `forest 1` and
+`grassland 2` retain assigned numbers when routes reorder. A second classified
+terrain comprising at least 20% of observed terrain can refine a label to
+`mixed N`; it then stays mixed. The topology ID never changes. Observed area
+counts unique passable four-unit cells times 16 square world units, not square
+meters, total area or a completion percentage.
+
+`boundary_complete` means every neighbor of the region's observed land cells
+is known at this grid resolution. Unknown cells and passable neighbors with
+unidentified topology keep it incomplete. Failed routing or danger never
+establish completeness. A complete boundary hides unknown-exit search, not
+known-region travel. Narrow sub-grid exits can still be missed.
+
+Observed passable gateways or verified crossings connect regions, with up to
+three gateways per pair. `navigation.graph.routes` unifies known destinations,
+including multi-hop routes through intermediate rooms. Choices distinguish
+observed resources from terrain priors and report entered status, observed
+area, boundary state and hops. Distance is to the NEXT exit, not a fabricated
+total distance to a remote destination. Future historical connections may no
+longer be safe; the next leg is revalidated at execution.
+
+`scripts/jev_exploration.lua` retains an outward heading across collection and
+crafting. An eligible frontier supplies the initial heading. When forward and
+laterally offset paths are blocked, it follows a fixed
+boundary side, resuming the original heading when forward opens. This is a
+local geometric fallback, not proof of a coastline. Recent trajectory loops
+pause the old target for 30 seconds and reconsider direction.
+`navigation.search` reports heading, strategy
+and cumulative displacement while the intent exists, including incidental
+movement rather than only deliberate exploration.
+
+JEV chooses the intent and destination; navigation only proposes executable
+legs. One exploration choice continues through verified legs of at most four
+units until an event, without periodic time, distance or leg-count decisions.
+Legs are sensing/navigation checkpoints, not model-decision boundaries.
+
+Events include an enemy targeting the player (even an already-visible enemy),
+a new potential threat or an approaching known threat at dangerous range,
+health loss, death, lost night lighting, phase changes, critical hunger with
+safe food carried, region discovery/entry,
+destination arrival, path failure, stalls and backtracking. Stopping never
+automatically selects collecting, fighting or fleeing instead of JEV.
+
+New resource events require a supported, currently collectible resource with
+a verified reachable route. Player/resource GUID memory suppresses repeated
+events from known berries or items leaving and re-entering view. Depleted plants
+and unreachable items do not interrupt. Memory keeps up to four players and
+approximately 8192 resources per player before rebuilding; process restarts or
+regressing game time reset it. Discovery during a model request is compared
+against what the model actually observed, not silently treated as declined.
+
+Known plants explicitly observed with `pickable=false` later trigger one
+`resource_available_again` event when collectible and reachable again. Normal
+state reads record depletion during collecting/crafting as well as exploration.
+Absence, unknown pickability and route failures do not imply depletion. Regrowth
+waits for a usable route; regrowth already included in JEV's decision snapshot
+is acknowledged rather than repeatedly interrupting. Depletion timestamps keep
+stale decisions from consuming newer events. A wholly offscreen harvest/regrowth
+cycle cannot be inferred without an observed depleted state.
+
+`exploration_yield reason=... prefab=... guid=... legs=... distance=...` reports
+why control returned. Timing includes `exploration_event`, leg count and distance.
+`exploration_events.py` contains detection policy. This event-driven update only
+requires the Python files; the schema 10 Mod remains compatible.
+
+Local current-region frontiers are passable cells of the current topology room
+adjacent to unknown cells. Their baseline score is:
 
 ```text
 score = information_gain * 10 - distance * 0.5 - visits * 6
 ```
 
-The highest-scoring reachable frontier becomes a persistent current-region target. The target
-survives intervening collection, crafting and other decisions until it is
-reached, the biome changes, or its next path segment becomes invalid. An invalid target is
-blacklisted for 30 seconds before another frontier is selected.
+The highest-scoring reachable local target survives collection and crafting
+until arrival, a region change or path failure. Unknown-exit search separately
+scores heading alignment, information gain, visits, distance and boundary side,
+trying at most 24 candidates per frame. Known-land detour trees visit at most
+2048 cells. Both paths reject remembered threats.
 
-Current-region exploration walks only the next leg of at most four units.
-One road-exploration decision follows successive live waypoints for at most
-eight legs and ten units, instead of asking JEV again after each roughly
-two-unit waypoint. Each road leg uses up to four short key pulses, with fresh
-telemetry after every release. Arrival allows 1.5 units for a region target and
-1.25 units for a road waypoint, avoiding reverse corrections just to hit an
-exact coordinate. The
-Mod samples each leg every 0.75 units using `TheWorld.Map:IsPassableAtPoint`.
-The controller stops early for a nearby newly discovered resource after at
-least four units, a hostile, a biome or phase change, critical hunger with
-carried food, lost night lighting, or the end of the road. JEV then chooses
-again. Direction keys are only an execution detail derived from the target
-vector. Adjust the duration of a full four-unit leg with `--move-seconds`;
-the default is one second and accepted values are 0.2–2.0 seconds.
+Every leg is sampled at 0.75-unit intervals with `IsPassableAtPoint` and checked
+again for threat distance and night lighting before input. Arrival allows 1.5
+units rather than exact coordinate corrections. Movement uses a nominal six
+units/second with braking; `--move-seconds` scales and caps pulses, default 1,
+range 0.2–2.0. F1 feeds back stalled unknown-search waypoints; two stalled legs
+pause the relevant search point without changing the local-survey target.
+Known-region routes also detect repeated backtracking and pause for 30 seconds.
+Road scanning, road graphs, road-waypoint following, F4 feedback and the
+road-discovery interruption were removed in 1.5.2. Old road telemetry does not
+create choices, and legacy road-following actions are rejected before input.
 
-The controller checks actual position after each leg. If the same target
-produces less than 0.15 units of progress twice in succession, it asks the Mod
-to blacklist that frontier or road waypoint for 30 seconds. JEV chooses the
-next action after each current-region leg or bounded road-follow action. If
-the player moves during a JEV call,
-the controller follows the Mod's latest passable leg for the same frontier.
+Timing records include region ID, name, observed area, search strategy and
+movement endpoints. Memory resets on world reload. Update Python, `modmain.lua`,
+`modinfo.lua` and the ENTIRE `scripts` directory together, then re-enter the world.
+Python tests use `python.exe .\run_tests.py`. Lua simulations use
+`npx.cmd --yes --package=fengari-node-cli fengari tests/exploration_spec.lua`
+(first use downloads a runner). These verify pure policy and Lua compilation,
+not actual DST-engine behavior.
+
+### Diagnosing wait-only states (1.5.1)
+
+Confidence 1.0 can mean `wait` was the only candidate, not that JEV preferred it
+over useful alternatives. Such decisions print `only_wait_available`; timing
+stores `decision_candidates` with actual supplied action keys, frontier/search
+status, known-region/route counts and path diagnostics. `candidate_rejections`
+records Python safety-filter reasons. Decisions with alternatives are not
+misreported as wait-only.
+
+`navigation.diagnostics` counts frontier, path-tree, gateway, exit-search and
+hazard-memory outcomes. `direct_hazard`, `no_observed_start`,
+`no_safe_observed_gateway_path` and `search_budget_exhausted` distinguish hazard
+avoidance, missing observations, absent safe paths and bounded search; none
+proves permanent physical unreachability.
+
+Hazard-blocked direct legs now attempt safe detours too, not just terrain-blocked
+legs. Frontier targets are not discarded merely because their straight line
+crosses danger. Detours may cross observed topology rooms: labels are not walls,
+and actual region entry still yields to JEV. Frontiers, gateways and collection
+share a per-frame safe-land tree with the existing 2048-cell bound. Passability,
+14-unit hazard clearance and 20-unit approach checks remain, with execution-side
+revalidation. A truly unavailable safe path can still leave only waiting.
+
+The existing 90-second hazard lifetime is unchanged. Earlier removal requires
+reobserving the old position inside the scan radius with an untruncated entity
+list and no matching GUID, or observing that the entity is no longer threatening.
+Unseen remote enemies retain their memory. Dynamic danger is not misclassified
+as terrain failure for the 30-second frontier blacklist. Update Mod (including
+`scripts`) and Python together and re-enter the world for this fix.
+
+### Path advancement and stable gateways (1.5.3)
+
+Frontier, known-region and collection detours share ordered-path lookahead:
+choose the furthest safely visible waypoint within eight units, not merely the
+closest BFS root, which can be behind the player. Exploration legs remain at
+most four units. Every shortcut verifies the complete segment for passability
+and hazards; it cannot cut across water or enemies.
+
+Each source/neighbor pair retains its last valid gateway through small distance
+changes. Paths and safety are recalculated every snapshot, and an invalid gateway
+is replaced by another valid candidate. Multi-hop routes carry `gateway_id`,
+also recorded in timing. Controller backtracking/stall pauses now yield
+`route_paused`, distinct from missing Mod paths (`path_unavailable`). Navigation
+continues only JEV's chosen intent; it does not choose a replacement destination.
 
 Equipping a torch uses the same inventory-tile action as manually clicking the
 torch, rather than the action-system auto-equip helper.

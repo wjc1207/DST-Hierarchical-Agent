@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Optional, Tuple
 
 
@@ -59,36 +61,71 @@ class StateAssembler:
         return value if isinstance(value, dict) else None
 
 
+class StateReader:
+    """Tail incrementally, retaining partial lines and chunked frames between polls."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = Lock()
+        self.identity = None
+        self.offset = 0
+        self.anchor = b""
+        self.buffer = b""
+        self.assembler = StateAssembler()
+        self.latest: Optional[dict] = None
+        self.latest_offset = 0
+
+    def read(self) -> Tuple[dict, int]:
+        with self.lock:
+            try:
+                with self.path.open("rb") as stream:
+                    metadata = os.fstat(stream.fileno())
+                    identity = (metadata.st_dev, metadata.st_ino)
+                    reset = (identity != self.identity or metadata.st_size < self.offset
+                             or metadata.st_size - self.offset > MAX_TAIL_BYTES)
+                    if not reset and self.anchor:
+                        # Detect a log truncated and regrown between polls, even
+                        # if the new file is already larger than the old cursor.
+                        stream.seek(self.offset - len(self.anchor))
+                        reset = stream.read(len(self.anchor)) != self.anchor
+                    if reset:
+                        self.identity = identity
+                        self.offset = max(0, metadata.st_size - MAX_TAIL_BYTES)
+                        self.buffer = b""
+                        self.assembler = StateAssembler()
+                        self.latest = None
+                        self.latest_offset = 0
+                        stream.seek(self.offset)
+                        if self.offset:
+                            stream.readline()  # discard the first partial line
+                            self.offset = stream.tell()
+                    stream.seek(self.offset)
+                    self.buffer += stream.read()
+                    self.offset = stream.tell()
+                    stream.seek(max(0, self.offset - 64))
+                    self.anchor = stream.read(self.offset - stream.tell())
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"DST log does not exist: {self.path}") from exc
+
+            line_offset = self.offset - len(self.buffer)
+            lines = self.buffer.split(b"\n")
+            self.buffer = lines.pop()
+            for raw_line in lines:
+                line_offset += len(raw_line) + 1
+                state = self.assembler.feed(raw_line.decode("utf-8", errors="replace"))
+                if state is not None:
+                    self.latest = state
+                    self.latest_offset = line_offset
+            if self.latest is None:
+                raise RuntimeError("No complete JEV telemetry record found; install the updated mod")
+            return self.latest, self.latest_offset
+
+
+@lru_cache(maxsize=8)
+def _reader(path: str) -> StateReader:
+    return StateReader(Path(path))
+
+
 def latest_state(log_path: Path) -> Tuple[dict, int]:
     """Return the latest complete JSON record and its final byte offset."""
-    if not log_path.exists():
-        raise RuntimeError(f"DST log does not exist: {log_path}")
-    with log_path.open("rb") as stream:
-        stream.seek(0, os.SEEK_END)
-        end = stream.tell()
-        start = max(0, end - MAX_TAIL_BYTES)
-        stream.seek(start)
-        data = stream.read()
-
-    offset = start
-    if start:
-        first_newline = data.find(b"\n")
-        if first_newline < 0:
-            raise RuntimeError("No complete JEV telemetry record found in the log tail")
-        offset += first_newline + 1
-        data = data[first_newline + 1:]
-
-    assembler = StateAssembler()
-    latest: Optional[dict] = None
-    latest_offset = 0
-    for raw_line in data.splitlines(keepends=True):
-        offset += len(raw_line)
-        if not raw_line.endswith(b"\n"):
-            continue
-        state = assembler.feed(raw_line.decode("utf-8", errors="replace"))
-        if state is not None:
-            latest = state
-            latest_offset = offset
-    if latest is None:
-        raise RuntimeError("No complete JEV telemetry record found; install the updated mod")
-    return latest, latest_offset
+    return _reader(os.path.abspath(log_path)).read()
