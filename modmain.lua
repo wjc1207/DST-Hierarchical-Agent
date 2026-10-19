@@ -1,5 +1,6 @@
 local json = require("json")
 local exploration = require("jev_exploration")
+local execution_observer = require("jev_execution")
 local G = GLOBAL
 local protected_call = G.pcall
 
@@ -39,7 +40,8 @@ local BIOME_BY_TILE =
 
 local GRAPH_RESOURCE_PREFABS =
 {
-    grass = true, sapling = true, berrybush = true, berrybush2 = true,
+    flower = true,
+    grass = true, sapling = true, berrybush = true, berrybush2 = true, berrybush_juicy = true,
     evergreen = true, deciduoustree = true, rock1 = true, rock2 = true,
     rock_flintless = true, flint = true, goldnugget = true, carrot = true,
     rabbit = true, beefalo = true, reeds = true, marsh_bush = true,
@@ -100,6 +102,8 @@ local WEAPON_PREFAB_SCORE =
 
 local RELEVANT_PREFABS =
 {
+    flower = true,
+    petals = true,
     grass = true,
     sapling = true,
     sapling_moon = true,
@@ -111,9 +115,11 @@ local RELEVANT_PREFABS =
     carrot_planted = true,
     carrot = true,
     berries = true,
+    berries_juicy = true,
+    berries_juicy_cooked = true,
     berrybush = true,
     berrybush2 = true,
-    juicyberrybush = true,
+    berrybush_juicy = true,
     evergreen = true,
     evergreen_sparse = true,
     deciduoustree = true,
@@ -135,12 +141,13 @@ local RELEVANT_PREFABS =
 
 local PICKABLE_SOURCE_PREFABS =
 {
+    flower = true,
     grass = true,
     sapling = true,
     sapling_moon = true,
     berrybush = true,
     berrybush2 = true,
-    juicyberrybush = true,
+    berrybush_juicy = true,
 }
 
 local function round(value, digits)
@@ -324,6 +331,11 @@ local function read_nearby(player)
             if PICKABLE_SOURCE_PREFABS[entity.prefab or ""] then
                 record.pickable = can_be_picked(entity)
             end
+            if entity:HasTag("_inventoryitem") then
+                record.stack_count = safe_call(function()
+                    return entity.replica.stackable:StackSize()
+                end, 1)
+            end
             if entity:HasTag("CHOP_workable") then
                 record.work_required = DEFAULT_CHOP_WORK
             elseif entity:HasTag("MINE_workable") then
@@ -415,6 +427,7 @@ local function get_navigation_memory(world)
             graph_nodes = {},
             graph_edges = {},
             gateway_targets = {},
+            gateway_crossings = {},
             current_node = nil,
             last_node_position = nil,
             return_stack = {},
@@ -537,15 +550,11 @@ local function frontier_candidates(player, memory)
     local px, py, pz = player.Transform:GetWorldPosition()
     local now = G.GetTime()
     local candidates = {}
+    local gains = exploration.frontier_gains(memory, memory.current_region, NAV_NEIGHBORS)
     for key, cell in pairs(memory.cells) do
-        if cell.passable and cell.region == memory.current_region
+        if gains[key] ~= nil
             and (memory.blacklist[key] or 0) <= now then
-            local information_gain = 0
-            for _, offset in ipairs(NAV_NEIGHBORS) do
-                if memory.cells[nav_key(cell.gx + offset[1], cell.gz + offset[2])] == nil then
-                    information_gain = information_gain + 1
-                end
-            end
+            local information_gain = gains[key]
             if information_gain > 0 then
                 exploration.count(memory, "frontiers", "eligible_boundary")
                 local distance = math.sqrt((cell.x - px) * (cell.x - px) + (cell.z - pz) * (cell.z - pz))
@@ -569,7 +578,7 @@ local function frontier_candidates(player, memory)
                     exploration.count(memory, "frontiers", "dangerous_endpoint")
                 end
             end
-        elseif cell.passable and cell.region == memory.current_region
+        elseif gains[key] ~= nil
             and (memory.blacklist[key] or 0) > now then
             exploration.count(memory, "frontiers", "temporarily_blacklisted")
         end
@@ -797,6 +806,7 @@ local function read_navigation(player, nearby)
     end
 
     if memory.target ~= nil and memory.cells[memory.target.key] ~= nil
+        and memory.cells[memory.target.key].region ~= nil
         and memory.cells[memory.target.key].region ~= memory.current_region then
         memory.target = nil
     end
@@ -1125,6 +1135,7 @@ observe_area_graph = function(player, map, memory, nearby)
     local node = ensure_graph_node(memory, current_id,
         memory.current_region, memory.current_biome)
     if memory.current_node ~= current_id then
+        memory.gateway_crossings = {}
         local old_id = memory.current_node
         if old_id ~= nil then
             local old_position = memory.last_node_position
@@ -1171,11 +1182,13 @@ local function graph_resources(node)
     return resources
 end
 
-local function graph_route_leg(player, map, memory, side_x, side_z,
+local function graph_route_leg(player, map, memory, gateway_id, side_x, side_z,
     destination_x, destination_z)
     local px, py, pz = player.Transform:GetWorldPosition()
-    local distance_to_side = math.sqrt((side_x - px) ^ 2 + (side_z - pz) ^ 2)
-    if distance_to_side <= NAV_ARRIVAL_DISTANCE then
+    local crossing = exploration.gateway_crossing(memory.gateway_crossings[gateway_id],
+        px, pz, side_x, side_z, destination_x, destination_z, NAV_ARRIVAL_DISTANCE)
+    memory.gateway_crossings[gateway_id] = crossing
+    if crossing then
         local leg, reason = make_navigation_leg(player, map,
             { x = destination_x, z = destination_z }, NAV_ARRIVAL_DISTANCE)
         if leg ~= nil and not hazard_segment_unsafe(memory, px, pz, leg.x, leg.z) then
@@ -1263,7 +1276,10 @@ read_area_graph = function(player, map, memory)
                 local side_z = entrance.a_id == current_id and entrance.az or entrance.bz
                 local other_x = entrance.a_id == current_id and entrance.bx or entrance.ax
                 local other_z = entrance.a_id == current_id and entrance.bz or entrance.az
-                local leg = graph_route_leg(player, map, memory,
+                local gateway_id = current_id .. ">" .. other_id .. ":"
+                    .. tostring(side_x) .. ":" .. tostring(side_z)
+                    .. ":" .. tostring(other_x) .. ":" .. tostring(other_z)
+                local leg = graph_route_leg(player, map, memory, gateway_id,
                     side_x, side_z, other_x, other_z)
                 if leg ~= nil and not hazard_segment_unsafe(memory, px, pz,
                     leg.x, leg.z)
@@ -1271,9 +1287,7 @@ read_area_graph = function(player, map, memory)
                     local other = memory.graph_nodes[other_id]
                     local distance = math.sqrt((side_x - px) ^ 2 + (side_z - pz) ^ 2)
                     local route = { status = "ready", node_id = other_id,
-                        gateway_id = current_id .. ">" .. other_id .. ":"
-                            .. tostring(side_x) .. ":" .. tostring(side_z)
-                            .. ":" .. tostring(other_x) .. ":" .. tostring(other_z),
+                        gateway_id = gateway_id,
                         biome = other.biome, topology = other.region,
                         entered = other.entries > 0, resources_seen = graph_resources(other),
                         distance = round(distance, 2),
@@ -1316,6 +1330,7 @@ local function read_collection_paths(player, nearby)
         local collectible = record.pickable == true
         for _, tag in ipairs(record.tags) do
             collectible = collectible or tag == "_inventoryitem" or tag == "pickable"
+                or tag == "CHOP_workable" or tag == "MINE_workable"
         end
         if collectible and (record.pickable == nil or record.pickable == true) then
             local tx, tz = px + record.dx, pz + record.dz
@@ -1367,6 +1382,13 @@ local function read_collection_paths(player, nearby)
     end
 end
 
+local emit_state
+
+local function read_execution(player)
+    execution_observer.attach(player, G.GetTime, function() emit_state(player) end)
+    return execution_observer.read(player, G.GetTime())
+end
+
 local function make_state(player)
     local x, y, z = player.Transform:GetWorldPosition()
     local world = G.TheWorld ~= nil and G.TheWorld.state or {}
@@ -1380,7 +1402,7 @@ local function make_state(player)
     {
         schema = 10,
         observed_at = round(G.GetTime(), 3),
-        telemetry = { on_demand = true, sample_interval = SAMPLE_INTERVAL },
+        telemetry = { on_demand = true, sample_interval = SAMPLE_INTERVAL, cancel_work = true },
         player =
         {
             guid = player.GUID,
@@ -1402,13 +1424,14 @@ local function make_state(player)
         },
         camera = camera,
         work = player._jev_dst_work,
+        execution = read_execution(player),
         navigation = navigation,
         crafting = read_crafting(player),
         nearby = nearby,
     }
 end
 
-local function emit_state(player)
+emit_state = function(player)
     if player == nil or not player:IsValid() or player ~= G.ThePlayer then
         return
     end
@@ -1726,8 +1749,10 @@ local SAFE_FOOD_PRIORITY =
     "cookedmeat",
     "cookedsmallmeat",
     "berries_cooked",
+    "berries_juicy_cooked",
     "carrot_cooked",
     "berries",
+    "berries_juicy",
     "carrot",
     "seeds_cooked",
     "seeds",
@@ -1738,6 +1763,7 @@ local COOKABLE_FOOD_PRIORITY =
     "meat",
     "smallmeat",
     "berries",
+    "berries_juicy",
     "carrot",
 }
 
@@ -2113,6 +2139,25 @@ end
 
 -- Reserved bridge keys. The external controller emits these keys; the mod
 -- translates them into bounded semantic actions and validates prerequisites.
+G.TheInput:AddKeyUpHandler(G.KEY_F4, function()
+    local player = G.ThePlayer
+    if player == nil then return end
+    if player._jev_dst_work_task ~= nil then
+        player._jev_dst_work_task:Cancel()
+        player._jev_dst_work_task = nil
+    end
+    if player._jev_dst_work and player._jev_dst_work.status == "started" then
+        player._jev_dst_work.status = "failed"
+        player._jev_dst_work.reason = "controller_interrupted"
+    end
+    safe_call(function() player:ClearBufferedAction() end, nil)
+    local controller = player.components and player.components.playercontroller
+    if controller then
+        safe_call(function() controller:RemoteStopAllControls() end, nil)
+        safe_call(function() controller.locomotor:Stop() end, nil)
+    end
+    print("[JEV_DST_ACTION]cancel_work:requested")
+end)
 G.TheInput:AddKeyUpHandler(G.KEY_KP_MULTIPLY, craft_torch)
 G.TheInput:AddKeyUpHandler(G.KEY_KP_DIVIDE, equip_torch)
 G.TheInput:AddKeyUpHandler(G.KEY_KP_MINUS, unequip_torch)

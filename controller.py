@@ -47,6 +47,7 @@ VK = {
     "cook_food": 0x72, # F3
     "refresh_state": 0x71, # F2, on-demand telemetry (advertised by the mod)
     "reject_search": 0x70, # F1, reject a stalled outward-search waypoint
+    "cancel_work": 0x73, # F4, cancel the Mod's repeated work dispatch
 }
 MOVEMENT_KEYS = (VK["up"], VK["left"], VK["down"], VK["right"])
 EXPLORATION_STALL = {"target": None, "count": 0, "last_position": None}
@@ -55,6 +56,22 @@ GRAPH_ROUTE_HISTORY: Dict[tuple, list] = {}
 COLLECTION_TARGET_PAUSES: Dict[tuple, dict] = {}
 EXPLORATION_SEEN_RESOURCES: Dict[object, dict] = {}
 _action_observer = ContextVar("action_observer", default=None)
+_state_guard = ContextVar("state_guard", default=None)
+
+
+class AutoExecutionInterrupted(Exception):
+    """A local task lost its safety conditions; return control without retry backoff."""
+
+
+@contextmanager
+def guard_states(log_path, callback):
+    token = _state_guard.set((log_path, callback))
+    try:
+        yield
+    finally:
+        _state_guard.reset(token)
+
+
 REGION_ARRIVAL_DISTANCE = 1.5
 EXPLORATION_HAZARD_CLEARANCE = 14.0
 EXPLORATION_HAZARD_CAUTION = 20.0
@@ -214,7 +231,13 @@ def tap(keys: Sequence[int], seconds: float) -> None:
             for key in keys:
                 send_key(key, True)
             observer = _action_observer.get()
-            if observer is not None and seconds >= 0.3 and any(key in MOVEMENT_KEYS for key in keys):
+            guard = _state_guard.get()
+            if guard is not None and any(key in MOVEMENT_KEYS for key in keys):
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    latest_state(guard[0])
+                    time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            elif observer is not None and seconds >= 0.3 and any(key in MOVEMENT_KEYS for key in keys):
                 deadline = time.monotonic() + seconds
                 time.sleep(min(0.2, seconds * 0.35))
                 keep_moving = observer(None, "movement")
@@ -244,6 +267,9 @@ def latest_state(log_path: Path) -> Tuple[dict, int]:
         # Observe depletion during collection/crafting too, not only while
         # exploring. Merely leaving view never changes availability memory.
         observe_depleted_resources(state, memory["seen"], memory.setdefault("depleted", {}))
+    guard = _state_guard.get()
+    if guard is not None:
+        guard[1](state)
     return state, offset
 
 
@@ -285,6 +311,9 @@ def wait_for_state_condition(log_path: Path, old_position: int, predicate, timeo
                 if observer is not None:
                     observer(state, "verified")
                 return state, position
+            observer = _action_observer.get()
+            if observer is not None:
+                observer(state, "action_progress")
         if time.monotonic() >= next_refresh:
             request_telemetry(state)
             next_refresh = time.monotonic() + 0.2
@@ -304,26 +333,28 @@ def find_target(state: dict, prefab: str, guid: Optional[int] = None) -> Optiona
 
 
 PICKABLE_SOURCE_PREFABS = {
+    "flower",
     "grass",
     "sapling",
     "sapling_moon",
     "berrybush",
     "berrybush2",
-    "juicyberrybush",
+    "berrybush_juicy",
 }
 
 COLLECT_PRODUCTS = {
+    "flower": "petals",
     "grass": "cutgrass",
     "sapling": "twigs",
     "sapling_moon": "twigs",
     "berrybush": "berries",
     "berrybush2": "berries",
-    "juicyberrybush": "berries_juicy",
+    "berrybush_juicy": "berries_juicy",
 }
 EXPLORATION_RESOURCE_PREFABS = set(COLLECT_PRODUCTS) | {
     "twigs", "cutgrass", "flint", "log", "rocks", "goldnugget",
     "nitre", "pinecone", "acorn", "charcoal", "marble", "moonrocknugget",
-    "berries", "carrot", "carrot_planted", "seeds",
+    "berries", "berries_juicy", "berries_juicy_cooked", "carrot", "carrot_planted", "seeds", "petals",
 }
 WORK_DROP_PREFABS = {
     "CHOP_workable": frozenset({
@@ -1088,6 +1119,9 @@ def craft_inventory_item(log_path: Path, prefab: str, crafting_key: str) -> None
     before = item_count(state, prefab)
     hwnd = find_game_window()
     focus_game(hwnd)
+    observer = _action_observer.get()
+    if observer is not None:
+        observer({**state, "_pending_action": {"kind": crafting_key}}, "action_pending")
     tap([VK[crafting_key]], 0.08)
     verified, _ = wait_for_state_condition(
         log_path,
@@ -1146,9 +1180,10 @@ def build_sciencemachine(log_path: Path) -> None:
     print("build verified: science machine appeared nearby")
 
 
-SAFE_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "carrot_cooked", "berries", "carrot", "seeds_cooked", "seeds")
-RAW_COOKABLE_FOOD_PREFABS = ("meat", "smallmeat", "berries", "carrot")
-COOKED_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "carrot_cooked")
+SAFE_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "berries_juicy_cooked",
+                     "carrot_cooked", "berries", "berries_juicy", "carrot", "seeds_cooked", "seeds")
+RAW_COOKABLE_FOOD_PREFABS = ("meat", "smallmeat", "berries", "berries_juicy", "carrot")
+COOKED_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "berries_juicy_cooked", "carrot_cooked")
 
 
 def safe_food_count(state: dict) -> int:
@@ -1370,6 +1405,10 @@ def collect(
             if distance <= 1.0:
                 if not collect_target_available(target):
                     raise RuntimeError(f"Target '{prefab}' is no longer pickable; interaction not sent")
+                observer = _action_observer.get()
+                if observer is not None:
+                    observer({**state, "_pending_action": {"kind": "collect", "prefab": prefab,
+                                                          "guid": guid}}, "action_pending")
                 tap([VK["interact"]], 0.08)
                 # A fast snapshot can precede the pick animation's completion.
                 # Observe its outcome instead of repeatedly pressing Space.

@@ -16,6 +16,9 @@ import controller
 import timing_log as timing
 from daily_planner import DailyPlanner
 from decision_prefetch import DecisionPrefetch, current_action, compatible
+from action_buffer import predict_success, started as buffered_action_started
+from task_board import board_view
+from board_executor import LocalBoardExecutor, task_progressed
 
 
 DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone"
@@ -27,6 +30,8 @@ SAFE_COLLECT_PREFABS = {
     "grass": "Cut grass source; needed urgently for a torch.",
     "sapling": "Twig source; needed urgently for a torch.",
     "sapling_moon": "Twig source; needed for basic crafting.",
+    "flower": "Optional flower picking for petals and potential sanity benefit; not a hunger resource. Some rose variants can hurt; weigh benefit against risk and survival needs.",
+    "petals": "Loose petals from flowers; optional materials, not a hunger resource.",
     "twigs": "Loose twigs; needed urgently for a torch.",
     "cutgrass": "Loose cut grass; needed urgently for a torch.",
     "flint": "Loose flint; useful for early tools.",
@@ -40,9 +45,11 @@ SAFE_COLLECT_PREFABS = {
     "marble": "Loose marble from mining; useful for later crafting.",
     "moonrocknugget": "Loose moon rock from mining.",
     "berries": "Food that can reduce early hunger risk.",
+    "berries_juicy": "Loose juicy berries; edible raw or cooked near a lit fire.",
+    "berries_juicy_cooked": "Loose cooked juicy berries; ready to eat.",
     "berrybush": "Berry source if it currently offers a pick action.",
     "berrybush2": "Berry source if it currently offers a pick action.",
-    "juicyberrybush": "Berry source if it currently offers a pick action.",
+    "berrybush_juicy": "Juicy berry source if it currently offers a pick action.",
     "carrot": "Loose food.",
     "carrot_planted": "Food source.",
     "seeds": "Low-priority emergency food.",
@@ -51,8 +58,10 @@ SAFE_FOOD_PREFABS = {
     "cookedmeat",
     "cookedsmallmeat",
     "berries_cooked",
+    "berries_juicy_cooked",
     "carrot_cooked",
     "berries",
+    "berries_juicy",
     "carrot",
     "seeds_cooked",
     "seeds",
@@ -61,17 +70,19 @@ COOKABLE_FOOD_PRODUCTS = {
     "meat": "cookedmeat",
     "smallmeat": "cookedsmallmeat",
     "berries": "berries_cooked",
+    "berries_juicy": "berries_juicy_cooked",
     "carrot": "carrot_cooked",
 }
 CRITICAL_HUNGER_RATIO = 0.30
 TOOL_MAX_USES = {"axe": 100, "pickaxe": 33}
 PICKABLE_SOURCE_PREFABS = {
+    "flower",
     "grass",
     "sapling",
     "sapling_moon",
     "berrybush",
     "berrybush2",
-    "juicyberrybush",
+    "berrybush_juicy",
 }
 
 
@@ -416,12 +427,13 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     counts = inventory_counts(state)
     torch_count = counts.get("torch", 0)
     torch_equipped = has_equipped_torch(state)
-    if state.get("crafting", {}).get("torch", False) and torch_count == 0:
+    if state.get("crafting", {}).get("torch", False):
         criteria["craft_torch"] = (
-            "Craft one torch now. This option is exposed only because the game reports that the "
-            "recipe is currently craftable. If DST auto-equips it during day or dusk, the "
-            "controller immediately unequips it to save fuel. Strongly prefer before night, "
-            "especially during dusk."
+            f"Craft one additional torch; {torch_count} currently carried or equipped. "
+            "This option is exposed because the game reports that the recipe is currently craftable. "
+            "If DST auto-equips it during day or dusk, the controller immediately unequips it "
+            "to save fuel. Consider current reserves and the task board before spending materials; "
+            "prioritize preparing light before night when reserves are insufficient."
         )
         dispatch["craft_torch"] = {"kind": "craft_torch"}
     if torch_count > 0 and not torch_equipped:
@@ -653,8 +665,8 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
             "A nearby potentialThreat may attack on approach even when activeThreat is false; avoid routes through remembered hazards.",
             "Regions are game topology rooms, not individual ground tiles; mixed terrain can belong to one region. Names have stable topology IDs, and observed area is not total area or a completion percentage.",
             "Current-region search finds local resources. New-region search investigates unknown exits, preserving its heading across short interruptions; known-region travel is separate and includes returning. When local resources no longer meet needs, consider unknown exits or known regions with useful resources rather than repeatedly surveying the same area.",
-            "A daily_plan is strategic advice from a separate planner, not a command. Make the fastest safe next-action choice from current facts; do not generate or revise a plan.",
-            "When execution_context is present, choose the action to run after the current bounded action; use observed facts only. The controller will revalidate it before execution.",
+            "A task_board (or legacy daily_plan) is strategic advice from a separate planner, not a command. Prefer ready/in_progress tasks with higher priority (1 highest); ignore done, blocked or expired tasks. Choose the fastest safe available next action that advances a task. You may respond to new opportunities and emergencies instead; never generate a plan or wait merely because a hint is unavailable.",
+            "When execution_context.predicted_success is true, the supplied state is the predicted successful outcome of the running action, not an observation. Choose just one next action conditional on that success; do not expand a plan. Otherwise use observed facts. The controller verifies the outcome and revalidates your choice before execution.",
         ],
         "day": world.get("day"),
         "phase": world.get("phase"),
@@ -702,7 +714,10 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
         ],
     }
     if daily_plan is not None:
-        compact["daily_plan"] = daily_plan
+        if daily_plan.get("kind") == "task_board":
+            compact["task_board"] = board_view(daily_plan, state)
+        else:
+            compact["daily_plan"] = daily_plan
     return compact
 
 
@@ -722,7 +737,7 @@ def call_jev(
                     "one semantic action, even when the controller performs several verified substeps. "
                     "Exploration continues until a meaningful event, not until the next short movement leg. "
                     "Decide the next action quickly from current state and criteria; do not plan ahead. "
-                    "Obey hard rules and immediate survival needs. Treat daily_plan, when present, "
+                    "Obey hard rules and immediate survival needs. Treat task_board or legacy daily_plan, when present, "
                     "as optional strategic guidance, never as permission to ignore current facts. "
                     "Do not request unavailable or redundant substeps."
                 ),
@@ -765,7 +780,8 @@ def call_jev(
 def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> bool:
     kind = action["kind"]
     if kind == "collect":
-        return controller.collect(log_path, action["prefab"], preferred_guid=action.get("guid"))
+        return controller.collect(log_path, action["prefab"], preferred_guid=action.get("guid"),
+                                  strict_preferred=action.get("_strict_preferred", False))
     elif kind == "explore":
         if action.get("navigation_mode") == "road":
             raise ValueError("Road-following exploration has been removed; update the mod")
@@ -808,27 +824,78 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> b
 
 
 def default_execution_threshold(choice: str, state: Optional[dict] = None) -> float:
-    """Apply the shared gate, with only urgent and riskier actions excepted."""
-    if choice in {"flee_from_nearest_hostile", "wait"}:
-        return 0.0
-    if choice in {"explore", "explore_current_region", "explore_other_region",
-                  "return_previous_region"} or choice.startswith(("explore_adjacent_", "travel_region_")):
-        return 0.15
-    if choice == "attack_nearest_hostile":
-        return 0.45
-    if choice == "eat_safe_food" and state is not None:
-        vitals = state.get("player", {}).get("vitals", {})
-        hunger = float(vitals.get("hunger") or 0)
-        hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
-        if hunger / hunger_max < CRITICAL_HUNGER_RATIO:
-            return 0.0
-    return 0.25
+    """Only attacks retain a confidence gate; legality checks are separate."""
+    return 0.45 if choice == "attack_nearest_hostile" else 0.0
+
+
+def run_local_board_step(args, state, board, dispatch, planner, prefetch, executor):
+    """One verified local action per loop; repeated loops need no model request."""
+    local_dispatch = dict(dispatch)
+    if can_eat_safe_food(state) and action_allowed(state, "eat_safe_food")[0]:
+        local_dispatch.setdefault("eat_safe_food", {"kind": "eat_safe_food"})
+    chosen = executor.choose(board, state, local_dispatch)
+    if chosen is None:
+        return False
+    task, choice, selected = chosen
+    if prefetch is not None:
+        prefetch.discard("local_board_execution")
+    timing.annotate(decision_source="board_auto", action=choice, current_action=choice,
+                    board_task_id=task["id"], board_auto_action=choice)
+    print(f"board_auto task={task['id']} action={choice} "
+          f"progress={task['progress']['current']}/{task['progress']['required']}")
+    finished = False
+    attempted = False
+    try:
+        with timing.span("board.auto_execute"):
+            with controller.observe_action(None), controller.guard_states(args.log, executor.guard(state, selected)):
+                fresh, _ = controller.latest_state(args.log)
+                # Match the currently legal target immediately before sending input.
+                _, refreshed = build_candidates(fresh)
+                if choice == "eat_safe_food" and can_eat_safe_food(fresh) and action_allowed(fresh, choice)[0]:
+                    refreshed[choice] = {"kind": choice}
+                fresh_chosen = executor.choose(board, fresh, refreshed)
+                if fresh_chosen is None or executor.key(board, task, selected) != executor.key(board, fresh_chosen[0], fresh_chosen[2]):
+                    raise controller.AutoExecutionInterrupted("task_or_target_changed")
+                attempted = True
+                executed = execute_action(fresh_chosen[2], args.log, args.move_seconds)
+                completed, _ = controller.latest_state(args.log)
+        if executed and task_progressed(board, task, fresh, completed):
+            finished = True
+            if planner is not None:
+                planner.record_action(fresh, choice, "executed")
+            timing.annotate(outcome="executed", board_auto_outcome="executed")
+            print("board_auto_completed")
+            return True
+        executor.pause(board, task, selected)
+        timing.annotate(board_auto_outcome="no_progress")
+        print("board_auto_handoff reason=no_progress")
+    except controller.AutoExecutionInterrupted as exc:
+        timing.annotate(board_auto_outcome="interrupted", board_handoff_reason=str(exc))
+        print(f"board_auto_handoff reason={exc}")
+    except (RuntimeError, OSError, ValueError) as exc:
+        executor.pause(board, task, selected)
+        timing.annotate(board_auto_outcome="failed", board_handoff_reason=type(exc).__name__)
+        if planner is not None:
+            planner.record_action(state, choice, "failed")
+        print(f"board_auto_handoff reason=execution_failed error={type(exc).__name__}")
+    finally:
+        controller.release_movement_keys()
+        # Also runs on Ctrl+C. Stop queued work, but never send F4 to an
+        # unrelated foreground application after a failed focus attempt.
+        if attempted and not finished and selected["kind"] in {"chop_nearest_tree", "mine_nearest_rock"}:
+            try:
+                controller.focus_game(controller.find_game_window())
+                controller.tap([controller.VK["cancel_work"]], 0.04)
+            except (RuntimeError, OSError) as exc:
+                print(f"board_auto_cancel_failed error={type(exc).__name__}")
+    return False
 
 
 def run_decision_cycle(
     args, api_url: str, api_key: str, model: str,
     planner: Optional[DailyPlanner] = None,
     prefetch: Optional[DecisionPrefetch] = None,
+    local_executor: Optional[LocalBoardExecutor] = None,
 ) -> bool:
     """Run one sense-decide-act cycle. Return True at a terminal game state."""
     with timing.span("cycle.observe"):
@@ -842,9 +909,28 @@ def run_decision_cycle(
         return True
     with timing.span("planner.update"):
         daily_plan = planner.update(state) if planner is not None else None
+    if daily_plan and daily_plan.get("kind") == "task_board":
+        timing.annotate(task_board_id=daily_plan.get("board_id"),
+                        ready_task_ids=daily_plan.get("ready_task_ids", []))
     criteria, dispatch = build_candidates(state)
+    if args.execute and daily_plan and daily_plan.get("kind") == "task_board":
+        if run_local_board_step(args, state, daily_plan, dispatch, planner, prefetch,
+                                local_executor if local_executor is not None else LocalBoardExecutor()):
+            return False
+        # After any attempted auto action, hand off using actual latest state,
+        # never the snapshot from before collection, damage or a phase change.
+        state, _ = controller.latest_state(args.log)
+        world = state.get("world", {})
+        if state.get("player", {}).get("vitals", {}).get("dead"):
+            timing.annotate(outcome="terminal")
+            return True
+        daily_plan = planner.update(state) if planner is not None else daily_plan
+        timing.annotate(day=world.get("day"), phase=world.get("phase"),
+                        task_board_id=(daily_plan or {}).get("board_id"),
+                        ready_task_ids=(daily_plan or {}).get("ready_task_ids", []))
+        criteria, dispatch = build_candidates(state)
     timing.annotate(decision_source="synchronous")
-    cached = prefetch.take(state, dispatch) if prefetch is not None else None
+    cached = prefetch.take(state, dispatch, plan=daily_plan) if prefetch is not None else None
     if cached is None:
         if prefetch is not None:
             with timing.span("decision.prefetch_refresh"):
@@ -914,7 +1000,7 @@ def run_decision_cycle(
 
     threshold = (
         args.min_confidence
-        if args.min_confidence is not None
+        if selected["kind"] == "attack_nearest_hostile" and args.min_confidence is not None
         else default_execution_threshold(current_choice, state)
     )
     print(f"execution_threshold={threshold:.2f}")
@@ -923,14 +1009,44 @@ def run_decision_cycle(
         print(f"abstained: confidence below {threshold:.2f}")
         return False
 
+    pending = None
+    prediction_submitted = False
+
     def checkpoint(observed, reason):
+        nonlocal pending, prediction_submitted
         kind = selected["kind"]
         if prefetch is None:
             return True
-        eligible = ((kind == "explore" and reason == "exploration_event")
-                    or (kind in {"collect", "eat_safe_food", "cook_food", "craft_axe", "craft_pickaxe"}
-                        and reason == "verified"))
-        if not eligible:
+        if reason == "action_pending" and observed is not None:
+            pending = (observed, observed.get("_pending_action", {}))
+            return True
+        predicting = False
+        if reason == "action_progress":
+            if prediction_submitted and pending is not None and observed is not None:
+                if not compatible(pending[0], observed, check_inventory=False):
+                    prefetch.discard("event_during_current_action")
+                    timing.annotate(buffer_validation="event_during_current_action")
+                return True
+            if pending is None or prediction_submitted or observed is None:
+                return True
+            before, running = pending
+            if not buffered_action_started(observed, running, since=float(before.get("observed_at") or 0)):
+                return True
+            if not compatible(before, observed, check_inventory=False):
+                return True
+            projected = predict_success(before, running)
+            if projected is None:
+                return True
+            predicting = True
+        elif prediction_submitted:
+            # Do not queue a second request at verification; one action in
+            # progress plus one advisory next-action response is the limit.
+            return True
+        # Exploration yields on new information. Request from the next cycle's
+        # fresh observation, not an intermediate event snapshot during cleanup.
+        eligible = (kind in {"collect", "eat_safe_food", "cook_food", "craft_axe", "craft_pickaxe"}
+                    and reason == "verified")
+        if not eligible and not predicting:
             return True
         if kind == "eat_safe_food" and observed is not None:
             # A composite eat can first verify cooking. Prefetch only once
@@ -949,13 +1065,18 @@ def run_decision_cycle(
                         or controller.night_travel_without_torch(observed)):
                     prefetch.discard("danger_or_darkness")
                     return False
-                upcoming, actions = build_candidates(observed)
-                request_state = {**observed, "_jev_execution_context": {
+                request_state = projected if predicting else {**observed, "_jev_execution_context": {
                     "current_action": current_choice, "stage": reason,
                     "decision_applies": "after_current_bounded_action",
                 }}
+                upcoming, actions = build_candidates(request_state)
                 with timing.span("decision.prefetch_submit"):
-                    prefetch.submit(request_state, upcoming, actions, daily_plan)
+                    accepted = prefetch.submit(request_state, upcoming, actions, daily_plan, predicted=predicting)
+                if accepted and predicting:
+                    prediction_submitted = True
+                    timing.annotate(buffer_start_source=(observed.get("execution") or {}).get("start_source", "native_buffered"))
+                    print(f"jev_buffer_predicted action={kind} start_source="
+                          f"{(observed.get('execution') or {}).get('start_source', 'native_buffered')}")
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"jev_prefetch_checkpoint_skipped error={type(exc).__name__}")
         return True
@@ -969,6 +1090,13 @@ def run_decision_cycle(
         if planner is not None:
             planner.record_action(state, choice, "failed")
         raise
+    if prefetch is not None and prediction_submitted:
+        if executed:
+            with timing.span("decision.buffer_confirm"):
+                completed, _ = controller.latest_state(args.log)
+                prefetch.confirm(completed)
+        else:
+            prefetch.discard("action_not_completed")
     if planner is not None:
         planner.record_action(state, choice, "executed" if executed else "skipped")
     timing.annotate(outcome="executed" if executed else "skipped")
@@ -990,7 +1118,7 @@ def main() -> int:
     parser.add_argument(
         "--min-confidence",
         type=float,
-        help="Override the action-specific execution threshold",
+        help="Override attack confidence threshold only; other actions have no confidence gate",
     )
     parser.add_argument("--show-probabilities", action="store_true")
     parser.add_argument(
@@ -1057,11 +1185,12 @@ def main() -> int:
         assert loose_dispatch["collect_log"] == {"kind": "collect", "prefab": "log", "guid": 102}
         assert loose_dispatch["collect_rocks"] == {"kind": "collect", "prefab": "rocks", "guid": 103}
         assert compact_game_state(sample)["goal"].startswith("Survive")
-        assert default_execution_threshold("explore_current_region") == 0.15
-        assert default_execution_threshold("explore_other_region") == 0.15
-        assert default_execution_threshold("collect_grass") == 0.25
-        assert default_execution_threshold("craft_torch") == 0.25
-        assert default_execution_threshold("build_campfire") == 0.25
+        assert default_execution_threshold("explore_current_region") == 0.0
+        assert default_execution_threshold("explore_other_region") == 0.0
+        assert default_execution_threshold("collect_grass") == 0.0
+        assert default_execution_threshold("craft_torch") == 0.0
+        assert default_execution_threshold("build_campfire") == 0.0
+        assert default_execution_threshold("attack_nearest_hostile") == 0.45
         assert default_execution_threshold("wait") == 0.0
         assert "craft_torch" not in criteria
         craftable = dict(sample)
@@ -1174,6 +1303,7 @@ def main() -> int:
 
 def run_control_loop(args, api_url, api_key, model, planner, prefetch):
     cycle = 0
+    local_executor = LocalBoardExecutor()
     consecutive_errors = 0
     while True:
         cycle += 1
@@ -1181,7 +1311,7 @@ def run_control_loop(args, api_url, api_key, model, planner, prefetch):
             print(f"cycle={cycle}")
         with timing.CycleTrace(cycle, args.timing_log, args.timing_details):
             try:
-                terminal = run_decision_cycle(args, api_url, api_key, model, planner, prefetch)
+                terminal = run_decision_cycle(args, api_url, api_key, model, planner, prefetch, local_executor)
                 consecutive_errors = 0
             except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
                 timing.annotate(outcome="retry_error", error_type=type(exc).__name__)

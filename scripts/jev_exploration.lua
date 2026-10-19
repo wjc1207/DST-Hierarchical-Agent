@@ -39,6 +39,49 @@ function M.select_gateway(candidates, previous)
     return best
 end
 
+function M.gateway_crossing(crossing, px, pz, ax, az, bx, bz, arrival)
+    -- Once across the source-side threshold, never steer back to that side.
+    -- A collection detour far from the entrance starts a fresh approach.
+    local from_side = distance(px, pz, ax, az)
+    if from_side > 8 then crossing = false end
+    local dx, dz = bx - ax, bz - az
+    local length = math.sqrt(dx*dx + dz*dz)
+    local projection = length > 0 and ((px-ax)*dx + (pz-az)*dz)/length or -1
+    local lateral = length > 0 and math.abs((px-ax)*dz - (pz-az)*dx)/length or math.huge
+    return crossing or from_side <= arrival
+        or (projection >= 0 and projection <= length + arrival and lateral <= arrival)
+end
+
+function M.frontier_gains(memory, region, neighbors)
+    -- Unlabelled but observed land is a transit corridor, not endlessly new
+    -- information. Follow it to genuinely unobserved space, without crossing
+    -- another known topology room or assigning a fabricated region ID.
+    local queue, seen, head, gains = {}, {}, 1, {}
+    if region == nil then return gains end
+    for id, cell in pairs(memory.cells) do
+        if cell.passable and cell.region == region then
+            seen[id] = true
+            table.insert(queue, id)
+        end
+    end
+    while head <= #queue do
+        local id = queue[head]
+        head = head + 1
+        local cell, gain = memory.cells[id], 0
+        for _, offset in ipairs(neighbors) do
+            local next_id = key(cell.gx + offset[1], cell.gz + offset[2])
+            local next_cell = memory.cells[next_id]
+            if next_cell == nil then gain = gain + 1
+            elseif next_cell.passable and next_cell.region == nil and not seen[next_id] then
+                seen[next_id] = true
+                table.insert(queue, next_id)
+            end
+        end
+        if gain > 0 then gains[id] = gain end
+    end
+    return gains
+end
+
 function M.summarize(memory, cell_size, neighbors)
     local ids = {}
     for id, node in pairs(memory.graph_nodes) do
@@ -52,18 +95,14 @@ function M.summarize(memory, cell_size, neighbors)
             node.observed_cells = node.observed_cells + 1
             local terrain = cell.biome or "unclassified"
             node.terrain[terrain] = (node.terrain[terrain] or 0) + 1
-            for _, offset in ipairs(neighbors) do
-                local neighbor = memory.cells[key(cell.gx + offset[1], cell.gz + offset[2])]
-                if neighbor == nil or (neighbor.passable and neighbor.region == nil) then
-                    node.unknown_boundary_cells = node.unknown_boundary_cells + 1
-                    break
-                end
-            end
         end
     end
     table.sort(ids)
     for _, id in ipairs(ids) do
         local node = memory.graph_nodes[id]
+        for _ in pairs(M.frontier_gains(memory, id, neighbors)) do
+            node.unknown_boundary_cells = node.unknown_boundary_cells + 1
+        end
         local best, count, second, total = "unidentified", 0, 0, 0
         for terrain, n in pairs(node.terrain) do
             if terrain ~= "unclassified" then

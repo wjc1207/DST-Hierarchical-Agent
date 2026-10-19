@@ -8,6 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import timing_log as timing
+from controller import (EXPLORATION_RESOURCE_PREFABS, EXPLORATION_SEEN_RESOURCES,
+                        collect_target_available, collect_target_reachable)
 
 
 def action_identity(action: dict) -> tuple:
@@ -35,22 +37,44 @@ def current_action(action: dict, dispatch: dict) -> tuple | None:
 
 def _inventory(state: dict) -> tuple:
     inventory = state.get("player", {}).get("inventory", {})
-    return tuple(sorted((group, item.get("prefab", ""), int(item.get("count", 1)))
-                        for group in ("items", "equipped") for item in inventory.get(group, [])))
+    counts = {}
+    for group in ("items", "equipped"):
+        for item in inventory.get(group, []):
+            key = (group, item.get("prefab", ""))
+            counts[key] = counts.get(key, 0) + int(item.get("count", 1))
+    return tuple(sorted(counts.items()))
 
 
-def compatible(source: dict, current: dict) -> bool:
+def _resources(state: dict) -> set:
+    return {(e.get("guid"), e.get("prefab")) for e in state.get("nearby", [])
+            if e.get("prefab") in EXPLORATION_RESOURCE_PREFABS
+            and collect_target_available(e) and collect_target_reachable(state, e)}
+
+
+def compatible(source: dict, current: dict, *, check_inventory: bool = True) -> bool:
     for key in ("day", "phase"):
         if source.get("world", {}).get(key) != current.get("world", {}).get(key):
             return False
     old_nav, new_nav = source.get("navigation", {}), current.get("navigation", {})
     if (old_nav.get("current_biome") != new_nav.get("current_biome")
-            or (old_nav.get("graph") or {}).get("current_node") != (new_nav.get("graph") or {}).get("current_node")):
+            or (old_nav.get("graph") or {}).get("current_node") != (new_nav.get("graph") or {}).get("current_node")
+            or int((new_nav.get("graph") or {}).get("known_nodes") or 0)
+                > int((old_nav.get("graph") or {}).get("known_nodes") or 0)):
         return False
     old, new = source.get("player", {}), current.get("player", {})
     if old.get("guid") != new.get("guid") or new.get("vitals", {}).get("dead"):
         return False
     if float(new.get("vitals", {}).get("health") or 0) < float(old.get("vitals", {}).get("health") or 0):
+        return False
+    hunger_ratio = lambda p: float(p.get("vitals", {}).get("hunger") or 0) / max(1, float(p.get("vitals", {}).get("hunger_max") or 1))
+    if hunger_ratio(old) >= 0.30 > hunger_ratio(new):
+        return False
+    memory = EXPLORATION_SEEN_RESOURCES.get(old.get("guid"), {}) if old.get("guid") is not None else {}
+    newly_available = _resources(current) - _resources(source)
+    previously_empty = {(e.get("guid"), e.get("prefab")) for e in source.get("nearby", [])
+                        if e.get("pickable") is False}
+    if (newly_available - memory.get("seen", set())
+            or newly_available.intersection(previously_empty | set(memory.get("depleted", {})))):
         return False
     a, b = old.get("position", {}), new.get("position", {})
     if a and b and math.hypot(float(a.get("x", 0)) - float(b.get("x", 0)),
@@ -58,7 +82,7 @@ def compatible(source: dict, current: dict) -> bool:
         return False
     threats = lambda s: {(e.get("guid"), e.get("prefab")) for e in s.get("nearby", [])
                          if e.get("activeThreat") or e.get("potentialThreat")}
-    return _inventory(source) == _inventory(current) and threats(source) == threats(current)
+    return (not check_inventory or _inventory(source) == _inventory(current)) and threats(source) == threats(current)
 
 
 class DecisionPrefetch:
@@ -68,8 +92,10 @@ class DecisionPrefetch:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jev-prefetch")
         self.future = None
         self.abandoned = False
+        self.confirmed = True
+        self.board_id = None
 
-    def submit(self, state: dict, criteria: dict, dispatch: dict, plan) -> bool:
+    def submit(self, state: dict, criteria: dict, dispatch: dict, plan, *, predicted=False) -> bool:
         if self.future is not None:
             if self.future.done() and (self.abandoned or time.monotonic() - self.submitted >= self.max_age
                                        or not compatible(self.source, state)):
@@ -80,8 +106,23 @@ class DecisionPrefetch:
         self.dispatch = copy.deepcopy(dispatch)
         self.submitted = time.monotonic()
         self.abandoned = False
+        self.confirmed = not predicted
+        self.board_id = plan.get("board_id") if plan and plan.get("kind") == "task_board" else None
         self.future = self.executor.submit(self._request, self.source, copy.deepcopy(criteria), copy.deepcopy(plan))
         print("jev_prefetch_submitted")
+        timing.annotate(buffer_stage="predicted" if predicted else "verified")
+        return True
+
+    def confirm(self, state: dict) -> bool:
+        if self.future is None or self.abandoned or self.confirmed:
+            return False
+        if not compatible(self.source, state):
+            timing.annotate(buffer_validation="prediction_mismatch_or_new_event")
+            self.discard("prediction_mismatch_or_new_event")
+            return False
+        self.confirmed = True
+        timing.annotate(buffer_validation="confirmed")
+        print("jev_buffer_confirmed")
         return True
 
     def _request(self, state, criteria, plan):
@@ -99,8 +140,15 @@ class DecisionPrefetch:
         if self.future.cancel() or self.future.done():
             self.future = None
 
-    def take(self, state: dict, dispatch: dict):
+    def take(self, state: dict, dispatch: dict, *, plan=None):
         if self.future is None or self.abandoned:
+            return None
+        board_id = plan.get("board_id") if plan and plan.get("kind") == "task_board" else None
+        if self.board_id != board_id:
+            self.discard("task_board_changed")
+            return None
+        if not self.confirmed:
+            self.discard("action_not_confirmed")
             return None
         age = time.monotonic() - self.submitted
         if age >= self.max_age or not compatible(self.source, state):

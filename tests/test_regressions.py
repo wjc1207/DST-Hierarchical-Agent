@@ -369,7 +369,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(dispatch["travel_region_1"]["target_node_id"], "B|rocky")
         self.assertNotIn("return_previous_region", criteria)
         self.assertEqual(dispatch["travel_region_2"]["target_node_id"], "C|grassland")
-        self.assertEqual(jev_agent.default_execution_threshold("travel_region_1"), 0.15)
+        self.assertEqual(jev_agent.default_execution_threshold("travel_region_1"), 0.0)
 
     def test_graph_choice_dispatches_event_driven_intent(self) -> None:
         observed = state([])
@@ -404,6 +404,31 @@ class CandidateTests(unittest.TestCase):
                     self.assertEqual("unequip_torch" in criteria, equipped)
                     self.assertIn("wait", criteria)
                     self.assertIn("explore_current_region", criteria)
+
+    def test_torch_crafting_remains_available_with_existing_torches(self) -> None:
+        for phase in ("day", "dusk", "night"):
+            for slot in ("items", "equipped"):
+                for count in (1, 2):
+                    with self.subTest(phase=phase, slot=slot, count=count):
+                        observed = state([])
+                        observed["world"]["phase"] = phase
+                        observed["crafting"]["torch"] = True
+                        observed["player"]["inventory"][slot] = [{"prefab": "torch", "count": count}]
+                        criteria, dispatch = jev_agent.build_candidates(observed)
+                        self.assertEqual(dispatch["craft_torch"], {"kind": "craft_torch"})
+                        self.assertIn(f"{count} currently carried or equipped", criteria["craft_torch"])
+                        observed["crafting"]["torch"] = False
+                        self.assertNotIn("craft_torch", jev_agent.build_candidates(observed)[1])
+
+    def test_reserve_torch_crafting_retains_hunger_and_combat_constraints(self) -> None:
+        for case in ("hungry", "hostile"):
+            observed = state([hostile(9991, 2)] if case == "hostile" else [])
+            observed["crafting"]["torch"] = True
+            observed["player"]["inventory"]["items"] = [{"prefab": "torch", "count": 1},
+                                                        {"prefab": "berries", "count": 1}]
+            if case == "hungry": observed["player"]["vitals"]["hunger"] = 1
+            with self.subTest(case=case):
+                self.assertNotIn("craft_torch", jev_agent.build_candidates(observed)[1])
 
     def test_night_torch_options_depend_on_fire_and_equipment(self) -> None:
         for lit_fire, equipped in ((False, False), (True, True)):
@@ -512,6 +537,25 @@ class CandidateTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_craft_second_torch_verifies_count_increase_not_existing_torch(self) -> None:
+        before = state([])
+        before["crafting"]["torch"] = True
+        before["player"]["inventory"]["items"] = [{"prefab": "torch", "count": 1}]
+        after = state([])
+        after["player"]["inventory"]["items"] = [{"prefab": "torch", "count": 1}]
+        after["player"]["inventory"]["equipped"] = [{"prefab": "torch", "count": 1}]
+        with patch.object(controller, "latest_state", return_value=(before, 100)), \
+                patch.object(controller, "find_game_window", return_value=123), \
+                patch.object(controller, "focus_game"), patch.object(controller, "tap") as tap, \
+                patch.object(controller, "wait_for_state_condition", return_value=(after, 101)) as verify, \
+                patch.object(controller, "unequip_torch") as unequip:
+            controller.craft_torch(Path("unused.log"))
+        predicate = verify.call_args.args[2]
+        self.assertFalse(predicate(before))
+        self.assertTrue(predicate(after))
+        tap.assert_called_once_with([controller.VK["craft_torch"]], 0.08)
+        unequip.assert_called_once_with(Path("unused.log"), daylight_only=True)
+
     def test_craft_torch_unequips_auto_equipped_torch_before_night(self) -> None:
         for phase in ("day", "dusk"):
             with self.subTest(phase=phase):
@@ -1230,10 +1274,10 @@ class ThresholdTests(unittest.TestCase):
             "mine_nearest_rock", "build_campfire", "build_sciencemachine", "equip_weapon",
         ):
             with self.subTest(action=action):
-                self.assertEqual(jev_agent.default_execution_threshold(action), 0.25)
+                self.assertEqual(jev_agent.default_execution_threshold(action), 0.0)
         for action, expected in (
             ("flee_from_nearest_hostile", 0.0), ("wait", 0.0),
-            ("explore_current_region", 0.15), ("explore_other_region", 0.15),
+            ("explore_current_region", 0.0), ("explore_other_region", 0.0),
             ("attack_nearest_hostile", 0.45),
         ):
             with self.subTest(action=action):
@@ -1241,7 +1285,7 @@ class ThresholdTests(unittest.TestCase):
 
         observed = state([])
         observed["player"]["inventory"]["items"] = [{"prefab": "carrot", "count": 1}]
-        for hunger, expected in ((100, 0.25), (3, 0.0)):
+        for hunger, expected in ((100, 0.0), (3, 0.0)):
             with self.subTest(action="eat_safe_food", hunger=hunger):
                 observed["player"]["vitals"]["hunger"] = hunger
                 self.assertIn("eat_safe_food", jev_agent.build_candidates(observed)[0])

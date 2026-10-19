@@ -2,7 +2,7 @@
 
 [English](README.EN.md) · [技术说明](docs/TECHNICAL.md)
 
-让 JEV 模型在《饥荒联机版》中根据实时状态选择动作的实验项目。客户端 Mod 读取游戏状态，Python 控制器执行有限的游戏操作；可选用 DeepSeek 定期生成计划，供 JEV 决策时参考。当前目标是制作炼金引擎。
+让 JEV 模型在《饥荒联机版》中根据实时状态选择动作的实验项目。客户端 Mod 读取游戏状态，Python 控制器执行有限的游戏操作；可选用 DeepSeek 生成任务看板，控制器优先自动推进视野内可执行的任务，遇到危险或没有本地任务可做时交给 JEV。当前目标是制作炼金引擎。
 
 已完成的阶段：[活过第一晚](https://bilibili.com/video/BV1aehE6DEji) · [制作科学机器](https://www.bilibili.com/video/BV1mFaV6aEQ2)
 

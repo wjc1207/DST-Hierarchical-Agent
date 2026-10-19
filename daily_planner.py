@@ -1,16 +1,20 @@
-"""Asynchronous, advisory daily planning for the fast JEV action loop."""
+"""Asynchronous task planning for local execution and fast JEV handoffs."""
 
 from __future__ import annotations
 
 import json
 import math
+import shutil
 import time
+import uuid
 import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
+from task_board import (validate_board, board_view, format_board,
+                        INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
 
 
 DEFAULT_API_URL = "https://api.deepseek.com/chat/completions"
@@ -19,6 +23,8 @@ PLAN_PREVIEW_CHARS = 240
 KNOWLEDGE_PATH = Path(__file__).resolve().with_name("DSTKnowledge.txt")
 MAX_KNOWLEDGE_CHARS = 12000
 PLAN_MAX_TOKENS = 4096
+BOARD_LOG_DIR = Path(__file__).resolve().parent / "logs"
+COMPLETION_REPLAN_INTERVAL = 15.0
 
 
 def planning_slot(state: dict) -> Optional[tuple[int, int]]:
@@ -83,6 +89,8 @@ def validate_plan(raw: object, day: int) -> dict:
     """Keep only a small, well-formed advisory plan in JEV's state."""
     if not isinstance(raw, dict):
         raise ValueError("DeepSeek plan must be a JSON object")
+    if "tasks" in raw:
+        return validate_board(raw, day)
     goal = _short_text(raw.get("goal"), 160)
     if not goal:
         raise ValueError("DeepSeek plan has no goal")
@@ -111,12 +119,37 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "makes fast next-action decisions; do not select or force its next action. Plan only "
         "a short, feasible goal for the next quarter of this game day using observed facts, "
         "the supplied DSTKnowledge reference, and recent outcomes. "
-        "The current longer-term milestone is to build a science machine; if the supplied "
-        "history says it was already built, do not plan to build another. Survival, food, "
+        "Output a small task board, not a paragraph or an action sequence. The controller "
+        "automatically advances locally executable tasks by priority and dependencies using "
+        "observed reachable resources and legal actions. It does not automatically explore or "
+        "invent missing-tool subtasks. JEV handles emergencies and decisions when no local "
+        "board task is executable, and may choose off-board opportunities. Use 1-6 tasks with stable "
+        "IDs when carrying forward previous_task_board, integer priority 1-5 (1 highest), "
+        "optional depends_on IDs and action_hints. No status or fabricated progress: the runtime "
+        "calculates those from facts. Targets must be machine-checkable: "
+        "inventory {prefab,count}, hunger_ratio {at_least:0..1}, known_regions {count}, "
+        "visit_region {node_id from observed graph routes}, or structure "
+        "{prefab:campfire|firepit|sciencemachine}. Inventory means desired CURRENT stock, "
+        "not lifetime collection. Use canonical inventory prefab IDs from "
+        "supported_capabilities.inventory_target_prefabs, not English display names or source "
+        "entities: logs must be log, and grass material must be cutgrass. Existing torches do "
+        "not prevent crafting another when the recipe is available. Dependencies must be "
+        "acyclic and reference this board only. "
+        "If replan_reason is all_tasks_completed, use the completed board as history and "
+        "choose new unmet goals from the CURRENT input; do not repeat already satisfied "
+        "inventory or exploration targets merely because they appeared on the old board. "
+        "Use only supported capabilities in the context; unavailable research and structures "
+        "are longer-term context, not executable tasks. The longer-term milestone is an alchemy "
+        "engine, but this controller currently supports only a science machine as a research "
+        "structure; do not ask it to build an alchemy engine yet. If history says a science "
+        "machine was already built, do not plan another. Survival, food, "
         "light, and safety outrank optional progress. Do not assume unseen "
         "resources or unsupported abilities. The live state and hard safety rules always override "
         "your plan. Return JSON only, shaped like: "
-        '{"goal":"...","steps":["...","..."],"priority":"...","replan_if":["..."]}'
+        '{"goal":"Prepare safely for night","tasks":[{"id":"grass","title":"Reserve torch grass",'
+        '"priority":1,"target":{"type":"inventory","prefab":"cutgrass","count":2},'
+        '"depends_on":[],"action_hints":["collect_grass"],"reason":"Night preparation"}],'
+        '"replan_if":["Threats or resources change"]}'
     )
     body = {
         "model": model,
@@ -190,6 +223,7 @@ class DailyPlanner:
     def __init__(
         self, api_key: str, api_url: str = DEFAULT_API_URL, model: str = DEFAULT_MODEL,
         knowledge_path: Path = KNOWLEDGE_PATH,
+        board_log_dir: Optional[Path] = BOARD_LOG_DIR,
     ):
         self.api_key = api_key
         self.api_url = api_url
@@ -205,9 +239,53 @@ class DailyPlanner:
         self.failed_action: Optional[str] = None
         self.failure_count = 0
         self.last_replan = 0.0
+        self.previous_board = None
+        self.board_revision = 0
+        self.board_run_id = uuid.uuid4().hex[:12]
+        self.board_log_dir = board_log_dir
+        self.board_signature = None
+        self.board_console_signature = None
+        self.board_console_status = None
+        self.board_console_at = 0.0
+        self.completion_replan_slot = None
+        self.last_completion_request = None
+
+    def _board(self, state):
+        if self.plan is None or self.plan.get("kind") != "task_board":
+            return self.plan
+        facts = ["sciencemachine"] if self.science_machine_built else []
+        return board_view(self.plan, state, verified_structures=facts)
+
+    def _publish_board(self, board):
+        if not board or board.get("kind") != "task_board":
+            return
+        signature = json.dumps({k: v for k, v in board.items() if k != "observed_at"}, sort_keys=True, ensure_ascii=False)
+        status = (board.get("board_id"), board.get("status"),
+                  tuple((t["id"], t["status"], t.get("blocked_reason")) for t in board["tasks"]))
+        now = time.monotonic()
+        if (signature != self.board_console_signature
+                and (status != self.board_console_status or now - self.board_console_at >= 3)):
+            print(format_board(board, shutil.get_terminal_size((100, 24)).columns))
+            self.board_console_signature, self.board_console_status = signature, status
+            self.board_console_at = now
+        if signature == self.board_signature:
+            return
+        self.board_signature = signature
+        if self.board_log_dir is None:
+            return
+        try:
+            self.board_log_dir.mkdir(parents=True, exist_ok=True)
+            packet = {"run_id": self.board_run_id, "event": "board_updated", "task_board": board}
+            temporary = self.board_log_dir / (".task_board_" + self.board_run_id + ".tmp")
+            temporary.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.board_log_dir / "task_board.json")
+            with (self.board_log_dir / "task_board.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(packet, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            print(f"task_board_log_unavailable error={type(exc).__name__}")
 
     def update(self, state: dict) -> Optional[dict]:
-        """Poll without waiting; schedule at most one plan per observed day-quarter."""
+        """Poll without waiting; replan each quarter and when a board is completed."""
         slot = planning_slot(state)
         if slot is None:
             return None
@@ -215,6 +293,9 @@ class DailyPlanner:
         if self.plan is not None and (
             self.plan["day"] != day or self.plan.get("quarter") != quarter + 1
         ):
+            if self.plan.get("kind") == "task_board":
+                self.previous_board = self._board(state)
+                self._publish_board(self.previous_board)
             self.plan = None
         if self.future is not None and self.future.done():
             future = self.future
@@ -231,6 +312,9 @@ class DailyPlanner:
                     print(f"daily_plan_error response_time={response_seconds:.2f}s error={error}")
                 elif completed_slot == slot and self.requested_slot == slot and result["day"] == day:
                     result["quarter"] = quarter + 1
+                    if result.get("kind") == "task_board":
+                        self.board_revision += 1
+                        result["board_id"] = f"{self.board_run_id}:{self.board_revision}"
                     self.plan = result
                     serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
                     preview = serialized[:PLAN_PREVIEW_CHARS]
@@ -241,10 +325,40 @@ class DailyPlanner:
                         f"response_time={response_seconds:.2f}s preview={preview}"
                     )
 
-        if self.requested_slot != slot and self.future is None:
+        view = self._board(state) if self.plan else None
+        if (view and view.get("kind") == "task_board" and view.get("status") == "active"
+                and view.get("state_basis") == "observed" and view.get("tasks")
+                and all(t["status"] == "done" for t in view["tasks"])
+                and not state.get("player", {}).get("vitals", {}).get("dead")):
+            # Retire this revision once. Never keep it as active guidance while
+            # waiting for a new board, or treat predicted completion as real.
+            view["status"] = "completed"
+            self.previous_board = view
+            self._publish_board(view)
+            self.plan = None
+            self.requested_slot = None
+            self.completion_replan_slot = slot
+            print(f"task_board_completed id={view['board_id']} reason=all_tasks_completed")
+
+        completing = self.completion_replan_slot == slot
+        completion_ready = (not completing or self.last_completion_request is None
+                            or time.monotonic() - self.last_completion_request >= COMPLETION_REPLAN_INTERVAL)
+        if self.requested_slot != slot and self.future is None and completion_ready:
             self.requested_slot = slot
+            reason = "all_tasks_completed" if completing else "quarter_window_or_invalidation"
             context = planning_context(state, list(self.history))
+            context["replan_reason"] = reason
             context["science_machine_built_this_run"] = self.science_machine_built
+            context["previous_task_board"] = self._board(state) or self.previous_board
+            context["supported_capabilities"] = {
+                "inventory_target_prefabs": sorted(INVENTORY_TARGET_PREFABS),
+                "inventory_prefab_aliases": dict(INVENTORY_PREFAB_ALIASES),
+                "actions": ["collect_<observed prefab>", "explore_current_region", "explore_other_region",
+                            "travel_region_<observed index>", "craft_axe", "craft_pickaxe", "craft_torch",
+                            "chop_nearest_tree", "mine_nearest_rock", "cook_food", "eat_safe_food",
+                            "build_campfire", "build_sciencemachine", "equip_torch", "unequip_torch",
+                            "equip_weapon", "attack_nearest_hostile", "flee_from_nearest_hostile", "wait"],
+                "note": "Hints are not commands; actual candidates and safety rules take precedence."}
             context["planning_window"] = {"day": day, "quarter": quarter + 1, "quarters_per_day": 4}
             try:
                 context["dst_knowledge"] = load_dst_knowledge(self.knowledge_path)
@@ -255,11 +369,16 @@ class DailyPlanner:
                 timed_request_plan, self.api_url, self.api_key, self.model, day, context
             )
             self.pending_slot = slot
+            if completing:
+                self.last_completion_request = time.monotonic()
+            self.completion_replan_slot = None
             print(
                 f"daily_plan_requested day={day} quarter={quarter + 1}/4 "
-                f"knowledge_chars={len(context['dst_knowledge'])}"
+                f"knowledge_chars={len(context['dst_knowledge'])} reason={reason}"
             )
-        return self.plan if self.plan and self.plan["day"] == day else None
+        view = self._board(state) if self.plan and self.plan["day"] == day else None
+        self._publish_board(view)
+        return view
 
     def record_action(self, state: dict, action: str, outcome: str) -> None:
         vitals = state.get("player", {}).get("vitals", {})
@@ -284,6 +403,13 @@ class DailyPlanner:
         if (major_change or repeated_failure) and time.monotonic() - self.last_replan >= 60:
             self.last_replan = time.monotonic()
             self.requested_slot = None
+            if self.plan and self.plan.get("kind") == "task_board":
+                self.previous_board = self._board(state)
+                self.previous_board["status"] = "invalidated"
+                for task in self.previous_board["tasks"]:
+                    if task["status"] != "done":
+                        task["status"] = "invalidated"
+                self._publish_board(self.previous_board)
             self.plan = None
             self.failure_count = 0
 

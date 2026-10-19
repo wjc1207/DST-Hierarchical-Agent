@@ -1,8 +1,107 @@
-# JEV DST Agent technical reference (1.5.3)
+# JEV DST Agent technical reference (1.7.0)
 
 [Project README](../README.EN.md) · [中文技术说明](TECHNICAL.md)
 
 Run all commands below from the project root (`jev_dst_agent`).
+
+### 1.7.0 automatic local board execution
+
+Execute mode first advances locally feasible board tasks by priority, dependencies,
+and observed progress. Each bounded action is followed by a fresh evaluation;
+consecutive gathers and switches to another feasible task need no JEV request or
+predictive prefetch. JEV resumes when no local task is executable. New resources
+alone do not interrupt local board execution; off-board opportunities remain JEV
+decisions. Dry-run mode never automatically executes board tasks.
+
+Supported local goals include inventory collection, explicit axe/pickaxe/torch
+crafting goals, eating, and existing legal structure actions. Log/mineral goals
+may use an existing sufficiently durable tool on a known target within 6 units,
+including drop pickup, but do not invent missing-tool subtasks. Work targets need
+a safe reachable path and the new Mod's `telemetry.cancel_work` capability. No
+automatic exploration, region navigation or off-board collection is added.
+Existing night travel, critical hunger and recipe safety rules still apply:
+fixed campfire light alone does not permit night collection outside its range.
+
+Immediately before execution, legal actions and the exact task/target are checked
+again. Observed hostile targeting, health loss, phase changes or changed night
+light sources hand control back to JEV without failure backoff. Movement holds
+check the latest received telemetry every 0.1 seconds; responsiveness still
+depends on the Mod's reporting rate. Interruption releases movement keys; F4
+also cancels queued Mod work dispatch, including on Ctrl+C. A server-side action
+animation already started may still finish. Failure or no measured increase
+toward the selected target pauses that board/task/target combination for 15
+seconds before handing back. Unrelated inventory changes or natural hunger loss
+are not progress.
+
+Console markers are `board_auto task=… action=… progress=…`,
+`board_auto_completed`, and `board_auto_handoff reason=…`. Timing JSON includes
+`decision_source=board_auto`, `board_task_id`, `board_auto_action`,
+`board_auto_outcome`, and `board.auto_execute`; successful automatic cycles have
+no JEV request time. Update Python including the new `board_executor.py`, restart
+it, and update/reload `modmain.lua` and `modinfo.lua`, keeping the previously
+required `scripts/` files. Schema stays at 10. An older Mod disables automatic
+chopping/mining, while other legal local tasks can still run.
+
+### 1.6.2 ordinary flower collection
+
+`flower` now participates in explicit pickability, verified-path filtering,
+`collect_flower`, region resource memory and new-resource events. Collection
+verifies `petals` inventory gain or the original flower disappearing. Prediction
+adds one petal and removes the flower; very fast picks can still use post-success
+prefetch. Loose petals are collectible, but are not hunger food or cookable
+inputs. JEV chooses whether picking is worthwhile; the hint notes that rose
+variants sharing this prefab may hurt. Other prefabs such as `flower_evil` remain
+outside the collection whitelist. Update/reload `modmain.lua` and `modinfo.lua`,
+and sync `controller.py`, `jev_agent.py`, and `action_buffer.py`.
+
+### 1.6.1 non-predicting client start acknowledgement
+
+With movement prediction disabled, a client may have neither a local stategraph
+nor a buffered action. `scripts/jev_execution.lua` observes the actual native
+`RemoteActionButton` and `RemoteMakeRecipeFromMenu` calls without changing their
+arguments or return values. A matching local action, or a subsequent transition
+to doing via `IsDoingOrWorking()`/replicated tags, confirms the requested target
+or recipe. Requests alone, pre-existing busy state, and unrelated buffered
+actions never acknowledge a start.
+
+A temporary 30 Hz observer emits telemetry when a start is confirmed. It retains
+the acknowledgement for 0.8 seconds after doing ends; unacknowledged requests
+expire after three seconds. Python rejects requests older than its current
+interaction snapshot. Success still requires separate outcome verification.
+Terminal `jev_buffer_predicted ... start_source=replicated_transition` and timing
+`buffer_start_source` reveal this path. Update `modmain.lua`, `modinfo.lua`, new
+`scripts/jev_execution.lua`, `action_buffer.py`, and `jev_agent.py`; reload the Mod
+and restart Python. Schema remains 10.
+
+### 1.5.5 juicy berries
+
+The correct bush prefab is `berrybush_juicy`, not `juicyberrybush`. The Mod now
+exports explicit pickability using `CanBePicked()` when available and the
+replicated `pickable` tag. Candidates require affirmative pickability and a
+verified route. Collection verifies `berries_juicy` inventory gain; discovery
+and observed regrowth participate in exploration events. Loose raw and cooked
+juicy berries are collectible. Both `berries_juicy` and `berries_juicy_cooked`
+are safe food; raw juicy berries can be cooked, including by the existing
+cook-then-eat composite near a lit fire. Update Python and reload the updated Mod.
+
+### 1.5.4 boundary and gateway fixes
+
+Frontier candidates and boundary completeness share one spatial definition. From
+observed land in the current topology room, a flood through adjacent observed,
+passable unlabelled land finds cells bordering genuinely unobserved space. It
+never crosses sea or another known room. Transit land receives no fabricated
+room ID and does not inflate room area. Fully observed unlabelled land is not
+itself new space; completeness remains grid-relative spatial coverage, not a
+guarantee that all topology labels are resolved.
+
+Gateway IDs retain an approach/crossing phase. Reaching the source side or
+passing it within the entrance corridor latches movement toward the destination
+side, rather than turning back when the source-side arrival radius is exceeded.
+Moving more than eight units from the source resets approach; a confirmed room
+change clears old phases. Terrain and hazard checks still apply to every leg;
+a blocked crossing is not replaced by a reverse leg toward the source. Update
+`modmain.lua`, `modinfo.lua` and `scripts/jev_exploration.lua`, then reload the Mod.
+Telemetry remains schema 10.
 
 This package connects JEV decisions to a bounded Don't Starve Together client Mod.
 It exports game state and can execute only the actions explicitly listed below.
@@ -47,15 +146,40 @@ and coastline detours.
 ### Next-decision prefetch
 
 Exploration is now event-driven: movement checkpoints obtain fresh observations
-for safety and event detection only, not per-leg model requests. The next JEV
-request may be submitted only when an event ends the current exploration intent.
+for safety and event detection only, not per-leg model requests. Exploration does
+not prefetch, including in its completion callback. After an event and cleanup,
+the next cycle observes fresh state before requesting JEV, including newly found
+resources in its candidates.
 `--no-prefetch` does not disable event detection.
 Collection, eating, cooking and basic tool crafting may also submit after their
 completion condition is observed; short actions provide little overlap. Long
 work actions do not prefetch when chopping or mining first starts. Background
-threads never send game inputs.
+threads never send game inputs. A prefetched decision may still choose exploration;
+the restriction concerns when a request starts, not which next action JEV chooses.
 
-At most one prefetch is retained, with a three-second lifetime. Phase, inventory,
+Version 1.6.0 adds a two-stage pipeline: one executing action plus one buffered
+next-action request. `execution.doing` (or a recent 1.6.1 `confirmed_start`) and native PICK/PICKUP target GUID or BUILD
+recipe must confirm the action actually started, not merely a keypress or an
+approach. `action_buffer.py` predicts the successful inventory/target outcome
+from the pre-input snapshot and explicitly labels that input as a prediction.
+Supported predictions are grass, saplings, normal/juicy berry bushes, loose items
+with known stack sizes, and axes/pickaxes. Exploration, torch/fire construction,
+chopping/mining, and food composites are not predicted. Missing start telemetry
+falls back to existing verified-completion prefetch.
+
+A predicted result cannot be consumed before the running action succeeds and
+actual inventory quantities/equipment placement match. Stack merges are harmless;
+unexpected character-specific yields, recipe costs, or auto-equipping invalidate
+the prediction. New meaningful resources or observed regrowth, region discoveries,
+damage, threats, phase changes, and crossing the critical-hunger boundary also
+invalidate it; simple re-entry of a previously known resource does not.
+Logs expose `jev_buffer_predicted`, `jev_buffer_confirmed`, discard reasons,
+`buffer_stage`, and `buffer_validation`, alongside existing overlap timing.
+Update `action_buffer.py`, `decision_prefetch.py`, `controller.py`, `jev_agent.py`
+and reload the 1.6.0 Mod (`modmain.lua`, `modinfo.lua`). Schema 10 gains optional
+`execution` and loose-item `stack_count` fields; older Mods cannot confirm starts.
+
+At most one prefetch is retained, with a three-second lifetime from submission. Phase, inventory,
 health, threat and position changes invalidate it. Before execution, both normal
 and prefetched decisions are matched against freshly generated legal candidates
 by collection GUID, destination node or local frontier identity. Unknown-exit
@@ -246,8 +370,12 @@ C:\Users\16425\anaconda3\python.exe .\controller.py equip-torch
 C:\Users\16425\anaconda3\python.exe .\controller.py unequip-torch
 ```
 
-The JEV candidate list contains `craft_torch` only while telemetry reports that
-the recipe is craftable and no torch is already held. `equip_torch` appears only
+The JEV candidate list contains `craft_torch` while telemetry reports that the
+recipe is craftable and hard safety rules allow it, including when torches are
+already carried or equipped. Its description includes the current total so JEV
+can weigh reserve needs against material costs. Local board execution can advance
+a reserve goal from 1/2 to 2/2, then stops automatic crafting at the target.
+`equip_torch` appears only
 at night while a torch exists, is not equipped, and no lit campfire or firepit
 is nearby. `unequip_torch` appears during day or dusk while a torch is equipped,
 and at night when a lit campfire or firepit is nearby.
@@ -331,8 +459,9 @@ The planner receives current telemetry, up to 40 recent action outcomes from
 this Python run, and the local [DSTKnowledge.txt](../DSTKnowledge.txt) reference.
 The reference contains common recipes checked against the installed game's
 recipe script; it is reread for every plan and can be edited. The repeating
-per-second game log is not sent. Its plan is passed as
-advisory `daily_plan` state once ready. JEV continues deciding while planning
+per-second game log is not sent. The structured board is passed as
+`task_board` state once ready (legacy plans still use `daily_plan`). Local execution
+can then advance feasible board tasks; JEV continues deciding while planning
 is in progress; live facts, available actions, and hard safety rules take
 precedence. Two consecutive failures of the same action or successfully building
 a science machine trigger a same-window replan, at most once per 60 seconds.
@@ -345,6 +474,61 @@ time and the first 240 characters of
 the validated plan JSON; longer previews end with an ellipsis. Retries and
 final errors show the API finish reason when available and the request time without logging the
 raw response or API key.
+
+When all board tasks are `done` in the latest observed state, the planner also
+requests a new board immediately within the current quarter. It logs
+`task_board_completed` then `daily_plan_requested ... reason=all_tasks_completed`.
+The request includes current telemetry and the completed board as history, with
+instructions to propose unmet goals. The old board is withdrawn from JEV's
+guidance while remaining visible as completed history in CLI/logs. JEV continues
+without waiting. Each revision triggers once and only one planning request may
+be outstanding. Completion-triggered requests are at least 15 seconds apart
+(the first is immediate), preventing repeated already-satisfied replies from
+spamming the API; normal quarter changes bypass this guard. Predicted, empty,
+partially complete, blocked, or dead-player boards do not trigger completion.
+Failures retain the existing no-per-cycle-retry policy until a new window.
+
+### CLI task board
+
+DeepSeek emits `goal` and 1–6 `tasks`, each with an ID, title, priority (1 highest,
+5 lowest), typed target, dependencies, and optional action hints/reason. Targets
+cover current inventory, hunger ratio, known-region count, visiting known rooms,
+and supported structures. Duplicate IDs, missing/cyclic dependencies, and
+unsupported target types are rejected. Model-supplied statuses/progress are ignored.
+
+Inventory targets use the supported product catalog in `task_board.py`, not world
+entity names or English display names. Trimmed/lowercase names are checked, with
+the explicit alias `logs` normalized to `log`. Valid plural IDs such as `rocks`
+and `twigs` stay unchanged; no fuzzy singularization is performed. Unknown or
+currently unsupported inventory names fail plan validation and use the existing
+bounded retry policy instead of leaving an unmatchable task. IDs, titles and
+dependencies are unchanged. DeepSeek receives the same catalog and alias map;
+progress evaluation and execution use canonical names. Sync `task_board.py`,
+`daily_planner.py` and `jev_agent.py`, then restart Python; no Mod update is needed
+for these fixes.
+
+The runtime derives ready/in_progress/blocked/done from telemetry; in_progress
+means partial measured progress, not an instruction to execute a task. Missing
+dependencies or telemetry block tasks, and quarter changes expire the board.
+Inventory goals refer to current stock, not lifetime collection. Verified science
+machine construction remains known for this run even after leaving it. The next
+planner request includes the previous board and its progress.
+
+The terminal renders a plain `TASK BOARD` table with IDs, priorities, statuses,
+progress, titles, and blocker details. Chinese width is supported; it neither
+clears the screen nor overwrites action logs, and needs no UI dependency. Status
+and revision changes display immediately; numeric-only progress is throttled to
+three seconds. Full snapshots go to `logs/task_board.json`, with changes appended
+to `logs/task_board.jsonl`. Run/board IDs enable correlation without API secrets;
+timing records include `task_board_id` and `ready_task_ids`.
+
+Execute mode first advances local board tasks as described in 1.7.0. When no
+local task is executable, or safety requires a handoff, JEV selects freely among
+all legal actions; the board adds no candidate filter. Predictive buffering
+recomputes a separate `state_basis=predicted_success` board view without mutating
+observed progress or enabling automatic execution. A board revision/withdrawal
+invalidates old buffered decisions, and starting local execution discards older
+prefetches. Full-board completion still triggers replanning as described above.
 
 The JEV prompt separates hard constraints from decision guidance and describes
 each candidate as one complete bounded action. Chopping/mining include nearby
@@ -542,24 +726,20 @@ continues only JEV's chosen intent; it does not choose a replacement destination
 Equipping a torch uses the same inventory-tile action as manually clicking the
 torch, rather than the action-system auto-equip helper.
 
-Safe resource collection uses a `0.25` confidence threshold. The JEV prompt also
+Safe resource collection has no confidence gate. The JEV prompt also
 explicitly prefers unequipping a torch during day and dusk to preserve its
 durability.
 
 Below 30% hunger with safe food already carried, waiting, exploration and
 optional gathering are omitted as dominated choices. JEV still selects from
 the remaining meaningful actions: eating, and escape or urgent night lighting
-when applicable. Emergency eating below 30% hunger uses a `0.00` threshold;
-ordinary eating remains at `0.25`;
-an explicit `--min-confidence` override still
-takes precedence. Without carried food, exploration remains available to seek it.
+when applicable. Both ordinary and emergency eating have no confidence gate.
+Without carried food, exploration remains available to seek it.
 
-Execution uses these default confidence thresholds: `0.00` for fleeing,
-waiting, and emergency eating, `0.15` for either exploration action, `0.45`
-for attacking, and `0.25`
-for every other action, including collection, cooking, eating, crafting, and
-building. Pass
-`--min-confidence` to override these values globally. Exploration and collection
+Only attacking retains a confidence threshold, defaulting to `0.45`.
+All non-attack actions use `0.00`; legality, path and safety checks remain active.
+Confidence is still logged. `--min-confidence` overrides attacks only.
+Exploration and collection
 without an equipped torch at night are blocked even beside a lit campfire: a
 stationary fire does not illuminate the full route. The controller rechecks
 during movement, stopping if night falls mid-route. Fleeing from an immediate

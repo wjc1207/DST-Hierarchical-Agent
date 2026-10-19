@@ -1,6 +1,7 @@
 -- Run from the project root: fengari tests/exploration_spec.lua
 package.path = "./scripts/?.lua;" .. package.path
 local E = require("jev_exploration")
+local X = require("jev_execution")
 local passed = 0
 local function test(name, fn)
     local ok, err=pcall(fn)
@@ -62,6 +63,43 @@ test("gateway remains stable until it is no longer a valid candidate", function(
     a.distance,b.distance=10.1,10
     assert(E.select_gateway({b,a},"lower") == a)
     assert(E.select_gateway({b},"lower") == b)
+end)
+
+test("gateway crossing survives leaving the source-side arrival radius", function()
+    local crossing=E.gateway_crossing(false,327.3,-500.46,328,-500,324,-500,1.5)
+    assert(crossing)
+    assert(E.gateway_crossing(crossing,325.8,-500.46,328,-500,324,-500,1.5))
+    assert(not E.gateway_crossing(crossing,340,-500,328,-500,324,-500,1.5),
+        "a distant collection detour should reset approach")
+    assert(not E.gateway_crossing(false,326,-506,328,-500,324,-500,1.5),
+        "passing on a parallel path does not enter the gateway")
+end)
+
+test("unknown corridor frontiers agree with boundary completeness", function()
+    local m=memory(); node(m,"A")
+    for x=-1,3 do for z=-1,1 do cell(m,x,z,nil,nil,false) end end
+    cell(m,0,0,"A","forest")
+    cell(m,1,0,nil,"grassland"); cell(m,2,0,nil,"grassland")
+    m.cells["3:0"]=nil
+    local gains=E.frontier_gains(m,"A",neighbors)
+    assert(gains["0:0"]==nil and gains["2:0"]==1)
+    E.summarize(m,4,neighbors)
+    assert(m.graph_nodes.A.unknown_boundary_cells==1)
+    assert(m.graph_nodes.A.explored_area==16,"unlabelled cells must not inflate region area")
+    cell(m,3,0,nil,nil,false)
+    assert(next(E.frontier_gains(m,"A",neighbors))==nil)
+    E.summarize(m,4,neighbors)
+    assert(m.graph_nodes.A.boundary_complete,"observed empty labels are not new space")
+end)
+
+test("unlabelled frontier flood never crosses sea or another known room", function()
+    local m=memory(); node(m,"A")
+    for x=-1,4 do for z=-1,1 do cell(m,x,z,nil,nil,false) end end
+    cell(m,0,0,"A","forest"); cell(m,1,0,"B","forest")
+    cell(m,2,0,nil,"grassland"); m.cells["3:0"]=nil
+    assert(next(E.frontier_gains(m,"A",neighbors))==nil)
+    cell(m,1,0,nil,nil,false)
+    assert(next(E.frontier_gains(m,"A",neighbors))==nil)
 end)
 
 test("mixed terrain remains one topology region with deduplicated area", function()
@@ -190,7 +228,7 @@ test("trajectory loops pause the old frontier instead of bouncing forever", func
     assert(m.searches.A.pauses["12:0"] == 31)
 end)
 
-local function simulated_mod(passable, topology, terrain)
+local function simulated_mod(passable, topology, terrain, entities)
     local handlers, captured, errors = {}, nil, {}
     local x,z,now=0,0,0
     local ground={FOREST=1,GRASS=2,SAVANNA=3,MARSH=4,ROCKY=5,DECIDUOUS=6,DESERT_DIRT=7,DIRT=8}
@@ -202,7 +240,7 @@ local function simulated_mod(passable, topology, terrain)
     local player={GUID=1,prefab="wilson",replica={},IsValid=function() return true end,
         Transform={GetWorldPosition=function() return x,0,z end}}
     local G=setmetatable({GROUND=ground,ThePlayer=player,TheWorld={Map=map,state={phase="day"}},
-        TheSim={FindEntities=function() return {} end},
+        TheSim={FindEntities=function() return entities or {} end},
         TheInput={AddKeyUpHandler=function(_,name,fn) handlers[name]=fn end},
         GetTime=function() return now end,
         ConvertTopologyIdToData=function(id) return {task_id=id} end,
@@ -226,8 +264,141 @@ local function simulated_mod(passable, topology, terrain)
         assert(captured,table.concat(errors,"\n"))
         return captured
     end
-    return sample, G.TheWorld
+    return sample, G.TheWorld, G, handlers
 end
+
+test("juicy berry telemetry respects replicated tags and CanBePicked", function()
+    local ripe=true
+    local bush={prefab="berrybush_juicy",GUID=22,IsValid=function() return true end,
+        HasTag=function(_,tag) return (tag=="pickable" and ripe) or tag=="DIG_workable" end,
+        Transform={GetWorldPosition=function() return 2,0,0 end}}
+    local sample=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{bush})
+    local ready=sample(0,0)
+    assert(ready.nearby[1].pickable==true)
+    assert(ready.nearby[1].collect_path.status=="ready")
+    assert(ready.navigation.graph.current.resources_seen[1]=="berrybush_juicy")
+    ripe=false
+    assert(sample(0,0).nearby[1].pickable==false)
+    ripe=true
+    bush.components={pickable={CanBePicked=function() return false end}}
+    assert(sample(0,0).nearby[1].pickable==false,"server component must also permit picking")
+end)
+
+test("execution telemetry exposes doing, exact buffered target and recipe", function()
+    local sample,_,G=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end)
+    local doing=false
+    local action={action={id="PICK"},target={GUID=22}}
+    G.ThePlayer.GetBufferedAction=function() return action end
+    G.ThePlayer.sg={HasStateTag=function(_,tag) return doing and tag=="doing" end}
+    assert(not sample(0,0).execution.doing)
+    doing=true
+    local pick=sample(0,0).execution
+    assert(pick.doing and pick.action=="PICK" and pick.target_guid==22)
+    action={action={id="BUILD"},recipe="axe"}
+    local build=sample(0,0).execution
+    assert(build.doing and build.action=="BUILD" and build.recipe=="axe")
+    action=nil; doing=false
+    assert(sample(0,0).execution.action==nil)
+end)
+
+test("ordinary flowers export CanBePicked and disappear safely after picking", function()
+    local ripe=true
+    local flower={prefab="flower",GUID=22,IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="pickable" end,
+        components={pickable={CanBePicked=function() return ripe end}},
+        Transform={GetWorldPosition=function() return 2,0,0 end}}
+    local entities={flower}
+    local sample=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,entities)
+    local ready=sample(0,0)
+    assert(ready.nearby[1].pickable==true and ready.nearby[1].collect_path.status=="ready")
+    assert(ready.navigation.graph.current.resources_seen[1]=="flower")
+    ripe=false
+    assert(sample(0,0).nearby[1].pickable==false)
+    table.remove(entities,1)
+    assert(#sample(0,0).nearby==0)
+end)
+
+test("non-predicting client confirms a native request only after replicated doing", function()
+    local now, doing, callback, starts, sent = 1, false, nil, 0, 0
+    local player={components={},HasTag=function(_,tag) return doing and tag=="doing" end,
+        GetBufferedAction=function() return nil end}
+    local task={Cancel=function(self) self.cancelled=true end}
+    player.DoPeriodicTask=function(_,interval,fn) callback=fn; return task end
+    local pc={RemoteActionButton=function(_,action,released) sent=sent+1; return "original",released end,
+        RemoteMakeRecipeFromMenu=function(_,recipe,skin) return skin end}
+    player.components.playercontroller=pc
+    X.attach(player,function() return now end,function() starts=starts+1 end)
+    local original,release=pc:RemoteActionButton({action={id="PICK"},target={GUID=22}},true)
+    assert(original=="original" and release==true and sent==1,"wrapper must preserve native return values")
+    assert(X.read(player,now).stage=="requested")
+    assert(not X.read(player,now).confirmed_start,"a sent RPC is not an acknowledgement")
+    now=1.1; callback(); assert(starts==0)
+    doing=true; now=1.2; callback()
+    local confirmed=X.read(player,now)
+    assert(starts==1 and confirmed.confirmed_start and confirmed.action=="PICK")
+    assert(confirmed.target_guid==22 and confirmed.start_source=="replicated_transition")
+    callback(); assert(starts==1,"start must be emitted once")
+    pc:RemoteActionButton(nil,true)
+    assert(X.read(player,now).target_guid==22,"key release must not replace the request")
+    doing=false; now=1.3; callback()
+    assert(task.cancelled)
+    local latched=X.read(player,1.4)
+    assert(not latched.doing and latched.confirmed_start and latched.stage=="finished_unverified")
+    assert(not X.read(player,2.2).confirmed_start,"old start latch must expire")
+end)
+
+test("busy state before request and unrelated actions cannot acknowledge it", function()
+    local doing=true
+    local action=nil
+    local player={HasTag=function(_,tag) return doing and tag=="doing" end,
+        GetBufferedAction=function() return action end}
+    X.request(player,{action={id="PICK"},target={GUID=22}},1)
+    assert(not X.read(player,1.1).confirmed_start)
+    doing=false; X.read(player,1.2)
+    action={action={id="PICK"},target={GUID=23}}; doing=true
+    assert(not X.read(player,1.3).confirmed_start,"wrong buffered target must not match")
+    doing=false; action=nil
+    assert(not X.read(player,4.1).confirmed_start,"rejected request must expire without an acknowledgement")
+end)
+
+test("non-predicting client tracks exact remotely requested build recipe", function()
+    local doing=false
+    local player={components={},HasTag=function(_,tag) return doing and tag=="doing" end}
+    local pc={RemoteMakeRecipeFromMenu=function(_,recipe,skin) return recipe.name,skin end}
+    player.components.playercontroller=pc
+    X.attach(player,function() return 1 end)
+    local name,skin=pc:RemoteMakeRecipeFromMenu({name="axe"},"skin")
+    assert(name=="axe" and skin=="skin")
+    assert(not X.read(player,1.1).confirmed_start)
+    doing=true
+    local status=X.read(player,1.2)
+    assert(status.confirmed_start and status.recipe=="axe" and status.action=="BUILD")
+end)
+
+test("real Mod eats raw or cooked juicy berries and cooks raw juicy berries", function()
+    local fire={prefab="campfire",GUID=99,IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="fire" or tag=="cooker" end}
+    local _,_,G,handlers=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{fire})
+    local food={prefab="berries_juicy",GUID=30,IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="cookable" end}
+    local eaten,cooked
+    G.ThePlayer.replica.inventory={
+        FindItem=function(_,fn) if fn(food) then return food end end,
+        UseItemFromInvTile=function(_,item) eaten=item end}
+    G.ThePlayer.GetDistanceSqToInst=function() return 4 end
+    G.ACTIONS={COOK={}}
+    G.ThePlayer.components={playercontroller={ismastersim=true,IsBusy=function() return false end,
+        GetItemUseAction=function() return {action=G.ACTIONS.COOK} end,
+        DoAction=function(_,action) cooked=action end}}
+    handlers.KEY_F7(); assert(eaten==food)
+    handlers.KEY_F3(); assert(cooked and cooked.action==G.ACTIONS.COOK)
+    food.prefab="berries_juicy_cooked"; eaten=nil
+    handlers.KEY_F7(); assert(eaten==food)
+end)
 
 test("real Mod telemetry keeps mixed terrain together and unifies round-trip routes", function()
     local sample=simulated_mod(function(x,z) return x>=-24 and x<=48 and math.abs(z)<=24 end,
@@ -265,6 +436,51 @@ test("real Mod exhausts a fully observed island without inventing unknown exits"
     local result=sample(0,0)
     assert(result.navigation.graph.current.boundary_complete)
     assert(result.navigation.search.status == "boundary_complete")
+end)
+
+test("real Mod offers exploration along an observed unlabelled land corridor", function()
+    local sample=simulated_mod(function(x,z) return x>=-4 and math.abs(z)<=4 end,
+        function(x,z) if x<=0 then return "A" end end,function() return 2 end)
+    local result=sample(0,0)
+    assert(result.navigation.status=="ready")
+    assert(result.navigation.search.status=="ready")
+    assert(not result.navigation.graph.current.boundary_complete)
+    assert(result.navigation.target.x>0)
+    assert(result.navigation.graph.current.explored_area>0)
+end)
+
+test("real Mod crossing keeps destination-side legs until topology settles", function()
+    local sample,world=simulated_mod(function() return true end,
+        function(x,z) return x<20 and "A" or "B" end,function() return 2 end)
+    sample(0,0)
+    local m=world._jev_dst_navigation
+    node(m,"B")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=16,az=0,bx=20,bz=0}}}
+    local first=sample(15.3,0).navigation.graph.routes[1]
+    assert(first.leg.x==19.3 or math.abs(first.leg.x-19.3)<0.01)
+    local mid=sample(18.2,0).navigation.graph.routes[1]
+    assert(mid and mid.leg.x>18.2,"crossing must not turn back to x=16")
+    local debounce=sample(20,0)
+    assert(debounce.navigation.graph.current_node=="A")
+    local settled=sample(20,0)
+    assert(settled.navigation.graph.current_node=="B")
+    for id in pairs(m.gateway_crossings) do assert(string.sub(id,1,2)=="B>") end
+end)
+
+test("a blocked crossing never falls back to walking toward its source side", function()
+    local blocked=false
+    local sample,world=simulated_mod(function(x,z) return not (blocked and x>=19 and x<=21) end,
+        function(x,z) return x<20 and "A" or "B" end,function() return 2 end)
+    sample(0,0)
+    local m=world._jev_dst_navigation; node(m,"B")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=16,az=0,bx=20,bz=0}}}
+    sample(15.3,0)
+    blocked=true
+    local result=sample(18.2,0)
+    for _,route in ipairs(result.navigation.graph.routes) do
+        assert(route.gateway_id~="A>B:16:0:20:0",
+            "blocked crossing must not be revived by a reverse source-side leg")
+    end
 end)
 
 test("known-region travel detours around a hazard instead of discarding a valid route", function()
@@ -350,6 +566,43 @@ test("real Mod keeps one gateway through small distance changes and abandons it 
     m.hazards[8]={guid=8,prefab="killerbee",x=24,z=-16,last_seen=3}
     local rerouted=sample(0,0.1).navigation.graph.routes[1]
     assert(rerouted and rerouted.target.z == 4,"unsafe cached gateway was not replaced")
+end)
+
+test("local board work gets passable-ground paths and cancellation capability", function()
+    local entities={}
+    for i,tag in ipairs({"CHOP_workable","MINE_workable"}) do
+        entities[i]={GUID=500+i,prefab=i==1 and "evergreen" or "rock1",
+            IsValid=function() return true end,
+            HasTag=function(_,name) return name==tag end,
+            Transform={GetWorldPosition=function() return i*2,0,0 end}}
+    end
+    local sample=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,entities)
+    local ready=sample(0,0)
+    assert(ready.telemetry.cancel_work==true)
+    assert(#ready.nearby==2)
+    for _,entity in ipairs(ready.nearby) do assert(entity.collect_path.status=="ready") end
+    local blocked=simulated_mod(function(x) return x<1 end,function() return "A" end,
+        function() return 2 end,entities)(0,0)
+    for _,entity in ipairs(blocked.nearby) do assert(entity.collect_path.status=="blocked") end
+end)
+
+test("F4 cancels queued work and stops controls before handing back to JEV", function()
+    local _,_,G,handlers=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end)
+    local cancelled,cleared,remote,stopped=0,0,0,0
+    G.ThePlayer._jev_dst_work_task={Cancel=function() cancelled=cancelled+1 end}
+    G.ThePlayer._jev_dst_work={status="started"}
+    G.ThePlayer.ClearBufferedAction=function() cleared=cleared+1 end
+    G.ThePlayer.components={playercontroller={RemoteStopAllControls=function() remote=remote+1 end,
+        locomotor={Stop=function() stopped=stopped+1 end}}}
+    handlers.KEY_F4()
+    assert(cancelled==1 and G.ThePlayer._jev_dst_work_task==nil)
+    assert(G.ThePlayer._jev_dst_work.status=="failed")
+    assert(G.ThePlayer._jev_dst_work.reason=="controller_interrupted")
+    assert(cleared==1 and remote==1 and stopped==1)
+    handlers.KEY_F4(); assert(cancelled==1,"cancel must be idempotent")
+    G.ThePlayer=nil; handlers.KEY_F4()
 end)
 
 print("PASS: " .. passed .. " Lua exploration checks")

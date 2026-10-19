@@ -2,7 +2,7 @@
 
 [中文版](README.md) · [Technical reference](docs/TECHNICAL.EN.md)
 
-An experimental agent for Don't Starve Together: a client mod reports game state, JEV selects actions, and a Python controller performs a bounded set of game inputs. Optional DeepSeek plans provide longer-term context for JEV's decisions. The current milestone is to build an Alchemy Engine.
+An experimental agent for Don't Starve Together: a client mod reports game state and a Python controller performs bounded game inputs. Optional DeepSeek task boards drive automatic local progress; JEV handles danger and decisions when no board task is locally executable. The current milestone is to build an Alchemy Engine.
 
 Previous milestones: [survive the first night](https://bilibili.com/video/BV1aehE6DEji) · [build a Science Machine](https://www.bilibili.com/video/BV1mFaV6aEQ2)
 

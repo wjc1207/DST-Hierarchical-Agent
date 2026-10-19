@@ -115,9 +115,9 @@ class PrefetchTests(unittest.TestCase):
 
     def test_second_cycle_consumes_prefetch_instead_of_sending_another_request(self):
         worker = self.make_prefetch()
-        observed = state([])
+        observed = state([grass(10, 0.5, True)])
         result = {"response": {"model": "test"},
-                  "answer": {"choice": "explore_current_region", "confidence": 1}}
+                  "answer": {"choice": "collect_grass", "confidence": 1}}
         args = SimpleNamespace(log=Path("unused.log"), execute=True, show_probabilities=False,
                                min_confidence=None, move_seconds=1.0)
         def execute(*_args):
@@ -125,7 +125,7 @@ class PrefetchTests(unittest.TestCase):
             submitted = len(worker.executor.calls)
             callback(observed, "movement")
             self.assertEqual(len(worker.executor.calls), submitted)
-            callback(observed, "exploration_event")
+            callback(observed, "verified")
             return True
         with (
             patch.object(controller, "latest_state", return_value=(observed, 100)),
@@ -137,6 +137,71 @@ class PrefetchTests(unittest.TestCase):
             worker.future.set_result((result, 0.5))
             self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test", prefetch=worker))
         request.assert_called_once()
+
+    def test_exploration_yield_requests_from_fresh_next_cycle_instead_of_prefetch(self):
+        worker = self.make_prefetch()
+        before = state([])
+        berry = {**grass(11, 0.5, True), "prefab": "berrybush"}
+        after = state([berry])
+        explore = {"response": {"model": "test"},
+                   "answer": {"choice": "explore_current_region", "confidence": 1}}
+        collect = {"response": {"model": "test"},
+                   "answer": {"choice": "collect_berries", "confidence": 1}}
+        # Use live candidate naming rather than a fixture-specific alias.
+        _, actions = jev_agent.build_candidates(after)
+        collect["answer"]["choice"] = next(key for key, action in actions.items()
+            if action["kind"] == "collect" and action.get("guid") == 11)
+        args = SimpleNamespace(log=Path("unused.log"), execute=True, show_probabilities=False,
+                               min_confidence=None, move_seconds=1.0)
+        current = [before]
+
+        def execute(action, *_args):
+            if action["kind"] == "explore":
+                callback = controller._action_observer.get()
+                callback(before, "movement")
+                callback(before, "verified")
+                current[0] = after
+                callback(after, "exploration_event")
+            return True
+
+        with (
+            patch.object(controller, "latest_state", side_effect=lambda *_: (current[0], 100)),
+            patch.object(jev_agent, "call_jev", side_effect=[explore, collect]) as request,
+            patch.object(jev_agent, "execute_action", side_effect=execute) as execute_mock,
+        ):
+            self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test", prefetch=worker))
+            self.assertEqual(len(worker.executor.calls), 0)
+            self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test", prefetch=worker))
+        self.assertEqual(request.call_count, 2)
+        self.assertIs(request.call_args.args[3], after)
+        self.assertEqual(execute_mock.call_args.args[0]["kind"], "collect")
+        self.assertEqual(execute_mock.call_args.args[0]["guid"], 11)
+
+    def test_basic_tool_crafting_prefetches_only_after_verified(self):
+        for kind, recipe in (("craft_axe", "axe"), ("craft_pickaxe", "pickaxe")):
+            with self.subTest(kind=kind):
+                worker = self.make_prefetch()
+                observed = state([])
+                observed["crafting"][recipe] = True
+                result = {"response": {"model": "test"},
+                          "answer": {"choice": kind, "confidence": 1}}
+                args = SimpleNamespace(log=Path("unused.log"), execute=True, show_probabilities=False,
+                                       min_confidence=None, move_seconds=1.0)
+
+                def execute(*_args):
+                    callback = controller._action_observer.get()
+                    callback(observed, "movement")
+                    self.assertEqual(len(worker.executor.calls), 0)
+                    callback(observed, "verified")
+                    return True
+
+                with (
+                    patch.object(controller, "latest_state", return_value=(observed, 100)),
+                    patch.object(jev_agent, "call_jev", return_value=result),
+                    patch.object(jev_agent, "execute_action", side_effect=execute),
+                ):
+                    self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test", prefetch=worker))
+                self.assertEqual(len(worker.executor.calls), 1)
 
     def test_observer_runs_while_keys_are_held_and_input_is_always_released(self):
         held = set()
@@ -187,6 +252,30 @@ class PrefetchTests(unittest.TestCase):
         ):
             self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test"))
         execute.assert_not_called()
+
+    def test_only_attack_is_confidence_gated_even_with_cli_override(self):
+        cases = (("craft_axe", 0.0, 0.9, True),
+                 ("explore_current_region", 0.01, 0.9, True),
+                 ("attack_nearest_hostile", 0.44, None, False),
+                 ("attack_nearest_hostile", 0.45, None, True),
+                 ("attack_nearest_hostile", 0.7, 0.8, False))
+        for choice, confidence, override, should_execute in cases:
+            with self.subTest(choice=choice, confidence=confidence, override=override):
+                kind = "explore" if choice.startswith("explore") else choice
+                action = {"kind": kind}
+                observed = state([])
+                args = SimpleNamespace(log=Path("unused.log"), execute=True, show_probabilities=False,
+                                       min_confidence=override, move_seconds=1)
+                result = {"response": {"model": "test"},
+                          "answer": {"choice": choice, "confidence": confidence}}
+                with (
+                    patch.object(controller, "latest_state", return_value=(observed, 100)),
+                    patch.object(jev_agent, "build_candidates", return_value=({choice: "Action"}, {choice: action})),
+                    patch.object(jev_agent, "call_jev", return_value=result),
+                    patch.object(jev_agent, "execute_action", return_value=True) as execute,
+                ):
+                    jev_agent.run_decision_cycle(args, "url", "key", "test")
+                self.assertEqual(execute.called, should_execute)
 
     def test_failed_optional_request_falls_back_without_raising(self):
         worker = self.make_prefetch()

@@ -93,13 +93,12 @@ class TimingTests(unittest.TestCase):
             self.assertTrue(any("timing_log_unavailable" in str(call) for call in printed.call_args_list))
 
     def test_dry_run_and_abstention_are_recorded_without_game_input(self):
-        observed = {
-            "world": {"day": 1, "phase": "day"}, "nearby": [],
-            "player": {"vitals": {"hunger": 100, "hunger_max": 150}},
-        }
+        from test_regressions import state, hostile
+        observed = state([hostile(22, 3)])
+        observed["player"]["inventory"]["equipped"] = [{"prefab": "axe", "weapon": True, "count": 1}]
         args = SimpleNamespace(log=Path("unused.log"), show_probabilities=False,
                                execute=False, min_confidence=0.5, move_seconds=1.0)
-        result = {"response": {"model": "test"}, "answer": {"choice": "wait", "confidence": 0.1}}
+        result = {"response": {"model": "test"}, "answer": {"choice": "attack_nearest_hostile", "confidence": 0.1}}
         with (
             patch.object(controller, "latest_state", return_value=(observed, 1)),
             patch.object(jev_agent, "call_jev", return_value=result),
@@ -111,7 +110,7 @@ class TimingTests(unittest.TestCase):
                 with timing.CycleTrace(1) as trace:
                     self.assertFalse(jev_agent.run_decision_cycle(args, "url", "secret", "test"))
                 self.assertEqual(trace.record["outcome"], outcome)
-                self.assertEqual(trace.record["action"], "wait")
+                self.assertEqual(trace.record["action"], "attack_nearest_hostile")
                 self.assertNotIn("secret", json.dumps(trace.record))
                 self.assertIn("decision.candidates", trace.record["totals"])
             execute.assert_not_called()
