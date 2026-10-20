@@ -1,8 +1,54 @@
-# JEV DST Agent technical reference (1.7.1)
+# JEV DST Agent technical reference (1.7.2)
 
 [Project README](../README.EN.md) · [中文技术说明](TECHNICAL.md)
 
 Run all commands below from the project root (`jev_dst_agent`).
+
+### Live action interrupts and native work cleanup
+
+Model-selected actions now use the same live guard as local board execution.
+Ordinary work yields on identity/death, damage, targeted hostiles or lighting
+changes. Checks run on telemetry reads and during held movement, not just at
+dispatch; model actions also recheck `action_allowed()`. Recovery actions such as
+equipping light and fleeing have reason-specific exemptions so their own light
+transition or existing danger does not cancel the remedy. This does not select
+or equip a torch automatically. Handoffs log `action_handoff reason=...`,
+`action_handoff_reason` and `outcome=interrupted`, without error retry backoff.
+
+Once chopping/mining has been sent, an interrupt, timeout, failure or Ctrl+C
+cancels the native repeated work with F4. Pre-dispatch validation failures do not
+send cancellation. The Mod also enforces a 30-second elapsed-time limit even in
+busy/no-matching-action retry branches, reports `completion_timeout` and stops
+controls. Failed/cancelled callbacks cannot restart work. Update the client Mod
+to 1.7.2, re-enter the world and restart the Python controller for both halves.
+
+### Usable sources and failed-source evidence
+
+Source relations no longer imply current obtainability. `usable_sources_for()`
+checks actual carried/equipped tools with the controller's conservative remaining
+use calculation and whole-target workloads: six for standard/gold boulders,
+four/two for medium/small flintless rocks, and fifteen for maximum-stage trees.
+Missing, insufficient or unknown durability excludes that work source from
+material-directed navigation; a craftable tool recipe is not an existing tool.
+Loose materials and tool-free gathering remain usable. Existing source intents
+are revalidated when tool conditions change.
+
+The old 30-second source pause is replaced by per-run `(region, product)` negative
+evidence. Only a completed boundary, explicit local `no_frontier`, and no currently
+obtainable matching source confirm a failed survey. Absence at an entrance, remaining
+frontiers, hazards or temporary blockage do not suffice. The unchanged historical
+record cannot keep triggering BFS returns for that product, nor pointless DFS returns
+to its failed, surveyed parent. This does not ban transit or unrelated product/tasks.
+
+Time, larger targets, board/quarter revisions and unrelated discoveries never clear
+negative evidence. A fresh obtainable entity or a newly usable recorded source type
+(for example, acquiring a pickaxe makes a previously unusable rock source feasible)
+can restore priority. Unreachable or depleted entities are not positive evidence.
+Player/world resets clear per-run memory. Logs add `exploration_source_failed`,
+`exploration_source_reconfirmed` and timing metadata `exploration_unusable_sources`.
+
+Sync `exploration_executor.py` and restart the controller; no Mod update is needed.
+JEV waiting policy and automatic tool prerequisite solving are unchanged.
 
 ### Executor-owned exploration
 

@@ -46,6 +46,7 @@ class ExplorationExecutorTests(unittest.TestCase):
 
     def test_known_source_room_is_searched_locally_not_abandoned_at_entrance(self):
         actual = observed()
+        actual["player"]["inventory"]["items"].append({"prefab": "pickaxe", "durability_percent": 1})
         actual["navigation"]["graph"]["current"]["resources_seen"] = ["rock2"]
         self.choose(actual, board({"type": "inventory", "prefab": "goldnugget", "count": 1}))
         self.assertEqual(self.navigator.strategy, "source_room")
@@ -167,7 +168,7 @@ class ExplorationExecutorTests(unittest.TestCase):
         changed["nearby"] = [grass(1, 1, True)]
         response = {"response": {"model": "test"},
                     "answer": {"choice": "collect_grass", "confidence": 1}}
-        with (patch.object(controller, "latest_state", side_effect=[(actual, 1), (changed, 2), (changed, 2)]),
+        with (patch.object(controller, "latest_state", side_effect=[(actual, 1), (changed, 2), (changed, 2), (changed, 2)]),
               patch.object(jev_agent, "execute_action", return_value=True) as execute,
               patch.object(jev_agent, "call_jev", return_value=response) as api):
             jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
@@ -213,7 +214,7 @@ class ExplorationExecutorTests(unittest.TestCase):
                                "dx": 2, "dz": 0, "activeThreat": True, "tags": ["hostile"]}]
         response = {"response": {"model": "test"},
                     "answer": {"choice": "flee_from_nearest_hostile", "confidence": 1}}
-        with (patch.object(controller, "latest_state", side_effect=[(actual, 1), (changed, 2), (changed, 2)]),
+        with (patch.object(controller, "latest_state", side_effect=[(actual, 1), (changed, 2), (changed, 2), (changed, 2)]),
               patch.object(jev_agent, "execute_action", return_value=True) as execute,
               patch.object(jev_agent, "call_jev", return_value=response) as api):
             jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",

@@ -50,6 +50,18 @@ Planning considerations:
 - Chopping and mining actions include bounded pickup near the completed target.
   Trees may yield logs and seeds (such as pinecones or acorns); mined rocks may
   yield rocks, flint, nitre, or gold, depending on the target.
+- Source feasibility depends on prerequisites: without a usable pickaxe, a rock
+  that can drop flint is NOT an executable way to get the flint needed to make
+  that pickaxe. Seek loose flint or another obtainable source instead. A recipe
+  being available does not mean its tool exists. Tools need enough remaining
+  uses for a whole work target. Standard rock1 gives rocks/flint/nitre, not gold;
+  rock2 is the standard gold-bearing boulder. Neither can be mined without a
+  usable pickaxe. Loose gold/flint pickups do not require mining tools.
+- A past resources_seen record is not proof of a currently obtainable source.
+  The executor remembers failed region/product surveys instead of retrying an
+  unchanged record after a timer. New obtainable-source evidence can restore
+  its priority; an entrance, temporary hazard or path failure is not a complete
+  survey. A need that persists does not itself make a failed source valid again.
 - The eat_safe_food action can cook carried raw food at a nearby lit cooker and
   then eat it when needed. Do not plan a separate cook action solely for that.
 - Exploration uses the game's topology IDs as region identity; ground tiles

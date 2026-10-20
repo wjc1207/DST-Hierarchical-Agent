@@ -60,7 +60,7 @@ _state_guard = ContextVar("state_guard", default=None)
 
 
 class AutoExecutionInterrupted(Exception):
-    """A local task lost its safety conditions; return control without retry backoff."""
+    """An action lost its safety conditions; return control without retry backoff."""
 
 
 @contextmanager
@@ -1325,6 +1325,28 @@ def _conservative_tool_uses(state: dict, prefab: str, maximum: int) -> int:
 
 @timing.timed("work.complete")
 def complete_work_action(log_path: Path, action_key: str, target_tag: str) -> None:
+    # Own the native repeated-work lifetime for both board and model actions,
+    # including standalone controller commands and keyboard interruption.
+    with cancel_work_on_error() as lifecycle:
+        _complete_work_action(log_path, action_key, target_tag, lifecycle)
+
+
+@contextmanager
+def cancel_work_on_error():
+    lifecycle = {"sent": False}
+    try:
+        yield lifecycle
+    except BaseException:
+        if lifecycle["sent"]:
+            try:
+                focus_game(find_game_window())
+                tap([VK["cancel_work"]], 0.04)
+            except (RuntimeError, OSError) as exc:
+                print(f"work_cancel_failed error={type(exc).__name__}")
+        raise
+
+
+def _complete_work_action(log_path: Path, action_key: str, target_tag: str, lifecycle: dict) -> None:
     state, log_position = latest_state(log_path)
     preexisting_drop_guids = {
         entity["guid"] for entity in state.get("nearby", [])
@@ -1346,6 +1368,7 @@ def complete_work_action(log_path: Path, action_key: str, target_tag: str) -> No
     previous_sequence = int((state.get("work") or {}).get("sequence") or 0)
     hwnd = find_game_window()
     focus_game(hwnd)
+    lifecycle["sent"] = True
     tap([VK[action_key]], 0.08)
 
     expected_action = "chop" if target_tag == "CHOP_workable" else "mine"

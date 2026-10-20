@@ -1703,6 +1703,7 @@ local function perform_work_action(action, target_tag, tool_prefab)
     player._jev_dst_work = work
 
     local attempts = 0
+    local deadline = G.GetTime() + 30
     local function schedule(delay, fn)
         player._jev_dst_work_task = player:DoTaskInTime(delay, fn)
     end
@@ -1711,9 +1712,23 @@ local function perform_work_action(action, target_tag, tool_prefab)
         if not player:IsValid() then
             return
         end
+        if player._jev_dst_work ~= work or work.status ~= "started" then
+            return
+        end
         if not target:IsValid() or not target:HasTag(target_tag) then
             work.status = "completed"
             print("[JEV_DST_ACTION]" .. string.lower(action.id) .. ":completed target=" .. tostring(target.GUID))
+            return
+        end
+        -- Count elapsed time even when busy or no matching action is returned;
+        -- those retries do not increment attempts and otherwise never expire.
+        if G.GetTime() >= deadline then
+            work.status = "failed"
+            work.reason = "completion_timeout"
+            safe_call(function() player:ClearBufferedAction() end, nil)
+            safe_call(function() controller:RemoteStopAllControls() end, nil)
+            safe_call(function() controller.locomotor:Stop() end, nil)
+            print("[JEV_DST_ACTION_ERROR]" .. string.lower(action.id) .. ":completion_timeout")
             return
         end
         if not tool:IsValid() then

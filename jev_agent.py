@@ -1123,9 +1123,29 @@ def run_decision_cycle(
             print(f"jev_prefetch_checkpoint_skipped error={type(exc).__name__}")
         return True
 
+    guard = LocalBoardExecutor.guard(state, selected, allow_recovery=True)
+
+    def execution_guard(observed):
+        guard(observed)
+        allowed, reason = action_allowed(observed, selected["kind"])
+        if not allowed:
+            raise controller.AutoExecutionInterrupted(reason)
+
     try:
-        with controller.observe_action(checkpoint if prefetch is not None else None):
+        with controller.observe_action(checkpoint if prefetch is not None else None), \
+                controller.guard_states(args.log, execution_guard):
+            # Recheck once more before sending any input; subsequent telemetry
+            # reads and held movement keys run the same live guard.
+            controller.latest_state(args.log)
             executed = execute_action(selected, args.log, args.move_seconds)
+    except controller.AutoExecutionInterrupted as exc:
+        if prefetch is not None:
+            prefetch.discard("action_interrupted")
+        if planner is not None:
+            planner.record_action(state, choice, "interrupted")
+        timing.annotate(outcome="interrupted", action_handoff_reason=str(exc))
+        print(f"action_handoff reason={exc}; requesting a fresh decision")
+        return False
     except (RuntimeError, OSError, ValueError):
         if prefetch is not None:
             prefetch.discard("action_failed")

@@ -34,16 +34,28 @@ class LocalBoardExecutor:
         return None
 
     @staticmethod
-    def guard(baseline, action=None):
+    def guard(baseline, action=None, *, allow_recovery=False):
+        kind = (action or {}).get("kind") if allow_recovery else None
+        light_recovery = kind in {"craft_torch", "equip_torch", "build_campfire"}
+        combat = kind in {"flee_from_nearest_hostile", "equip_weapon", "attack_nearest_hostile"}
         def check(state):
             reason = LocalBoardExecutor.initial_handoff(state)
+            if reason == "targeted_by_hostile" and combat:
+                reason = None
+            if reason == "night_light_requires_decision" and (
+                    light_recovery or kind in {"flee_from_nearest_hostile", "eat_safe_food", "wait"}):
+                reason = None
             old, new = baseline.get("player", {}), state.get("player", {})
             if old.get("guid") != new.get("guid"):
                 reason = "player_changed"
             health, previous = new.get("vitals", {}).get("health"), old.get("vitals", {}).get("health")
-            if health is not None and previous is not None and float(health) < float(previous):
+            if (health is not None and previous is not None and float(health) < float(previous)
+                    and not light_recovery and kind != "flee_from_nearest_hostile"):
                 reason = "health_lost"
-            if light_signature(state) != light_signature(baseline):
+            # A recovery may itself change the light signature. Do not cancel
+            # equipping light because the torch has just appeared in the hand.
+            if (light_signature(state) != light_signature(baseline)
+                    and not light_recovery and kind not in {"unequip_torch", "flee_from_nearest_hostile"}):
                 reason = reason or "light_changed"
             if action and action.get("_board_target_guid") is not None:
                 work = state.get("work") or {}

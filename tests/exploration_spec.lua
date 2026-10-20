@@ -605,6 +605,50 @@ test("F4 cancels queued work and stops controls before handing back to JEV", fun
     G.ThePlayer=nil; handlers.KEY_F4()
 end)
 
+test("repeated work expires even while busy or lacking an action", function()
+    for _,mode in ipairs({"busy","no_action","working"}) do
+        local target={GUID=22,prefab="evergreen",IsValid=function() return true end,
+            HasTag=function(_,tag) return tag=="CHOP_workable" end,
+            Transform={GetWorldPosition=function() return 2,0,0 end}}
+        local _,_,G,handlers=simulated_mod(function() return true end,function() return "A" end,
+            function() return 2 end,{target})
+        local clock,queued,issued,stopped=0,nil,0,0
+        G.GetTime=function() return clock end
+        G.EQUIPSLOTS={HANDS="hands"}; G.ACTIONS={CHOP={id="CHOP"}}
+        local tool={prefab="axe",IsValid=function() return true end,
+            components={finiteuses={GetPercent=function() return 1 end}}}
+        G.ThePlayer.replica.inventory={GetEquippedItem=function() return tool end,
+            GetItems=function() return {} end}
+        G.ThePlayer.GetDistanceSqToInst=function() return 4 end
+        G.ThePlayer.DoTaskInTime=function(_,delay,fn)
+            queued=fn; return {Cancel=function() queued=nil end}
+        end
+        G.ThePlayer.ClearBufferedAction=function() end
+        G.ThePlayer.components={playercontroller={ismastersim=true,
+            IsBusy=function() return mode=="busy" end,
+            GetActionButtonAction=function()
+                if mode~="no_action" then return {action=G.ACTIONS.CHOP} end
+            end,
+            DoAction=function() issued=issued+1 end,
+            RemoteStopAllControls=function() stopped=stopped+1 end,
+            locomotor={Stop=function() end}}}
+        handlers.KEY_F8()
+        assert(queued and G.ThePlayer._jev_dst_work.status=="started")
+        clock=29.9; local retry=queued; queued=nil; retry()
+        assert(queued and G.ThePlayer._jev_dst_work.status=="started")
+        clock=30; retry=queued; queued=nil; retry()
+        assert(queued==nil and stopped==1)
+        assert(G.ThePlayer._jev_dst_work.status=="failed")
+        assert(G.ThePlayer._jev_dst_work.reason=="completion_timeout")
+        local count=issued
+        retry(); assert(issued==count and queued==nil,"failed work must not restart")
+        handlers.KEY_F8(); retry=queued
+        assert(retry)
+        handlers.KEY_F4(); queued=nil
+        retry(); assert(queued==nil,"cancelled callback must not restart work")
+    end
+end)
+
 test("gateway continuation is fixed and never steers back after overshoot", function()
     local target=E.gateway_destination(16,0,20,0,2)
     assert(target.x==22 and target.z==0)
