@@ -247,13 +247,13 @@ class BoardLoopTests(unittest.TestCase):
         self.execute.assert_not_called()
         self.key.assert_not_called()
 
-    def test_missing_local_target_hands_back_to_jev(self):
+    def test_missing_local_target_hands_navigation_to_executor(self):
         self.current = state([])
         self.execute.side_effect = None
         self.execute.return_value = True
         self.cycle()
-        self.request.assert_called_once()
-        self.assertEqual(self.execute.call_args.args[0]["kind"], "wait")
+        self.request.assert_not_called()
+        self.assertEqual(self.execute.call_args.args[0]["kind"], "explore")
 
     def test_failed_or_no_progress_action_is_paused_and_hands_back(self):
         for failure in (False, RuntimeError("timeout"), True):

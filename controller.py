@@ -17,7 +17,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import telemetry
 import timing_log as timing
-from exploration_events import ExplorationEvents, observe_depleted_resources
+from exploration_events import ExplorationEvents, MIN_RESOURCE_EVENT_DISTANCE
 
 
 PREFIX = "[JEV_DST_STATE]"
@@ -52,9 +52,9 @@ VK = {
 MOVEMENT_KEYS = (VK["up"], VK["left"], VK["down"], VK["right"])
 EXPLORATION_STALL = {"target": None, "count": 0, "last_position": None}
 GRAPH_ROUTE_BLACKLIST: Dict[str, float] = {}
+GRAPH_GATEWAY_BLACKLIST: Dict[tuple, float] = {}
 GRAPH_ROUTE_HISTORY: Dict[tuple, list] = {}
 COLLECTION_TARGET_PAUSES: Dict[tuple, dict] = {}
-EXPLORATION_SEEN_RESOURCES: Dict[object, dict] = {}
 _action_observer = ContextVar("action_observer", default=None)
 _state_guard = ContextVar("state_guard", default=None)
 
@@ -77,8 +77,27 @@ EXPLORATION_HAZARD_CLEARANCE = 14.0
 EXPLORATION_HAZARD_CAUTION = 20.0
 
 
-def graph_route_available(node_id: str) -> bool:
-    return time.monotonic() >= GRAPH_ROUTE_BLACKLIST.get(node_id, 0.0)
+def graph_route_available(node_id: str, gateway_id=None, player_guid=None) -> bool:
+    now = time.monotonic()
+    return (now >= GRAPH_ROUTE_BLACKLIST.get(node_id, 0.0)
+            and now >= GRAPH_GATEWAY_BLACKLIST.get((player_guid, gateway_id), 0.0))
+
+
+def graph_history_key(state, destination, route):
+    return (state.get("player", {}).get("guid"),
+            (state.get("navigation", {}).get("graph") or {}).get("current_node"),
+            route.get("gateway_id") or destination)
+
+
+def pause_graph_route(state, destination, route, reason):
+    until = time.monotonic() + 30
+    GRAPH_ROUTE_BLACKLIST[destination or ""] = until
+    gateway = route.get("gateway_id")
+    if gateway:
+        GRAPH_GATEWAY_BLACKLIST[(state.get("player", {}).get("guid"), gateway)] = until
+    GRAPH_ROUTE_HISTORY.pop(graph_history_key(state, destination, route), None)
+    timing.annotate(graph_route_pause_reason=reason, blocked_gateway_id=gateway)
+    print(f"graph route to {destination} and gateway={gateway} paused for 30s reason={reason}")
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -257,16 +276,6 @@ def parse_state_line(line: str) -> Optional[dict]:
 @timing.timed("state.read", record=False)
 def latest_state(log_path: Path) -> Tuple[dict, int]:
     state, offset = telemetry.latest_state(log_path)
-    memory = EXPLORATION_SEEN_RESOURCES.get(state.get("player", {}).get("guid"))
-    if memory is not None:
-        observed_at = float(state.get("observed_at") or 0)
-        if observed_at < memory["observed_at"]:
-            memory["seen"].clear()
-            memory.setdefault("depleted", {}).clear()
-        memory["observed_at"] = observed_at
-        # Observe depletion during collection/crafting too, not only while
-        # exploring. Merely leaving view never changes availability memory.
-        observe_depleted_resources(state, memory["seen"], memory.setdefault("depleted", {}))
     guard = _state_guard.get()
     if guard is not None:
         guard[1](state)
@@ -374,6 +383,11 @@ def collect_target_available(target: Optional[dict]) -> bool:
         return target.get("pickable") is True
     tags = set(target.get("tags", []))
     return "_inventoryitem" in tags or "pickable" in tags
+
+
+def exploration_resource_available(state: dict, entity: dict) -> bool:
+    return (entity.get("prefab") in EXPLORATION_RESOURCE_PREFABS
+            and collect_target_available(entity) and collect_target_reachable(state, entity))
 
 
 def collect_target_reachable(state: dict, target: dict) -> bool:
@@ -637,6 +651,10 @@ def explore_leg(
     if navigation_mode not in {"region", "graph", "search"}:
         raise ValueError(f"Unknown navigation mode: {navigation_mode}")
     navigation = section(state)
+    if navigation_mode == "graph" and not graph_route_available(target_node_id or "",
+            navigation.get("gateway_id"), state.get("player", {}).get("guid")):
+        print("explore leg skipped: route or gateway is temporarily paused")
+        return False
     area = (state.get("navigation", {}).get("graph") or {}).get("current") or {}
     timing.annotate(region_id=area.get("id"), region_name=area.get("name"),
                     region_explored_area=area.get("explored_area"),
@@ -679,7 +697,8 @@ def explore_leg(
     dx = target_x - float(position["x"])
     dz = target_z - float(position["z"])
     remaining = math.hypot(dx, dz)
-    arrival_distance = REGION_ARRIVAL_DISTANCE
+    arrival_distance = (max(0.1, min(REGION_ARRIVAL_DISTANCE, float(current_leg.get("arrival_distance")
+                        or REGION_ARRIVAL_DISTANCE))) if navigation_mode == "graph" else REGION_ARRIVAL_DISTANCE)
     if remaining <= arrival_distance:
         print("explore leg skipped: leg target is within arrival tolerance")
         return False
@@ -738,7 +757,7 @@ def explore_leg(
                     movement_start=[start_x, start_z], movement_end=[end_x, end_z],
                     movement_target=[target_x, target_z], movement_progress=round(progress, 3))
     if navigation_mode == "graph":
-        history_key = (state.get("navigation", {}).get("graph", {}).get("current_node"), target_node_id)
+        history_key = graph_history_key(state, target_node_id, navigation)
         history = GRAPH_ROUTE_HISTORY.get(history_key, [])
         now = time.monotonic()
         history = [(t, x, z) for t, x, z in history if now - t < 20]
@@ -749,10 +768,7 @@ def explore_leg(
         if len(history) >= 3:
             travelled = sum(math.hypot(b[1] - a[1], b[2] - a[2]) for a, b in zip(history, history[1:]))
             if travelled > 4 and any(math.hypot(end_x - x, end_z - z) < 1.0 for _, x, z in history[:-2]):
-                GRAPH_ROUTE_BLACKLIST[target_node_id or ""] = now + 30
-                GRAPH_ROUTE_HISTORY.pop(history_key, None)
-                timing.annotate(graph_route_pause_reason="backtracking")
-                print(f"graph route to {target_node_id} paused for 30s after repeated backtracking")
+                pause_graph_route(state, target_node_id, navigation, "backtracking")
                 return True
     EXPLORATION_STALL["last_position"] = (end_x, end_z)
     if light_lost:
@@ -770,9 +786,7 @@ def explore_leg(
         )
         if EXPLORATION_STALL["count"] >= 2 and current_key == frontier_key:
             if navigation_mode == "graph":
-                GRAPH_ROUTE_BLACKLIST[target_node_id or ""] = time.monotonic() + 30.0
-                timing.annotate(graph_route_pause_reason="stalled")
-                print(f"graph route to {target_node_id} paused for 30s after two stalled legs")
+                pause_graph_route(state, target_node_id, navigation, "stalled")
                 EXPLORATION_STALL.update(target=None, count=0, last_position=None)
                 return True
             reject_key = "reject_search" if navigation_mode == "search" else "reject_frontier"
@@ -803,36 +817,28 @@ def explore_leg(
 @timing.timed("explore.event_driven")
 def follow_exploration(log_path: Path, action: dict, full_leg_seconds: float = 1.0,
                        max_distance: Optional[float] = None, max_seconds: Optional[float] = None,
-                       max_legs: Optional[int] = None, baseline: Optional[dict] = None) -> bool:
+                       max_legs: Optional[int] = None, baseline: Optional[dict] = None,
+                       on_event=None) -> bool:
     """Continue the chosen intent until an event; optional caps are for tests."""
     initial, _ = latest_state(log_path)
     mode, destination = action.get("navigation_mode", "region"), action.get("target_node_id")
-    player_id = initial.get("player", {}).get("guid")
-    observed_at = float(initial.get("observed_at") or 0)
-    memory = EXPLORATION_SEEN_RESOURCES.get(player_id)
-    if memory is None or observed_at < memory["observed_at"]:
-        if len(EXPLORATION_SEEN_RESOURCES) >= 4:
-            EXPLORATION_SEEN_RESOURCES.pop(next(iter(EXPLORATION_SEEN_RESOURCES)))
-        memory = {"observed_at": observed_at, "seen": set(), "depleted": {}}
-        EXPLORATION_SEEN_RESOURCES[player_id] = memory
-    if len(memory["seen"]) > 8192:
-        memory["seen"].clear()
-        memory.setdefault("depleted", {}).clear()
+    detector = ExplorationEvents(baseline or initial, exploration_resource_available, destination)
+    # Start at actual execution, not the older model snapshot or previous action.
+    origin = initial.get("player", {}).get("position", {})
 
-    def available(state, entity):
-        return (entity.get("prefab") in EXPLORATION_RESOURCE_PREFABS
-                and collect_target_available(entity) and collect_target_reachable(state, entity))
+    def displacement(state):
+        position = state.get("player", {}).get("position", {})
+        return math.hypot(float(position.get("x", 0)) - float(origin.get("x", 0)),
+                          float(position.get("z", 0)) - float(origin.get("z", 0)))
 
-    detector = ExplorationEvents(baseline or initial, available, memory["seen"], destination,
-                                 depleted=memory.setdefault("depleted", {}))
     started, travelled, legs = time.monotonic(), 0.0, 0
     event, current = None, initial
     parent_observer = _action_observer.get()
 
     def detect(state):
-        memory["observed_at"] = float(state.get("observed_at") or memory["observed_at"])
         return detector.check(state, night_unsafe=night_travel_without_torch(state),
-                              food_available=safe_food_count(state) > 0)
+                              food_available=safe_food_count(state) > 0,
+                              distance=displacement(state))
 
     def checkpoint(observed, reason):
         nonlocal event
@@ -862,7 +868,8 @@ def follow_exploration(log_path: Path, action: dict, full_leg_seconds: float = 1
             break
         nav = exploration_section(current, mode, destination)
         target, leg = nav.get("target") or {}, nav.get("leg") or {}
-        if mode == "graph" and not graph_route_available(destination or ""):
+        if mode == "graph" and not graph_route_available(destination or "",
+                nav.get("gateway_id"), current.get("player", {}).get("guid")):
             event = {"reason": "route_paused", "destination": destination,
                      "gateway_id": nav.get("gateway_id")}
             break
@@ -876,6 +883,24 @@ def follow_exploration(log_path: Path, action: dict, full_leg_seconds: float = 1
         if exploration_hazard_on_leg(current, float(leg["x"]), float(leg["z"])):
             event = {"reason": "unsafe_path"}
             break
+        if mode == "graph" and leg.get("awaiting_region"):
+            old_region = (current.get("navigation", {}).get("graph") or {}).get("current_node")
+            def confirmed(fresh):
+                nonlocal event
+                event = event or detect(fresh)
+                graph = fresh.get("navigation", {}).get("graph") or {}
+                route = exploration_section(fresh, mode, destination)
+                return bool(event or graph.get("current_node") != old_region
+                            or not (route.get("leg") or {}).get("awaiting_region"))
+            _, offset = latest_state(log_path)
+            try:
+                with timing.span("explore.region_confirmation"):
+                    current, _ = wait_for_state_condition(log_path, offset, confirmed, timeout=2)
+            except RuntimeError:
+                pause_graph_route(current, destination, nav, "region_confirmation_timeout")
+                event = {"reason": "region_confirmation_timeout", "gateway_id": nav.get("gateway_id")}
+                break
+            continue
         if max_distance is not None and travelled + float(leg["distance"]) > max_distance:
             event = {"reason": "distance_budget"}
             break
@@ -896,11 +921,16 @@ def follow_exploration(log_path: Path, action: dict, full_leg_seconds: float = 1
         legs += 1
     event = event or detect(current) or {"reason": "leg_budget"}
     timing.annotate(exploration_event=event, exploration_legs=legs,
-                    exploration_distance=round(travelled, 2))
+                    exploration_distance=round(travelled, 2),
+                    exploration_displacement=round(displacement(current), 2),
+                    exploration_min_resource_distance=MIN_RESOURCE_EVENT_DISTANCE)
     detail = " ".join(f"{k}={v}" for k, v in event.items())
-    print(f"exploration_yield {detail} legs={legs} distance={travelled:.2f}")
+    print(f"exploration_yield {detail} legs={legs} distance={travelled:.2f} "
+          f"displacement={displacement(current):.2f}")
     if parent_observer is not None:
         parent_observer(current, "exploration_event")
+    if on_event is not None:
+        on_event(event, current)
     return legs > 0 or travelled > 0.05
 
 
@@ -1058,7 +1088,7 @@ def craft_torch(log_path: Path) -> None:
         and item_count(verified, "torch", equipped_only=True) > 0
     ):
         # DST may auto-equip a newly crafted torch. Preserve fuel before night.
-        unequip_torch(log_path, daylight_only=True)
+        unequip_torch(log_path, daylight_only=True, minimum_total=before + 1)
 
 
 @timing.timed("equipment.equip_torch")
@@ -1085,8 +1115,12 @@ def equip_torch(log_path: Path) -> None:
 
 
 @timing.timed("equipment.unequip_torch")
-def unequip_torch(log_path: Path, daylight_only: bool = False) -> None:
+def unequip_torch(log_path: Path, daylight_only: bool = False, minimum_total: int = 1) -> None:
     state, log_position = latest_state(log_path)
+    expected_total = max(minimum_total, item_count(state, "torch"))
+    def completed(fresh):
+        return (item_count(fresh, "torch", equipped_only=True) == 0
+                and item_count(fresh, "torch") >= expected_total)
     if daylight_only and state.get("world", {}).get("phase") == "night":
         print("craft cleanup skipped: night began before torch could be unequipped")
         return
@@ -1094,6 +1128,9 @@ def unequip_torch(log_path: Path, daylight_only: bool = False) -> None:
         raise RuntimeError("Cannot unequip the only light source at night; command not sent")
     if item_count(state, "torch", equipped_only=True) <= 0:
         if daylight_only:
+            if not completed(state):
+                # The hand slot can clear before the backpack replication arrives.
+                wait_for_state_condition(log_path, log_position, completed)
             print("craft cleanup skipped: torch is already unequipped")
             return
         raise RuntimeError("A torch is not equipped in the hand slot; command not sent")
@@ -1103,10 +1140,7 @@ def unequip_torch(log_path: Path, daylight_only: bool = False) -> None:
     verified, _ = wait_for_state_condition(
         log_path,
         log_position,
-        lambda fresh: (
-            item_count(fresh, "torch", equipped_only=True) == 0
-            and item_count(fresh, "torch") > 0
-        ),
+        completed,
     )
     print(f"unequip verified: {item_count(verified, 'torch')} torch in inventory")
 

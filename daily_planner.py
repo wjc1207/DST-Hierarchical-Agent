@@ -13,6 +13,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
+from model_state import model_game_state
 from task_board import (validate_board, board_view, format_board,
                         INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
 
@@ -25,6 +26,8 @@ MAX_KNOWLEDGE_CHARS = 12000
 PLAN_MAX_TOKENS = 4096
 BOARD_LOG_DIR = Path(__file__).resolve().parent / "logs"
 COMPLETION_REPLAN_INTERVAL = 15.0
+PLAN_HISTORY_TURNS = 3
+PLAN_HISTORY_CHARS = 48000
 
 
 def planning_slot(state: dict) -> Optional[tuple[int, int]]:
@@ -48,29 +51,8 @@ def load_dst_knowledge(path: Path = KNOWLEDGE_PATH) -> str:
 
 def planning_context(state: dict, history: list[dict]) -> dict:
     """Summarize facts and recent action outcomes, not the repeating telemetry log."""
-    player = state.get("player", {})
-    inventory: dict[str, int] = {}
-    for item in player.get("inventory", {}).get("items", []) + player.get("inventory", {}).get("equipped", []):
-        prefab = str(item.get("prefab", "unknown"))
-        inventory[prefab] = inventory.get(prefab, 0) + int(item.get("count", 1))
-    nearby = sorted(state.get("nearby", []), key=lambda item: float(item.get("distance", 999)))
     return {
-        "world": state.get("world", {}),
-        "vitals": player.get("vitals", {}),
-        "inventory": inventory,
-        "crafting": state.get("crafting", {}),
-        "navigation": state.get("navigation", {}),
-        "nearby": [
-            {
-                "prefab": entity.get("prefab"),
-                "distance": entity.get("distance"),
-                "activeThreat": entity.get("activeThreat", False),
-                "pickable": entity.get("pickable"),
-                "collect_path_status": (entity.get("collect_path") or {}).get("status"),
-                "collect_path_reason": (entity.get("collect_path") or {}).get("reason"),
-            }
-            for entity in nearby[:20]
-        ],
+        **model_game_state(state),
         "science_machine_built_this_run": any(
             event.get("action") == "build_sciencemachine" and event.get("outcome") == "executed"
             for event in history
@@ -113,17 +95,37 @@ def validate_plan(raw: object, day: int) -> dict:
     }
 
 
-def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict) -> dict:
+def recent_exchanges(exchanges) -> list[tuple[str, str]]:
+    """Keep a chronological suffix of complete user/assistant pairs, never fragments."""
+    retained, size = [], 0
+    for user, assistant in reversed(list(exchanges)[-PLAN_HISTORY_TURNS:]):
+        pair_size = len(user) + len(assistant)
+        if size + pair_size > PLAN_HISTORY_CHARS:
+            break
+        retained.append((user, assistant))
+        size += pair_size
+    return list(reversed(retained))
+
+
+def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
+                 conversation: Optional[list[tuple[str, str]]] = None) -> dict:
     system_prompt = (
         "You are the daily planner for a Don't Starve Together agent. The separate JEV model "
         "makes fast next-action decisions; do not select or force its next action. Plan only "
         "a short, feasible goal for the next quarter of this game day using observed facts, "
         "the supplied DSTKnowledge reference, and recent outcomes. "
+        "Earlier user messages are historical state snapshots; earlier assistant messages "
+        "are proposed plans, not evidence of execution or current facts. The FINAL user "
+        "message is the latest observation and overrides conflicting history. Use its "
+        "observed progress and recent outcomes to revise or abandon earlier plans. "
         "Output a small task board, not a paragraph or an action sequence. The controller "
         "automatically advances locally executable tasks by priority and dependencies using "
-        "observed reachable resources and legal actions. It does not automatically explore or "
-        "invent missing-tool subtasks. JEV handles emergencies and decisions when no local "
-        "board task is executable, and may choose off-board opportunities. Use 1-6 tasks with stable "
+        "observed reachable resources and legal actions. The executor also owns exploration "
+        "and known-region travel: it follows visit_region targets, uses known source records "
+        "and BFS hop counts, and investigates unknown branches with resumable depth-first "
+        "traversal. Entered does not mean fully surveyed; source records can be stale. It does "
+        "not yet invent missing-tool subtasks. JEV handles non-navigation local actions, "
+        "opportunities and emergencies, not exploration selection. Use 1-6 tasks with stable "
         "IDs when carrying forward previous_task_board, integer priority 1-5 (1 highest), "
         "optional depends_on IDs and action_hints. No status or fabricated progress: the runtime "
         "calculates those from facts. Targets must be machine-checkable: "
@@ -132,12 +134,22 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "{prefab:campfire|firepit|sciencemachine}. Inventory means desired CURRENT stock, "
         "not lifetime collection. Use canonical inventory prefab IDs from "
         "supported_capabilities.inventory_target_prefabs, not English display names or source "
-        "entities: logs must be log, and grass material must be cutgrass. Existing torches do "
-        "not prevent crafting another when the recipe is available. Dependencies must be "
+        "entities: logs must be log, and grass material must be cutgrass. Read individual "
+        "inventory_details durability_percent (0..1; torch fuel remaining) and equipped slots, "
+        "lighting.observed_fires (lit, distance), and world phase before judging light reserves. "
+        "Missing fuel values or fire lifetime are unknown, not full or zero. Craftability is "
+        "not demand: another torch is possible, but increase its target only for an observed "
+        "or anticipated lighting shortfall, such as low remaining fuel or necessary night travel. "
+        "Account for stationary light only while staying near a lit fire; it does not prove "
+        "coverage for the whole night. Explain any increased reserve using those facts, not "
+        "merely 'more is safer'. Dependencies must be "
         "acyclic and reference this board only. "
         "If replan_reason is all_tasks_completed, use the completed board as history and "
         "choose new unmet goals from the CURRENT input; do not repeat already satisfied "
         "inventory or exploration targets merely because they appeared on the old board. "
+        "Completion or a new planning window is not itself a reason to raise stock targets. "
+        "Keep sufficient reserves sufficient unless consumption, conditions, or intended use "
+        "changes; redirect effort to other unmet needs rather than ratcheting stock upward. "
         "Use only supported capabilities in the context; unavailable research and structures "
         "are longer-term context, not executable tasks. The longer-term milestone is an alchemy "
         "engine, but this controller currently supports only a science machine as a research "
@@ -155,6 +167,9 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
+            *[message for user, assistant in recent_exchanges(conversation or [])
+              for message in ({"role": "user", "content": user},
+                              {"role": "assistant", "content": assistant})],
             {"role": "user", "content": json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
         ],
         "response_format": {"type": "json_object"},
@@ -209,11 +224,12 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
     raise RuntimeError("DeepSeek planning retry exhausted")
 
 
-def timed_request_plan(api_url: str, api_key: str, model: str, day: int, context: dict) -> tuple:
+def timed_request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
+                       conversation: Optional[list[tuple[str, str]]] = None) -> tuple:
     """Measure the worker's request, excluding the JEV cycle's polling delay."""
     started_at = time.monotonic()
     try:
-        plan = request_plan(api_url, api_key, model, day, context)
+        plan = request_plan(api_url, api_key, model, day, context, conversation)
     except Exception as exc:
         return None, time.monotonic() - started_at, exc
     return plan, time.monotonic() - started_at, None
@@ -230,6 +246,9 @@ class DailyPlanner:
         self.model = model
         self.knowledge_path = knowledge_path
         self.history: deque[dict] = deque(maxlen=80)
+        # Immutable JSON snapshots, accepted replies only; scoped to this run.
+        self.conversation: deque[tuple[str, str]] = deque(maxlen=PLAN_HISTORY_TURNS)
+        self.pending_user_message: Optional[str] = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dst-planner")
         self.future: Optional[Future] = None
         self.pending_slot: Optional[tuple[int, int]] = None
@@ -300,8 +319,10 @@ class DailyPlanner:
         if self.future is not None and self.future.done():
             future = self.future
             completed_slot = self.pending_slot
+            completed_user_message = self.pending_user_message
             self.future = None
             self.pending_slot = None
+            self.pending_user_message = None
             try:
                 result, response_seconds, error = future.result()
             except Exception as exc:
@@ -311,6 +332,12 @@ class DailyPlanner:
                 if error is not None:
                     print(f"daily_plan_error response_time={response_seconds:.2f}s error={error}")
                 elif completed_slot == slot and self.requested_slot == slot and result["day"] == day:
+                    if completed_user_message is not None:
+                        # Save before runtime quarter/board IDs and progress are added.
+                        reply = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+                        self.conversation = deque(recent_exchanges([
+                            *self.conversation, (completed_user_message, reply),
+                        ]), maxlen=PLAN_HISTORY_TURNS)
                     result["quarter"] = quarter + 1
                     if result.get("kind") == "task_board":
                         self.board_revision += 1
@@ -365,8 +392,12 @@ class DailyPlanner:
             except (OSError, UnicodeError) as exc:
                 context["dst_knowledge"] = ""
                 print(f"daily_plan_knowledge_unavailable={exc}")
+            # Snapshot the actual request, not a later observation or mutated board.
+            context = json.loads(json.dumps(context, ensure_ascii=False))
+            self.pending_user_message = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             self.future = self.executor.submit(
-                timed_request_plan, self.api_url, self.api_key, self.model, day, context
+                timed_request_plan, self.api_url, self.api_key, self.model, day, context,
+                list(self.conversation),
             )
             self.pending_slot = slot
             if completing:
@@ -374,7 +405,8 @@ class DailyPlanner:
             self.completion_replan_slot = None
             print(
                 f"daily_plan_requested day={day} quarter={quarter + 1}/4 "
-                f"knowledge_chars={len(context['dst_knowledge'])} reason={reason}"
+                f"knowledge_chars={len(context['dst_knowledge'])} "
+                f"history_turns={len(self.conversation)} reason={reason}"
             )
         view = self._board(state) if self.plan and self.plan["day"] == day else None
         self._publish_board(view)

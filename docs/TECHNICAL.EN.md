@@ -1,8 +1,144 @@
-# JEV DST Agent technical reference (1.7.0)
+# JEV DST Agent technical reference (1.7.1)
 
 [Project README](../README.EN.md) · [中文技术说明](TECHNICAL.md)
 
 Run all commands below from the project root (`jev_dst_agent`).
+
+### Executor-owned exploration
+
+`exploration_executor.py` holds navigation intent, a region branch stack and
+temporary failure records. Synchronous and prefetched JEV requests exclude
+`explore_current_region`, `explore_other_region` and `travel_region_*`.
+`build_candidates()` remains the internal full legal-action builder;
+`build_jev_candidates()` keeps local actions only. The API boundary also filters
+legacy exploration keys and rejects replies outside the supplied local choices.
+
+Locally executable board tasks retain priority. Navigation follows explicit
+`visit_region` requests, then known inventory-source records using Mod-provided
+BFS hop counts and first-exit distance. The source table distinguishes gold-bearing
+`rock2` from ordinary `rock1`. With no known source, depth-first branch order visits
+unentered neighbors, investigates unknown exits/local frontiers and backtracks or
+returns to unfinished entered rooms. Historical `entered` does not establish a
+requested current visit or complete surveying. Temporary blockage never marks a
+boundary complete. These policies use reported safe routes; they are not a complete
+acquisition, exact source-location or tool-prerequisite solver.
+
+The existing event-driven movement, hazard checks and input-time validation remain.
+No local arbitration needed means direct execution without a per-leg model call.
+Resource-type changes and safety events hand control to JEV for local actions.
+JEV `wait` now releases local arbitration: safe exploration may resume rather than
+standing still. No valid route means idle; an only-wait decision needs no API call.
+Collection/crafting still use existing board automation or JEV choices. Navigation
+intent survives those actions. New resources/threats in a pre-movement observation
+override continuation and are handed to local decision-making from that fresh state.
+
+Logs add `decision_source=exploration_auto`, `exploration_owner=executor`,
+`exploration_strategy`, `exploration_goal` and `exploration.auto_execute`;
+no-route idle uses `executor_idle`. Existing event/timing records remain.
+The old 0.15-second mid-move telemetry check is unchanged in this migration.
+
+Sync new `exploration_executor.py`, plus `controller.py`, `jev_agent.py`,
+`daily_planner.py`, `exploration_events.py` and `DSTKnowledge.txt`; retain
+`model_state.py` from the previous update. Restart the controller; no Mod update
+is needed. JEV is not removed and a full tool/source acquisition chain is not added.
+
+### Shared game facts for both models
+
+`model_state.py:model_game_state()` is the single game-fact projection for
+DeepSeek and JEV. Given the same telemetry snapshot, both receive identical
+world/phase, character position/vitals, inventory counts and individual fuel/tool
+durability, equipped slots, fire status/distance, recipe availability, navigation,
+work and execution fields. Existing JEV food, cooking/light, weapon and resource-set
+convenience signals are now also sent to DeepSeek. Both retain all entities
+reported by the Mod, including GUIDs, threats, work costs, stack counts and
+collection paths. The separate DeepSeek nearest-20 cut is removed; the Mod's
+scan range is unchanged.
+
+Role-specific inputs remain separate: planning knowledge, recent outcomes,
+conversation and replan reasons for DeepSeek; candidates, decision guidance and
+the current board for JEV. Asynchronous requests need not use the same instant's
+snapshot. `observed_at`, `state_basis` and `execution_context` identify time and
+observed/predicted provenance. Pipeline prefetch can still ask JEV about a predicted
+successful outcome without presenting it as observed or replacing live facts with
+an old planning snapshot. Each projection is independently copied.
+
+Sync the new `model_state.py`, `daily_planner.py` and `jev_agent.py`, then restart
+the controller; no Mod update is required. Action filters, planning triggers,
+navigation and execution policies are unchanged.
+
+### DeepSeek multi-turn planning context
+
+The first request is `system → user (current state)`. Later requests replay
+`user (historical state) → assistant (accepted plan)` pairs between the system
+message and the final user message containing the latest observation. History
+keeps at most three complete pairs and 48,000 characters, evicting oldest pairs
+without splitting JSON or trimming the latest state. Immutable request and
+validated, adopted reply snapshots are saved before runtime quarter/board IDs
+are injected; subsequent state/progress mutations cannot rewrite history.
+Failed, incomplete retry responses and stale-quarter results are excluded.
+
+Historical assistant messages are proposals, not evidence of execution. The
+system prompt prioritizes final-user observations, action outcomes and observed
+`previous_task_board` progress over old plans. History is memory-only for this
+controller run; restarting begins a fresh conversation. No extra API calls or
+full-conversation logs are added. `daily_plan_requested` reports `history_turns`.
+Sync `daily_planner.py` and restart the controller; no Mod update is required.
+
+### Planning knowledge and lighting observations
+
+Both models retain the `inventory` count summary and receive individual
+`inventory_details.items/equipped` records with prefab, count, GUID, slot and
+available durability/fuel fractions and maximum tool uses. Torch
+`durability_percent` is remaining fuel in 0–1; missing values stay unknown.
+`lighting.torch_equipped` identifies portable light in hand, while
+`lighting.observed_fires` preserves the distance and fire/cooker tag status of
+all reported campfires/firepits; neither nearby list has an extra nearest-20 cut.
+A current fire tag does not establish remaining burn time or all-night safety.
+Nearby records also retain tags and potential-threat observations.
+
+`DSTKnowledge.txt` explains demand-based light reserves, the locally verified
+75-second base torch fuel and its limitations, and current topology/event-driven
+exploration instead of obsolete road-following and region action names.
+Planner guidance requires a fuel/use-based justification for larger reserves:
+task completion or a new quarter alone must not ratchet stock targets upward.
+There is no hard torch-count cap or change to executor/JEV decisions. Actual
+phase durations, weather/skill drain modifiers and fire fuel are not observed;
+the context does not invent exact remaining coverage.
+
+Sync `daily_planner.py` and `DSTKnowledge.txt`, then restart the controller.
+The next planning request uses the changes; no Mod update is required.
+
+### 1.7.1 gateway crossing and torch completion
+
+Ordinary exploration keeps its 1.5-unit arrival tolerance. Gateway crossings
+instead follow a fixed destination-side continuation extended by at most two
+units, with a 0.2-unit leg tolerance. All movement is checked for passability
+and hazards; an unsafe extension falls back only to the original endpoint.
+The direct gateway stays available until topology changes. Arrival or slight
+overshoot marks `leg.awaiting_region` instead of steering backwards or moving
+the target indefinitely. Python waits at most two seconds for fresh confirmation,
+still yielding on safety/survival/navigation events, then stops and pauses an
+unconfirmed gateway.
+
+Backtracking, repeated stalls and confirmation timeout pause both the final
+destination and the current player's directed `gateway_id` for 30 seconds.
+Other destinations sharing that first gateway are also filtered, with an input-time
+recheck. History is shared by player/source-room/gateway, so changing the final
+goal does not reset the same entrance's failure history. This isolates failed
+routes; it does not choose another room or prohibit JEV from returning normally.
+Logs include `blocked_gateway_id` and `explore.region_confirmation`.
+
+Torch unequip verification now requires an empty torch hand slot AND restoration
+of at least the pre-unequip total count. Craft cleanup explicitly requires the
+pre-craft total plus one. An older backpack torch cannot mask a newly crafted
+torch in transit. If the hand already cleared but replication is pending, cleanup
+waits without sending another unequip key. A `2→1→2` transition no longer creates
+a false no-progress board handoff and duplicate craft. Existing verification
+timeouts and night-light safeguards remain. JEV selection/wait policy is unchanged.
+
+Sync `controller.py` and `jev_agent.py`, then restart Python; update/reload
+`modmain.lua`, `modinfo.lua` and `scripts/jev_exploration.lua` (Mod 1.7.1). Schema
+stays at 10 with optional leg fields. An older Mod lacks the gateway fix.
 
 ### 1.7.0 automatic local board execution
 
@@ -170,9 +306,11 @@ falls back to existing verified-completion prefetch.
 A predicted result cannot be consumed before the running action succeeds and
 actual inventory quantities/equipment placement match. Stack merges are harmless;
 unexpected character-specific yields, recipe costs, or auto-equipping invalidate
-the prediction. New meaningful resources or observed regrowth, region discoveries,
+the prediction. Changes to collectible/reachable resource type sets, region discoveries,
 damage, threats, phase changes, and crossing the critical-hunger boundary also
-invalidate it; simple re-entry of a previously known resource does not.
+invalidate it; extra instances, quantity changes or replacement GUIDs of an
+already available type do not. Concrete collection targets still require exact
+GUID matching and cannot silently switch to another instance.
 Logs expose `jev_buffer_predicted`, `jev_buffer_confirmed`, discard reasons,
 `buffer_stage`, and `buffer_validation`, alongside existing overlap timing.
 Update `action_buffer.py`, `decision_prefetch.py`, `controller.py`, `jev_agent.py`
@@ -624,27 +762,33 @@ safe food carried, region discovery/entry,
 destination arrival, path failure, stalls and backtracking. Stopping never
 automatically selects collecting, fighting or fleeing instead of JEV.
 
-New resource events require a supported, currently collectible resource with
-a verified reachable route. Player/resource GUID memory suppresses repeated
-events from known berries or items leaving and re-entering view. Depleted plants
-and unreachable items do not interrupt. Memory keeps up to four players and
-approximately 8192 resources per player before rebuilding; process restarts or
-regressing game time reset it. Discovery during a model request is compared
-against what the model actually observed, not silently treated as declined.
+Ordinary resource events compare the SET of supported, currently collectible
+and reachable product types with the model's decision snapshot. Saplings/loose
+twigs share `twigs`, ordinary berry bushes/loose berries share `berries`, and
+planted/loose carrots share `carrot`. More instances, changed quantities or new
+GUIDs of an already available type do not change the set. Depleted, unknown or
+unreachable entities are excluded. JEV input includes sorted
+`exploration_resource_types`; global seen-GUID and regrowth caches are removed.
 
-Known plants explicitly observed with `pickable=false` later trigger one
-`resource_available_again` event when collectible and reachable again. Normal
-state reads record depletion during collecting/crafting as well as exploration.
-Absence, unknown pickability and route failures do not imply depletion. Regrowth
-waits for a usable route; regrowth already included in JEV's decision snapshot
-is acknowledged rather than repeatedly interrupting. Depletion timestamps keep
-stale decisions from consuming newer events. A wholly offscreen harvest/regrowth
-cycle cannot be inferred without an observed depleted state.
+A resource handoff requires BOTH a currently changed set (added or removed
+types) AND at least four units of net XZ displacement from actual execution
+start. Four units alone do not end exploration. An earlier type change is
+deferred and must still be present at the distance floor; transient changes are
+not latched. Movement from the previous action and outward-and-back loops do
+not satisfy this floor. Leaving/re-entering view or depletion/regrowth matter
+only when they change the available type set, not the resource's history.
+Safety/survival events, region discovery/change/arrival, path failures and stalls
+can still yield earlier rather than moving just to satisfy the distance floor.
 
-`exploration_yield reason=... prefab=... guid=... legs=... distance=...` reports
-why control returned. Timing includes `exploration_event`, leg count and distance.
-`exploration_events.py` contains detection policy. This event-driven update only
-requires the Python files; the schema 10 Mod remains compatible.
+`exploration_yield reason=resource_types_changed before_types=... resource_types=...
+added_types=... removed_types=...` reports the set difference. Console/timing
+distinguish accumulated `distance`/`exploration_distance` from net
+`displacement`/`exploration_displacement`, and record
+`exploration_min_resource_distance=4.0`. There is no per-leg model prefetch.
+Prefetch compatibility uses the same type sets; concrete target validation is
+unchanged. Sync `exploration_events.py`, `controller.py`, `decision_prefetch.py`
+and `jev_agent.py`, then restart Python. No Mod update is needed; schema 10 stays
+compatible.
 
 Local current-region frontiers are passable cells of the current topology room
 adjacent to unknown cells. Their baseline score is:

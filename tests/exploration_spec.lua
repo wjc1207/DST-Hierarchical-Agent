@@ -605,4 +605,63 @@ test("F4 cancels queued work and stops controls before handing back to JEV", fun
     G.ThePlayer=nil; handlers.KEY_F4()
 end)
 
+test("gateway continuation is fixed and never steers back after overshoot", function()
+    local target=E.gateway_destination(16,0,20,0,2)
+    assert(target.x==22 and target.z==0)
+    assert(not E.gateway_reached(21,0,16,0,22,0,0.2))
+    assert(E.gateway_reached(22,0,16,0,22,0,0.2))
+    assert(E.gateway_reached(22.7,0,16,0,22,0,0.2))
+    assert(not E.gateway_reached(22.7,4,16,0,22,0,0.2),"parallel paths are not arrivals")
+end)
+
+test("real border replay retains its direct gateway inside old 1.5-unit arrival radius", function()
+    local sample,world=simulated_mod(function() return true end,
+        function(x,z) if z<100 then return "C" end; return x>=24 and "B" or "A" end,
+        function() return 2 end)
+    sample(20,104.69)
+    local m=world._jev_dst_navigation; node(m,"B"); node(m,"C")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=20,az=108,bx=24,bz=104}},
+        AC={{a_id="A",b_id="C",ax=12,az=100,bx=12,bz=96}},
+        CB={{a_id="C",b_id="B",ax=20,az=96,bx=24,bz=96}}}
+    m.gateway_targets.A={B="A>B:20:108:24:104"}
+    for _,x in ipairs({22.08,22.77,23.07}) do
+        local result=sample(x,104.69)
+        local found
+        for _,r in ipairs(result.navigation.graph.routes) do if r.node_id=="B" then found=r end end
+        assert(found and found.gateway_id=="A>B:20:108:24:104","direct gateway disappeared near arrival")
+        assert(found.hops==1 and found.leg.x>x,"routing must keep crossing, not select a westward detour")
+        assert(found.leg.arrival_distance==0.2)
+    end
+    sample(24.2,103.5)
+    assert(sample(24.2,103.5).navigation.graph.current_node=="B")
+end)
+
+test("gateway stays present while awaiting topology confirmation at fixed continuation", function()
+    local sample,world=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end)
+    sample(0,0)
+    local m=world._jev_dst_navigation; node(m,"B")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=16,az=0,bx=20,bz=0}}}
+    sample(18.2,0)
+    for _,x in ipairs({22,22.7}) do
+        local result=sample(x,0)
+        local route=result.navigation.graph.routes[1]
+        assert(result.navigation.graph.current_node=="A")
+        assert(route and route.node_id=="B" and route.leg.awaiting_region)
+        assert(route.leg.distance==0 and route.leg.x==x,"do not move backwards or extend indefinitely")
+    end
+end)
+
+test("unsafe gateway overshoot falls back to the passable endpoint without crossing sea", function()
+    local sample,world=simulated_mod(function(x) return x<=20.1 end,
+        function(x) return x<20 and "A" or "B" end,function() return 2 end)
+    sample(0,0)
+    local m=world._jev_dst_navigation; node(m,"B")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=16,az=0,bx=20,bz=0}}}
+    local result=sample(18.2,0)
+    local route=result.navigation.graph.routes[1]
+    assert(route and route.leg.x<=20.1 and route.leg.x==20)
+    assert(route.leg.arrival_distance==0.2)
+end)
+
 print("PASS: " .. passed .. " Lua exploration checks")

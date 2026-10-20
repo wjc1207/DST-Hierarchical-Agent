@@ -68,7 +68,7 @@ class BoardTests(unittest.TestCase):
         actual = self.completed_state()
         self.assertIsNone(planner.update(actual))
         self.assertEqual(len(planner.executor.calls), 1)
-        context = planner.executor.calls[0][1][-1]
+        context = planner.executor.calls[0][1][4]
         self.assertEqual(context["replan_reason"], "all_tasks_completed")
         self.assertEqual(context["previous_task_board"]["status"], "completed")
         self.assertTrue(all(t["status"] == "done" for t in context["previous_task_board"]["tasks"]))
@@ -265,13 +265,13 @@ class BoardTests(unittest.TestCase):
             planner.update(current)
             current["world"]["time"] = 0.26
             self.assertIsNone(planner.update(current))
-            context = planner.executor.calls[-1][1][-1]
+            context = planner.executor.calls[-1][1][4]
             self.assertEqual(context["previous_task_board"]["status"], "expired")
             self.assertEqual(context["previous_task_board"]["tasks"][0]["progress"]["current"], 4)
             next_board = planner.update(current)
             self.assertNotEqual(next_board["board_id"], board["board_id"])
 
-    def test_jev_receives_board_without_changing_available_actions(self):
+    def test_jev_receives_board_but_exploration_stays_with_executor(self):
         class Response:
             def __enter__(self): return self
             def __exit__(self, *_args): return False
@@ -284,7 +284,7 @@ class BoardTests(unittest.TestCase):
         supplied = json.loads(body["state"])
         self.assertIn("task_board", supplied)
         self.assertNotIn("daily_plan", supplied)
-        self.assertEqual(body["questions"]["next_action"]["criteria"], criteria)
+        self.assertEqual(body["questions"]["next_action"]["criteria"], {"wait": "Wait"})
 
     def test_deepseek_is_prompted_for_structured_tasks(self):
         class Response:
@@ -321,7 +321,7 @@ class BoardTests(unittest.TestCase):
     def test_planner_receives_canonical_inventory_names_and_aliases(self):
         planner = self.pending_planner(seeded=False)
         planner.update(state([]))
-        capabilities = planner.executor.calls[0][1][-1]["supported_capabilities"]
+        capabilities = planner.executor.calls[0][1][4]["supported_capabilities"]
         self.assertEqual(capabilities["inventory_target_prefabs"], sorted(INVENTORY_TARGET_PREFABS))
         self.assertEqual(capabilities["inventory_prefab_aliases"], INVENTORY_PREFAB_ALIASES)
         self.assertIn("log", capabilities["inventory_target_prefabs"])

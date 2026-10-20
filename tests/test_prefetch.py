@@ -143,8 +143,6 @@ class PrefetchTests(unittest.TestCase):
         before = state([])
         berry = {**grass(11, 0.5, True), "prefab": "berrybush"}
         after = state([berry])
-        explore = {"response": {"model": "test"},
-                   "answer": {"choice": "explore_current_region", "confidence": 1}}
         collect = {"response": {"model": "test"},
                    "answer": {"choice": "collect_berries", "confidence": 1}}
         # Use live candidate naming rather than a fixture-specific alias.
@@ -157,22 +155,21 @@ class PrefetchTests(unittest.TestCase):
 
         def execute(action, *_args):
             if action["kind"] == "explore":
-                callback = controller._action_observer.get()
-                callback(before, "movement")
-                callback(before, "verified")
+                self.assertIsNone(controller._action_observer.get())
                 current[0] = after
-                callback(after, "exploration_event")
+                action["_on_exploration_event"]({"reason": "resource_types_changed"}, after)
             return True
 
         with (
             patch.object(controller, "latest_state", side_effect=lambda *_: (current[0], 100)),
-            patch.object(jev_agent, "call_jev", side_effect=[explore, collect]) as request,
+            patch.object(jev_agent, "call_jev", return_value=collect) as request,
             patch.object(jev_agent, "execute_action", side_effect=execute) as execute_mock,
+            patch.object(controller, "release_movement_keys"),
         ):
             self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test", prefetch=worker))
             self.assertEqual(len(worker.executor.calls), 0)
             self.assertFalse(jev_agent.run_decision_cycle(args, "url", "key", "test", prefetch=worker))
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, 1)
         self.assertIs(request.call_args.args[3], after)
         self.assertEqual(execute_mock.call_args.args[0]["kind"], "collect")
         self.assertEqual(execute_mock.call_args.args[0]["guid"], 11)
@@ -219,13 +216,13 @@ class PrefetchTests(unittest.TestCase):
 
     def test_phase_change_after_prefetch_reply_prevents_execution(self):
         worker = self.make_prefetch()
-        before = state([])
+        before = state([grass(10, 0.5, True)])
         after = copy.deepcopy(before)
         after["world"]["phase"] = "dusk"
         criteria, dispatch = jev_agent.build_candidates(before)
         worker.submit(before, criteria, dispatch, None)
         result = {"response": {"model": "test"},
-                  "answer": {"choice": "explore_current_region", "confidence": 1}}
+                  "answer": {"choice": "collect_grass", "confidence": 1}}
         worker.future.set_result((result, 0.5))
         args = SimpleNamespace(log=Path("unused.log"), execute=True, show_probabilities=False,
                                min_confidence=None, move_seconds=1.0)
@@ -273,6 +270,7 @@ class PrefetchTests(unittest.TestCase):
                     patch.object(jev_agent, "build_candidates", return_value=({choice: "Action"}, {choice: action})),
                     patch.object(jev_agent, "call_jev", return_value=result),
                     patch.object(jev_agent, "execute_action", return_value=True) as execute,
+                    patch.object(controller, "release_movement_keys"),
                 ):
                     jev_agent.run_decision_cycle(args, "url", "key", "test")
                 self.assertEqual(execute.called, should_execute)
@@ -308,7 +306,7 @@ class PrefetchTests(unittest.TestCase):
         before["navigation"]["graph"] = {"current_node": "test-start", "adjacent": [route]}
         after = copy.deepcopy(before)
         after["player"]["position"]["x"] = 0
-        key = ("test-start", "test-destination")
+        key = controller.graph_history_key(before, "test-destination", route)
         controller.GRAPH_ROUTE_HISTORY[key] = [(time.monotonic(), 0, 0), (time.monotonic(), 5, 0)]
         try:
             with (

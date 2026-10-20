@@ -240,9 +240,10 @@ class CandidateTests(unittest.TestCase):
         request = send.call_args.args[0]
         body = json.loads(request.data)
         forwarded = json.loads(body["state"])
-        self.assertEqual(set(body["questions"]["next_action"]["criteria"]), set(criteria))
+        self.assertEqual(set(body["questions"]["next_action"]["criteria"]),
+                         {key for key in criteria if not key.startswith(("explore_", "travel_region_"))})
         self.assertIn("semantic action", body["questions"]["next_action"]["instructions"])
-        self.assertIn("until a meaningful event", body["questions"]["next_action"]["instructions"])
+        self.assertIn("executor owns exploration", body["questions"]["next_action"]["instructions"])
         self.assertIn("decision_guidance", forwarded)
         self.assertNotIn("first_day_survival_knowledge", forwarded)
 
@@ -554,7 +555,7 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(predicate(before))
         self.assertTrue(predicate(after))
         tap.assert_called_once_with([controller.VK["craft_torch"]], 0.08)
-        unequip.assert_called_once_with(Path("unused.log"), daylight_only=True)
+        unequip.assert_called_once_with(Path("unused.log"), daylight_only=True, minimum_total=2)
 
     def test_craft_torch_unequips_auto_equipped_torch_before_night(self) -> None:
         for phase in ("day", "dusk"):
@@ -578,7 +579,7 @@ class ControllerTests(unittest.TestCase):
                     controller.craft_torch(Path("unused.log"))
 
                 self.assertTrue(verify.call_args.args[2](crafted))
-                unequip.assert_called_once_with(Path("unused.log"), daylight_only=True)
+                unequip.assert_called_once_with(Path("unused.log"), daylight_only=True, minimum_total=1)
 
     def test_craft_torch_keeps_torch_when_night_or_not_auto_equipped(self) -> None:
         for phase, equipped in (("night", True), ("day", False)):

@@ -61,15 +61,14 @@ class BufferTests(unittest.TestCase):
                          before["player"]["inventory"]["equipped"])
         self.assertEqual(predicted["player"]["inventory"]["items"][0]["prefab"], "axe")
 
-    def test_known_resource_reentry_does_not_invalidate_but_regrowth_does(self):
-        before = state([])
-        before["player"]["guid"] = 999
+    def test_type_set_not_resource_guid_controls_buffer_compatibility(self):
+        before = state([self.berry()])
         actual = copy.deepcopy(before)
-        actual["nearby"] = [self.berry()]
-        with patch.dict(controller.EXPLORATION_SEEN_RESOURCES, {999: {"seen": {(22, "berrybush")}}}):
-            self.assertTrue(prefetch.compatible(before, actual))
-            before["nearby"] = [{**self.berry(), "pickable": False}]
-            self.assertFalse(prefetch.compatible(before, actual))
+        actual["nearby"] = [{**self.berry(), "guid": 999}, self.berry()]
+        self.assertTrue(prefetch.compatible(before, actual))
+        before["nearby"] = [{**self.berry(), "pickable": False}]
+        self.assertFalse(prefetch.compatible(before, actual))
+        self.assertFalse(prefetch.compatible(actual, before))
 
     def test_unknown_yield_and_unsupported_actions_do_not_predict(self):
         before = state([{"guid": 1, "prefab": "flint", "tags": ["_inventoryitem"]}])

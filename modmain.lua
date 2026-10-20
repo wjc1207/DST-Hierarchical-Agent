@@ -1189,13 +1189,31 @@ local function graph_route_leg(player, map, memory, gateway_id, side_x, side_z,
         px, pz, side_x, side_z, destination_x, destination_z, NAV_ARRIVAL_DISTANCE)
     memory.gateway_crossings[gateway_id] = crossing
     if crossing then
-        local leg, reason = make_navigation_leg(player, map,
-            { x = destination_x, z = destination_z }, NAV_ARRIVAL_DISTANCE)
-        if leg ~= nil and not hazard_segment_unsafe(memory, px, pz, leg.x, leg.z) then
-            exploration.count(memory, "graph_paths", "gateway_ready")
-            return leg
+        local targets = {
+            exploration.gateway_destination(side_x, side_z, destination_x, destination_z, 2),
+            {x=destination_x,z=destination_z},
+        }
+        for _, target in ipairs(targets) do
+            local leg, reason
+            if exploration.gateway_reached(px,pz,side_x,side_z,target.x,target.z,0.2) then
+                reason = "arrived"
+            else
+                leg, reason = make_navigation_leg(player, map, target, 0.2)
+            end
+            if reason == "arrived" and graph_segment_passable(map, px, pz, target.x, target.z)
+                and not hazard_segment_unsafe(memory, px, pz, target.x, target.z) then
+                -- Keep this gateway in the graph during topology debounce.
+                -- Python bounds the confirmation wait and cancels on danger.
+                leg = {x=px,z=pz,distance=0,awaiting_region=true}
+            end
+            if leg ~= nil and not hazard_segment_unsafe(memory, px, pz, leg.x, leg.z) then
+                leg.arrival_distance = 0.2
+                exploration.count(memory, "graph_paths", leg.awaiting_region
+                    and "awaiting_region" or "gateway_ready")
+                return leg
+            end
+            exploration.count(memory, "graph_paths", reason or "unsafe_gateway")
         end
-        exploration.count(memory, "graph_paths", reason or "unsafe_gateway")
         return nil
     end
     local direct = make_navigation_leg(player, map,
@@ -1293,7 +1311,9 @@ read_area_graph = function(player, map, memory)
                         distance = round(distance, 2),
                         target = { x = round(other_x, 2), z = round(other_z, 2) },
                         leg = { x = round(leg.x, 2), z = round(leg.z, 2),
-                            distance = round(leg.distance, 2), detour = leg.detour == true } }
+                            distance = round(leg.distance, 2), detour = leg.detour == true,
+                            arrival_distance = leg.arrival_distance,
+                            awaiting_region = leg.awaiting_region == true } }
                     gateways[other_id] = gateways[other_id] or {}
                     table.insert(gateways[other_id], route)
                 elseif leg ~= nil then

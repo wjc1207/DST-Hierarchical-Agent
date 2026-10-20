@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 import controller
 import jev_agent
-from exploration_events import ExplorationEvents
+from exploration_events import ExplorationEvents, resource_types
 from test_exploration import observed
 from test_regressions import grass, state
 
@@ -26,37 +26,79 @@ def berry(guid=22):
 class EventTests(unittest.TestCase):
     def test_discovering_a_road_no_longer_interrupts_exploration(self):
         initial = observed()
-        detector = ExplorationEvents(initial, available, set())
+        detector = ExplorationEvents(initial, available)
         changed = copy.deepcopy(initial)
         changed["navigation"]["road"] = {"status": "ready"}
         changed["navigation"]["on_road"] = True
         self.assertIsNone(detector.check(changed, night_unsafe=False, food_available=False))
 
-    def test_known_berries_do_not_interrupt_but_new_berries_do(self):
+    def test_more_berries_or_replacement_guids_do_not_change_the_set(self):
         initial = state([berry(1)])
-        seen = set()
-        detector = ExplorationEvents(initial, available, seen)
-        self.assertIsNone(detector.check(initial, night_unsafe=False, food_available=False))
-        changed = state([berry(1), berry(2)])
-        event = detector.check(changed, night_unsafe=False, food_available=False)
-        self.assertEqual((event["reason"], event["guid"]), ("new_resource", 2))
-        self.assertIsNone(detector.check(changed, night_unsafe=False, food_available=False))
+        detector = ExplorationEvents(initial, available)
+        for nearby in ([berry(1)], [berry(1), berry(2)], [berry(3)], [berry(i) for i in range(100)]):
+            self.assertIsNone(detector.check(state(nearby), night_unsafe=False,
+                                             food_available=False, distance=100))
+
+    def test_types_appear_and_disappear_with_deterministic_set_details(self):
+        detector = ExplorationEvents(state([berry(1)]), available)
+        changed = state([berry(2), grass(3, 2, True)])
+        event = detector.check(changed, night_unsafe=False, food_available=False, distance=4)
+        self.assertEqual(event, {"reason": "resource_types_changed", "before_types": ["berries"],
+            "resource_types": ["berries", "cutgrass"], "added_types": ["cutgrass"], "removed_types": []})
+        self.assertIsNone(detector.check(changed, night_unsafe=False, food_available=False, distance=4))
+        removed = detector.check(state([grass(4, 2, True)]), night_unsafe=False,
+                                 food_available=False, distance=5)
+        self.assertEqual(removed["removed_types"], ["berries"])
+        self.assertEqual(removed["added_types"], [])
+
+    def test_sources_and_loose_products_share_a_semantic_type(self):
+        sapling = {**grass(1, 2, True), "prefab": "sapling"}
+        loose = {**grass(2, 2, True), "prefab": "twigs", "tags": ["_inventoryitem"]}
+        carrot = {**grass(3, 2, True), "prefab": "carrot_planted"}
+        self.assertEqual(resource_types(state([sapling, loose, berry(4), carrot]), available),
+                         {"twigs", "berries", "carrot"})
+        detector = ExplorationEvents(state([sapling]), available)
+        self.assertIsNone(detector.check(state([loose]), night_unsafe=False, food_available=False, distance=4))
+        actual = state([sapling, loose, berry(4), carrot])
+        self.assertEqual(jev_agent.compact_game_state(actual)["exploration_resource_types"],
+                         ["berries", "carrot", "twigs"])
+
+    def test_resource_types_do_not_require_identity_or_count_metadata(self):
+        plant = berry()
+        plant.pop("guid")
+        self.assertEqual(resource_types(state([plant, {**plant, "stack_count": 100}]), available), {"berries"})
+
+    def test_resource_change_and_four_unit_floor_are_both_required(self):
+        detector = ExplorationEvents(state([]), available)
+        changed = state([berry()])
+        for distance in (0, 1, 3.99):
+            self.assertIsNone(detector.check(changed, night_unsafe=False,
+                                             food_available=False, distance=distance))
+        event = detector.check(changed, night_unsafe=False, food_available=False, distance=4)
+        self.assertEqual(event["added_types"], ["berries"])
+        self.assertIsNone(detector.check(changed, night_unsafe=False, food_available=False, distance=40))
+
+    def test_short_lived_change_before_floor_is_not_a_stale_pending_event(self):
+        detector = ExplorationEvents(state([]), available)
+        self.assertIsNone(detector.check(state([berry()]), night_unsafe=False,
+                                         food_available=False, distance=2))
+        self.assertIsNone(detector.check(state([]), night_unsafe=False, food_available=False, distance=4))
 
     def test_depleted_and_unreachable_resources_do_not_interrupt(self):
-        detector = ExplorationEvents(state([]), available, set())
+        detector = ExplorationEvents(state([]), available)
         depleted, unreachable = berry(1), berry(2)
         depleted["pickable"] = False
         unreachable["collect_path"] = {"status": "unknown"}
         self.assertIsNone(detector.check(state([depleted, unreachable]),
                                          night_unsafe=False, food_available=False))
         self.assertEqual(detector.check(state([berry(1)]), night_unsafe=False,
-                                        food_available=False)["reason"], "new_resource")
+                                        food_available=False, distance=4)["reason"], "resource_types_changed")
 
     def test_known_hound_starting_to_target_player_is_an_event(self):
         hound = {"guid": 80, "prefab": "hound", "potentialThreat": True,
                  "activeThreat": False, "distance": 10}
         initial = state([hound])
-        detector = ExplorationEvents(initial, available, set())
+        detector = ExplorationEvents(initial, available)
         self.assertIsNone(detector.check(initial, night_unsafe=False, food_available=False))
         changed = copy.deepcopy(initial)
         changed["nearby"][0]["activeThreat"] = True
@@ -64,73 +106,48 @@ class EventTests(unittest.TestCase):
         self.assertEqual(event["reason"], "targeted_by_hostile")
         self.assertEqual(event["guid"], 80)
 
-    def test_known_resource_stays_known_after_leaving_and_reentering_view(self):
-        seen = set()
-        ExplorationEvents(state([berry()]), available, seen)
-        detector = ExplorationEvents(state([]), available, seen)
-        self.assertIsNone(detector.check(state([berry()]), night_unsafe=False, food_available=False))
+    def test_urgent_events_bypass_the_distance_floor(self):
+        initial = state([])
+        for expected, edit, night_unsafe, food in (
+            ("health_lost", lambda s: s["player"]["vitals"].update(health=140), False, False),
+            ("critical_hunger_with_food", lambda s: s["player"]["vitals"].update(hunger=1), False, True),
+            ("night_light_lost", lambda s: None, True, False),
+            ("potential_threat", lambda s: s["nearby"].append({"guid": 30, "prefab": "hound",
+                "potentialThreat": True, "distance": 10}), False, False),
+        ):
+            current = copy.deepcopy(initial)
+            edit(current)
+            with self.subTest(expected=expected):
+                self.assertEqual(ExplorationEvents(initial, available).check(current,
+                    night_unsafe=night_unsafe, food_available=food, distance=0)["reason"], expected)
 
-    def test_known_plants_trigger_once_per_observed_regrowth(self):
+    def test_regrowth_only_matters_when_available_type_set_changes(self):
         for prefab in ("grass", "sapling", "berrybush"):
             with self.subTest(prefab=prefab):
                 plant=berry()
                 plant["prefab"]=prefab
-                detector=ExplorationEvents(state([plant]),available,set())
+                detector=ExplorationEvents(state([plant]),available)
                 for _ in range(2):
                     empty=copy.deepcopy(plant)
                     empty["pickable"]=False
-                    self.assertIsNone(detector.check(state([empty]),night_unsafe=False,food_available=False))
-                    self.assertIsNone(detector.check(state([]),night_unsafe=False,food_available=False))
-                    event=detector.check(state([plant]),night_unsafe=False,food_available=False)
-                    self.assertEqual(event["reason"],"resource_available_again")
-                    self.assertEqual(event["guid"],plant["guid"])
-                    self.assertIsNone(detector.check(state([plant]),night_unsafe=False,food_available=False))
+                    removed=detector.check(state([empty]),night_unsafe=False,food_available=False,distance=4)
+                    self.assertEqual(removed["resource_types"],[])
+                    event=detector.check(state([plant]),night_unsafe=False,food_available=False,distance=4)
+                    self.assertEqual(event["reason"],"resource_types_changed")
+                    self.assertTrue(event["added_types"])
+                    self.assertIsNone(detector.check(state([plant]),night_unsafe=False,food_available=False,distance=4))
 
-    def test_unknown_pickability_and_route_changes_are_not_depletion(self):
-        initial=state([berry()])
-        detector=ExplorationEvents(initial,available,set())
-        for change in ("path", "unknown_pickability"):
-            changed=copy.deepcopy(initial)
-            if change == "path":
-                changed["nearby"][0]["collect_path"]={"status":"unknown"}
-            else:
-                changed["nearby"][0]["pickable"]=None
-            self.assertIsNone(detector.check(changed,night_unsafe=False,food_available=False))
-            self.assertIsNone(detector.check(initial,night_unsafe=False,food_available=False))
-
-    def test_regrowth_seen_by_jev_is_acknowledged_but_stale_decision_cannot_consume_it(self):
-        for baseline_time,expected in ((1,"resource_available_again"),(3,None)):
-            with self.subTest(baseline_time=baseline_time):
-                baseline=state([berry()]); baseline["observed_at"]=baseline_time
-                seen={(22,"berrybush")}; depleted={(22,"berrybush"):2}
-                detector=ExplorationEvents(baseline,available,seen,depleted=depleted)
-                current=state([berry()]); current["observed_at"]=3
-                event=detector.check(current,night_unsafe=False,food_available=False)
-                self.assertEqual(event["reason"] if event else None,expected)
-
-    def test_depletion_during_other_actions_persists_until_regrowth_is_reachable(self):
-        controller.EXPLORATION_SEEN_RESOURCES.clear()
-        self.addCleanup(controller.EXPLORATION_SEEN_RESOURCES.clear)
-        memory={"observed_at":1,"seen":{(22,"berrybush")},"depleted":{}}
-        controller.EXPLORATION_SEEN_RESOURCES[99]=memory
-        empty=berry(); empty["pickable"]=False
-        snapshot=state([empty]); snapshot["player"]["guid"]=99; snapshot["observed_at"]=2
-        with patch.object(controller.telemetry,"latest_state",return_value=(snapshot,100)):
-            controller.latest_state(Path("unused"))
-        self.assertIn((22,"berrybush"),memory["depleted"])
-        baseline=state([]); baseline["player"]["guid"]=99; baseline["observed_at"]=3
-        detector=ExplorationEvents(baseline,available,memory["seen"],depleted=memory["depleted"])
-        blocked=state([berry()]); blocked["player"]["guid"]=99; blocked["observed_at"]=4
-        blocked["nearby"][0]["collect_path"]={"status":"unknown"}
-        self.assertIsNone(detector.check(blocked,night_unsafe=False,food_available=False))
-        ready=state([berry()]); ready["player"]["guid"]=99; ready["observed_at"]=5
-        self.assertEqual(detector.check(ready,night_unsafe=False,food_available=False)["reason"],
-                         "resource_available_again")
-        self.assertIsNone(detector.check(ready,night_unsafe=False,food_available=False))
+    def test_one_depleted_plant_among_same_available_type_does_not_interrupt(self):
+        detector=ExplorationEvents(state([berry(1),berry(2)]),available)
+        empty=berry(1); empty["pickable"]=False
+        self.assertIsNone(detector.check(state([empty,berry(2)]),night_unsafe=False,
+                                         food_available=False,distance=10))
+        self.assertIsNone(detector.check(state([berry(1),berry(2)]),night_unsafe=False,
+                                         food_available=False,distance=10))
 
     def test_mixed_ground_change_is_not_a_region_change(self):
         initial = observed()
-        detector = ExplorationEvents(initial, available, set())
+        detector = ExplorationEvents(initial, available)
         changed = copy.deepcopy(initial)
         changed["navigation"]["current_biome"] = "grassland"
         self.assertIsNone(detector.check(changed, night_unsafe=False, food_available=False))
@@ -145,7 +162,7 @@ class EventTests(unittest.TestCase):
             ("player_dead", lambda s: s["player"]["vitals"].update(dead=True)),
         ):
             with self.subTest(expected=expected):
-                detector = ExplorationEvents(initial, available, set(), "B")
+                detector = ExplorationEvents(initial, available, "B")
                 changed = copy.deepcopy(initial)
                 change(changed)
                 self.assertEqual(detector.check(changed, night_unsafe=False,
@@ -154,27 +171,32 @@ class EventTests(unittest.TestCase):
 
 class ContinuousExecutionTests(unittest.TestCase):
     def setUp(self):
-        controller.EXPLORATION_SEEN_RESOURCES.clear()
         self.output = patch("builtins.print")
         self.output.start()
         self.addCleanup(self.output.stop)
 
-    def run_motion(self, event_after=4, event_kind="resource", mid_move=False, **limits):
+    def run_motion(self, event_after=4, event_kind="resource", mid_move=False,
+                   step=3, expected_after=None, initial_nearby=None, **limits):
         current = observed()
+        if initial_nearby is not None:
+            current["nearby"] = state(initial_nearby)["nearby"]
         current["player"]["guid"] = 500
         current["observed_at"] = 1
         current["navigation"]["graph"]["known_nodes"] = 2
         action = jev_agent.build_candidates(current)[1]["explore_other_region"]
         outer = Mock()
         frames = []
+        expected_after = event_after if expected_after is None else expected_after
 
         def move(*_args, **_kwargs):
             nonlocal current
             next_state = copy.deepcopy(current)
             next_state["observed_at"] += 1
-            next_state["player"]["position"]["z"] += 3
-            next_state["navigation"]["search"]["leg"]["z"] += 3
+            next_state["player"]["position"]["z"] += step
+            next_state["navigation"]["search"]["leg"]["z"] += step
             frames.append(next_state)
+            if event_kind == "same_type":
+                next_state["nearby"] = state([berry(100 + len(frames))])["nearby"]
             if len(frames) == event_after:
                 if event_kind == "resource":
                     next_state["nearby"] = state([berry()])["nearby"]
@@ -187,7 +209,7 @@ class ContinuousExecutionTests(unittest.TestCase):
             if mid_move:
                 callback = controller._action_observer.get()
                 keep_moving = callback(next_state, "movement")
-                self.assertEqual(keep_moving, len(frames) != event_after)
+                self.assertEqual(keep_moving, len(frames) != expected_after)
             current = next_state
             return True
 
@@ -199,7 +221,7 @@ class ContinuousExecutionTests(unittest.TestCase):
                 self.assertTrue(controller.follow_exploration(Path("unused"), action, **limits))
             keys.assert_not_called()
             api.assert_not_called()
-        self.assertEqual(leg.call_count, event_after)
+        self.assertEqual(leg.call_count, expected_after)
         outer.assert_called_once()
         self.assertEqual(outer.call_args.args[1], "exploration_event")
         return current
@@ -212,14 +234,20 @@ class ContinuousExecutionTests(unittest.TestCase):
     def test_new_berry_stops_mid_segment_even_without_prefetch(self):
         self.run_motion(event_after=3, mid_move=True)
 
+    def test_early_new_type_waits_for_four_units_even_mid_segment(self):
+        self.run_motion(event_after=1, step=2, expected_after=2, mid_move=True)
+
+    def test_same_type_does_not_yield_even_after_many_new_guids_and_four_units(self):
+        self.run_motion(event_after=1, event_kind="same_type", initial_nearby=[berry()],
+                        max_legs=6, expected_after=6)
+
     def test_hound_targeting_stops_mid_segment_without_attacking_or_fleeing_automatically(self):
-        self.run_motion(event_after=2, event_kind="hound", mid_move=True)
+        self.run_motion(event_after=1, step=1, event_kind="hound", mid_move=True)
 
     def test_blocked_path_and_phase_change_return_to_jev(self):
         for kind in ("blocked", "phase"):
             with self.subTest(kind=kind):
-                controller.EXPLORATION_SEEN_RESOURCES.clear()
-                self.run_motion(event_after=2, event_kind=kind)
+                self.run_motion(event_after=1, step=1, event_kind=kind)
 
     def test_exception_restores_observer_and_does_not_start_other_actions(self):
         value = observed()
@@ -233,15 +261,44 @@ class ContinuousExecutionTests(unittest.TestCase):
             self.assertIs(controller._action_observer.get(), parent)
         parent.assert_not_called()
 
-    def test_resource_arriving_while_jev_was_answering_is_not_silently_ignored(self):
+    def test_resource_arriving_while_jev_was_answering_is_deferred_until_four_units(self):
         baseline = observed()
         current = copy.deepcopy(baseline)
         current["nearby"] = state([berry()])["nearby"]
         action = jev_agent.build_candidates(current)[1]["explore_other_region"]
-        with (patch.object(controller, "latest_state", return_value=(current, 10)),
-              patch.object(controller, "explore_leg") as leg):
-            self.assertFalse(controller.follow_exploration(Path("unused"), action, baseline=baseline))
-        leg.assert_not_called()
+        def move(*_args, **_kwargs):
+            nonlocal current
+            current = copy.deepcopy(current)
+            current["player"]["position"]["z"] += 2
+            return True
+        with (patch.object(controller, "latest_state", side_effect=lambda *_: (current, 10)),
+              patch.object(controller, "explore_leg", side_effect=move) as leg):
+            self.assertTrue(controller.follow_exploration(Path("unused"), action, baseline=baseline, max_legs=3))
+        self.assertEqual(leg.call_count,2)
+
+    def test_four_units_means_displacement_from_actual_execution_start_not_path_length(self):
+        baseline = observed()
+        current = copy.deepcopy(baseline)
+        current["nearby"] = state([berry()])["nearby"]
+        # JEV observed z=0, but execution starts at z=10. Neither previous
+        # movement nor a 3-unit outward-and-back loop may satisfy the floor.
+        current["player"]["position"]["z"] = 10
+        action = jev_agent.build_candidates(current)[1]["explore_other_region"]
+        positions = iter((13, 10, 13, 14))
+        def move(*_args, **_kwargs):
+            nonlocal current
+            current = copy.deepcopy(current)
+            current["player"]["position"]["z"] = next(positions)
+            return True
+        with patch.object(controller, "latest_state", side_effect=lambda *_: (current, 10)), \
+                patch.object(controller, "explore_leg", side_effect=move) as leg:
+            with controller.timing.CycleTrace(1, emit_console=False) as trace:
+                self.assertTrue(controller.follow_exploration(Path("unused"), action,
+                    baseline=baseline, max_legs=5))
+        self.assertEqual(leg.call_count, 4)
+        self.assertEqual(trace.record["exploration_event"]["reason"], "resource_types_changed")
+        self.assertEqual(trace.record["exploration_displacement"], 4)
+        self.assertEqual(trace.record["exploration_distance"], 10)
 
     def test_real_key_hold_releases_early_when_observer_sees_targeting_hound(self):
         current = observed()

@@ -20,24 +20,64 @@ Planning considerations:
   light the route away from it. Secure light before darkness.
 - Torch fuel is consumed while equipped. This controller automatically unequips
   a torch auto-equipped by crafting during day or dusk, but keeps it at night.
+- Judge portable-light reserves by remaining fuel and expected use, not count
+  alone. inventory_details.items and inventory_details.equipped retain each
+  item's durability_percent: for torches this is remaining fuel in [0,1], not a
+  percentage in [0,100]. Missing fuel is unknown; do not assume full or empty.
+  A nearly empty torch and a full torch are not equivalent reserves. Include
+  both backpack and equipped torches without counting the equipped one twice.
+- Local scripts/tuning.lua defines TORCH_FUEL = night_time * 1.25 with a base
+  night_time of 2 * 30 seconds: a full torch has 75 base seconds of fuel.
+  This is a reference, NOT guaranteed coverage of the current world's night.
+  Rain increases torch drain; skills and other modifiers can change consumption.
+  Seasons and world settings can change night length. Current telemetry gives
+  phase/progress, not actual phase durations, weather, or active fuel modifiers;
+  do not invent an exact remaining-night or effective-fuel duration from it.
+- lighting.torch_equipped reports portable light in the hand. Each entry in
+  lighting.observed_fires reports a campfire/firepit's observed distance and
+  lit status (from the fire tag); null means unreported. A structure's presence
+  alone does not mean it is burning. Remaining fire fuel/burn time is unknown.
+  The controller uses an 8-unit nearby-lit-fire rule for torch switching, not a
+  guarantee of safe illumination everywhere within that radius or all night.
+- Reserve targets must correspond to a concrete expected shortage. Consider
+  remaining torch fuel, stationary light, intended night travel, and the cost of
+  consuming grass/twigs needed for other tasks. If current reserves cover the
+  intended use with a justified margin, work on another unmet need. A completed
+  target or new quarter is not a reason to turn 1 torch into 2, then 3, then 4.
+  Extra crafting is allowed when needed, not a standing goal to maximize stock.
+  No fixed torch-count cap applies: low fuel, changed conditions, or a longer
+  trip can justify more, but state that reason using observed facts/uncertainty.
 - Chopping and mining actions include bounded pickup near the completed target.
   Trees may yield logs and seeds (such as pinecones or acorns); mined rocks may
   yield rocks, flint, nitre, or gold, depending on the target.
 - The eat_safe_food action can cook carried raw food at a nearby lit cooker and
   then eat it when needed. Do not plan a separate cook action solely for that.
-- Exploration is bounded. explore_current_region surveys a frontier leg on the
-  current ground-tile biome; explore_other_region follows an observed road to
-  look for a different biome, but the road may end first. Forest, grassland,
-  savanna, swamp, rocky ground, deciduous forest, and desert are tile cues,
-  not guarantees of resources. Spawn and mixed areas are not single tile types.
-  Oasis and ordinary desert share desert ground cues; do not infer an oasis
+- Exploration uses the game's topology IDs as region identity; ground tiles
+  supply terrain/resource hints, not region boundaries. One topology region can
+  contain mixed tiles; distinct regions can share a biome and get numbered names.
+  explore_current_region searches locally. explore_other_region searches for
+  NEW exits with a persistent outward heading and safe obstacle bypassing, not
+  road following. Already discovering a neighbor does not disable new-exit
+  search; completely observing the current boundary does.
+- travel_region_<observed index> goes to a known graph node, whether newly
+  discovered or previously visited; there is no separate return action. Use
+  observed node_id values in visit_region targets. Paths use verified passable
+  gateways; the reported next-exit distance is not the final travel distance.
+  Resources_seen are past observations, not guaranteed current stock. Terrain
+  hints are only priors. No current action depends on following roads.
+- Exploration and region travel are selected by the executor, not JEV. It uses
+  visit_region goals, known material-source records/BFS hops, and depth-first
+  unknown-branch traversal with backtracking. JEV selects non-navigation local
+  actions; wait hands control back to safe exploration, not a navigation veto.
+  These are navigation policies, not a complete acquisition/tool-dependency solver.
+- Exploration continues across short movement legs without requesting JEV
+  after every leg. Ordinary resource events compare the SET of collectible,
+  reachable product types, not entity GUIDs or counts: more grass alone is not
+  a new type. Yield only while that set differs and displacement from execution
+  start is at least 4 units. Threats, unsafe lighting, phase/region changes, and
+  navigation failures can interrupt earlier; the 4-unit rule is not a safety delay.
+- Oasis and ordinary desert share desert ground cues; do not infer an oasis
   without additional evidence. Prioritize resources actually observed nearby.
-- The observed area graph uses topology ID plus terrain as a local node key.
-  explore_adjacent_* enters a discovered neighboring node through a verified
-  passable gateway; return_previous_region backtracks through a recorded
-  connection. Resources_seen are observations, whereas terrain hints are only
-  priors. These actions advance one leg and may be interrupted for survival.
-  Roads help discover unknown nodes, but a road is not itself a node boundary.
 - Terrain is only a search hint: forest often has trees and saplings; grassland
   often has grass and saplings; savanna often has grass and may have beefalo;
   rocky ground often has rocks and flint; swamp can contain reeds and hostile

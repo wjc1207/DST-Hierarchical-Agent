@@ -29,10 +29,10 @@ class FlowerTests(unittest.TestCase):
         self.assertNotIn("collect_flower_evil", jev_agent.build_candidates(state([evil]))[0])
 
     def test_new_flower_interrupts_exploration_once(self):
-        detector = ExplorationEvents(state([]), available, set())
+        detector = ExplorationEvents(state([]), available)
         actual = state([self.flower()])
-        event = detector.check(actual, night_unsafe=False, food_available=False)
-        self.assertEqual((event["reason"], event["prefab"]), ("new_resource", "flower"))
+        event = detector.check(actual, night_unsafe=False, food_available=False, distance=4)
+        self.assertEqual((event["reason"], event["added_types"]), ("resource_types_changed", ["petals"]))
         self.assertIsNone(detector.check(actual, night_unsafe=False, food_available=False))
 
     def test_pick_verifies_petals_gain_and_prediction_removes_flower(self):

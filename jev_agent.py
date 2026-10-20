@@ -1,4 +1,4 @@
-"""Use JEV to choose one bounded DST action from fresh mod telemetry."""
+"""Executor-owned exploration with JEV local choices from fresh Mod telemetry."""
 
 from __future__ import annotations
 
@@ -19,6 +19,9 @@ from decision_prefetch import DecisionPrefetch, current_action, compatible
 from action_buffer import predict_success, started as buffered_action_started
 from task_board import board_view
 from board_executor import LocalBoardExecutor, task_progressed
+from model_state import model_game_state
+from exploration_executor import ExplorationExecutor, local_candidates, exploration_key
+from exploration_events import resource_types
 
 
 DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone"
@@ -361,7 +364,8 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     for index, route in enumerate(routes, start=1):
         if route.get("status") != "ready" or not route.get("target") or not route.get("leg"):
             continue
-        if not controller.graph_route_available(str(route.get("node_id") or "")):
+        if not controller.graph_route_available(str(route.get("node_id") or ""),
+                route.get("gateway_id"), state.get("player", {}).get("guid")):
             continue
         if not route.get("node_id") or route["node_id"] in seen_destinations:
             continue
@@ -599,8 +603,9 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         dispatch["build_sciencemachine"] = {"kind": "build_sciencemachine"}
     
     criteria["wait"] = (
-        "Take no action for one telemetry interval. Choose only when no currently useful "
-        "safe action is available or waiting is safer than acting."
+        "No local action is needed now; return control to the exploration executor. "
+        "It may continue safe navigation, or remain still when no safe route is available. "
+        "Choose a local survival action instead when immediate intervention is needed."
     )
     dispatch["wait"] = {"kind": "wait"}
 
@@ -619,6 +624,10 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     timing.annotate(candidate_rejections=rejected)
     dispatch = {k: v for k, v in dispatch.items() if k in criteria}
     return criteria, dispatch
+
+
+def build_jev_candidates(state):
+    return local_candidates(*build_candidates(state))
 
 
 def candidate_context(state: dict, keys) -> dict:
@@ -640,15 +649,8 @@ def candidate_context(state: dict, keys) -> dict:
 
 @timing.timed("decision.state_compact")
 def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
-    world = state.get("world", {})
-    player = state.get("player", {})
-    vitals = player.get("vitals", {})
-    counts = inventory_counts(state)
-    hunger = float(vitals.get("hunger") or 0)
-    hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
-    weapon_equipped, weapon_carried, best_weapon = weapon_status(state)
-    work = state.get("work") or {}
     compact = {
+        **model_game_state(state),
         "goal": "Survive indefinitely and steadily improve food, light, tools, resources, and safety.",
         "hard_rules": [
             "Choose only an action listed in the available criteria; unavailable actions cannot be executed.",
@@ -656,6 +658,9 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
             "A torch can be equipped only at night and only when no lit campfire or firepit is nearby. A campfire can be built only at night when no lit fire is nearby.",
         ],
         "decision_guidance": [
+            "Exploration and known-region travel are owned by the executor, not by you. Choose a useful available local action or wait to return control; wait is not a request to stop safe exploration. Resource opportunities and survival changes can interrupt navigation, whose intent is preserved for resumption.",
+            "Both models use the same game-state fields. inventory_details separates backpack items and equipped slots; durability_percent is a 0..1 remaining fraction (torch fuel), with missing values unknown. lighting.observed_fires reports current burning and distance, not remaining fire lifetime. state_basis marks observed versus predicted snapshots.",
+            "Exploration watches the SET of currently collectible, reachable resource product types, not individual GUIDs or counts. Ordinary resource changes yield only after at least 4 world units of displacement from the execution start and while that set differs; threats and other safety/navigation events may interrupt earlier.",
             "Assess immediate threats, darkness, and starvation before optional progress; compare the remaining safe actions rather than following a fixed script.",
             "eat_safe_food is a complete eating action: if no preferred cooked food is carried and a lit cooker is nearby, it cooks one item and then eats; cook_food alone only prepares food for later.",
             "craft_torch is a complete crafting action: if DST auto-equips the new torch before night, the controller unequips it to preserve fuel.",
@@ -664,53 +669,9 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
             "Prefer a useful safe action over repeated waiting, but do not take unnecessary risks for optional resources.",
             "A nearby potentialThreat may attack on approach even when activeThreat is false; avoid routes through remembered hazards.",
             "Regions are game topology rooms, not individual ground tiles; mixed terrain can belong to one region. Names have stable topology IDs, and observed area is not total area or a completion percentage.",
-            "Current-region search finds local resources. New-region search investigates unknown exits, preserving its heading across short interruptions; known-region travel is separate and includes returning. When local resources no longer meet needs, consider unknown exits or known regions with useful resources rather than repeatedly surveying the same area.",
+            "The executor selects local frontiers, unknown exits and known-region travel from the task board and observations. These are not your action choices; focus on worthwhile local actions or return control with wait.",
             "A task_board (or legacy daily_plan) is strategic advice from a separate planner, not a command. Prefer ready/in_progress tasks with higher priority (1 highest); ignore done, blocked or expired tasks. Choose the fastest safe available next action that advances a task. You may respond to new opportunities and emergencies instead; never generate a plan or wait merely because a hint is unavailable.",
             "When execution_context.predicted_success is true, the supplied state is the predicted successful outcome of the running action, not an observation. Choose just one next action conditional on that success; do not expand a plan. Otherwise use observed facts. The controller verifies the outcome and revalidates your choice before execution.",
-        ],
-        "day": world.get("day"),
-        "phase": world.get("phase"),
-        "world_time": world.get("time"),
-        "health": vitals.get("health"),
-        "hunger": vitals.get("hunger"),
-        "hunger_max": vitals.get("hunger_max"),
-        "hunger_fraction": round(hunger / hunger_max, 3),
-        "sanity": vitals.get("sanity"),
-        "dead": vitals.get("dead"),
-        "position": player.get("position"),
-        "navigation": state.get("navigation", {}),
-        "execution_context": state.get("_jev_execution_context"),
-        "inventory": counts,
-        "safe_food_count": sum(counts.get(prefab, 0) for prefab in SAFE_FOOD_PREFABS),
-        "cookable_raw_count": sum(counts.get(prefab, 0) for prefab in COOKABLE_FOOD_PRODUCTS),
-        "nearby_cooker": nearest_cookable_fire(state) is not None,
-        "last_work": {
-            "action": work.get("action"),
-            "status": work.get("status"),
-        } if work else None,
-        "torch_equipped": has_equipped_torch(state),
-        "nearby_lit_fire": has_nearby_lit_fire(state),
-        "weapon_equipped": weapon_equipped,
-        "weapon_carried": weapon_carried,
-        "best_weapon": best_weapon,
-        "can_craft_torch": state.get("crafting", {}).get("torch", False),
-        "can_craft_axe": state.get("crafting", {}).get("axe", False),
-        "can_craft_pickaxe": state.get("crafting", {}).get("pickaxe", False),
-        "can_craft_campfire": state.get("crafting", {}).get("campfire", False),
-        "nearby": [
-            {
-                "prefab": entity.get("prefab"),
-                "distance": entity.get("distance"),
-                "tags": entity.get("tags", []),
-                "pickable": entity.get("pickable"),
-                "collect_path_status": (entity.get("collect_path") or {}).get("status"),
-                "collect_path_reason": (entity.get("collect_path") or {}).get("reason"),
-                "work_required": entity.get("work_required"),
-                "attackable": entity.get("attackable", False),
-                "activeThreat": entity.get("activeThreat", False),
-                "potentialThreat": entity.get("potentialThreat", False),
-            }
-            for entity in state.get("nearby", [])
         ],
     }
     if daily_plan is not None:
@@ -726,6 +687,8 @@ def call_jev(
     api_url: str, api_key: str, model: str, state: dict,
     criteria: Dict[str, str], daily_plan: Optional[dict] = None,
 ) -> dict:
+    # Also enforce the boundary for direct callers, not only the control loop.
+    criteria = {k: v for k, v in criteria.items() if not exploration_key(k)}
     body = {
         "state": json.dumps(compact_game_state(state, daily_plan), ensure_ascii=False, separators=(",", ":")),
         "model": model,
@@ -735,7 +698,7 @@ def call_jev(
                 "instructions": (
                     "Choose exactly one action key from the supplied criteria. Treat each key as "
                     "one semantic action, even when the controller performs several verified substeps. "
-                    "Exploration continues until a meaningful event, not until the next short movement leg. "
+                    "The executor owns exploration; choose only among local actions. "
                     "Decide the next action quickly from current state and criteria; do not plan ahead. "
                     "Obey hard rules and immediate survival needs. Treat task_board or legacy daily_plan, when present, "
                     "as optional strategic guidance, never as permission to ignore current facts. "
@@ -773,6 +736,8 @@ def call_jev(
     answer = payload.get("answers", {}).get("next_action")
     if not isinstance(answer, dict) or not answer.get("choice"):
         raise RuntimeError("JEV response did not contain answers.next_action.choice")
+    if answer["choice"] not in criteria:
+        raise RuntimeError(f"JEV selected unavailable local action: {answer['choice']}")
     return {"response": payload, "answer": answer}
 
 
@@ -786,7 +751,8 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> b
         if action.get("navigation_mode") == "road":
             raise ValueError("Road-following exploration has been removed; update the mod")
         return controller.follow_exploration(log_path, action, move_seconds,
-                                             baseline=action.get("_decision_state"))
+                                             baseline=action.get("_decision_state"),
+                                             on_event=action.get("_on_exploration_event"))
     elif kind == "wait":
         with timing.span("action.wait"):
             time.sleep(1.0)
@@ -891,11 +857,57 @@ def run_local_board_step(args, state, board, dispatch, planner, prefetch, execut
     return False
 
 
+def run_executor_exploration(args, state, board, dispatch, planner, prefetch, executor,
+                             force=False):
+    if not args.execute:
+        return False
+    executor.fresh_handoff = None
+    selected = executor.choose(state, dispatch, board)
+    if selected is None:
+        return False
+    local = {k for k, a in dispatch.items() if a["kind"] not in {"explore", "wait"}}
+    if not force and executor.handoff and local:
+        return False
+    # Validate against an observation taken immediately before starting movement.
+    fresh, _ = controller.latest_state(args.log)
+    executor.fresh_handoff = fresh
+    _, fresh_dispatch = build_candidates(fresh)
+    selected = executor.choose(fresh, fresh_dispatch, board)
+    if selected is None:
+        return False
+    fresh_local = {k for k, a in fresh_dispatch.items() if a["kind"] not in {"explore", "wait"}}
+    new_resources = executor.resources != resource_types(state, controller.exploration_resource_available)
+    if fresh_local and (new_resources or (not force and executor.handoff)):
+        executor.handoff = True
+        return False
+    key, action = selected
+    if prefetch is not None:
+        prefetch.discard("executor_exploration")
+    executor.handoff, executor.last_event = False, None
+    timing.annotate(decision_source="exploration_auto", action=key, current_action=key,
+                    exploration_owner="executor", exploration_strategy=executor.strategy,
+                    exploration_goal=executor.goal)
+    print(f"exploration_auto strategy={executor.strategy} goal={executor.goal} action={key}")
+    try:
+        with timing.span("exploration.auto_execute"), controller.observe_action(None):
+            moved = execute_action({**action, "_on_exploration_event": executor.on_event},
+                                   args.log, args.move_seconds)
+        if not moved and executor.last_event is None:
+            executor.on_event({"reason": "movement_stalled"}, fresh)
+        if planner is not None:
+            planner.record_action(fresh, key, "executed" if moved else "skipped")
+        timing.annotate(outcome="executed" if moved else "skipped")
+    finally:
+        controller.release_movement_keys()
+    return True
+
+
 def run_decision_cycle(
     args, api_url: str, api_key: str, model: str,
     planner: Optional[DailyPlanner] = None,
     prefetch: Optional[DecisionPrefetch] = None,
     local_executor: Optional[LocalBoardExecutor] = None,
+    exploration_executor: Optional[ExplorationExecutor] = None,
 ) -> bool:
     """Run one sense-decide-act cycle. Return True at a terminal game state."""
     with timing.span("cycle.observe"):
@@ -907,6 +919,7 @@ def run_decision_cycle(
         timing.annotate(outcome="terminal")
         print("goal_failed: player is dead; control loop stopped")
         return True
+    navigator = exploration_executor if exploration_executor is not None else ExplorationExecutor()
     with timing.span("planner.update"):
         daily_plan = planner.update(state) if planner is not None else None
     if daily_plan and daily_plan.get("kind") == "task_board":
@@ -929,6 +942,23 @@ def run_decision_cycle(
                         task_board_id=(daily_plan or {}).get("board_id"),
                         ready_task_ids=(daily_plan or {}).get("ready_task_ids", []))
         criteria, dispatch = build_candidates(state)
+    if run_executor_exploration(args, state, daily_plan, dispatch, planner, prefetch, navigator):
+        return False
+    if navigator.fresh_handoff is not None:
+        state = navigator.fresh_handoff
+        world = state.get("world", {})
+        if state.get("player", {}).get("vitals", {}).get("dead"):
+            timing.annotate(outcome="terminal")
+            return True
+        timing.annotate(day=world.get("day"), phase=world.get("phase"))
+        criteria, dispatch = build_candidates(state)
+    criteria, dispatch = local_candidates(criteria, dispatch)
+    if args.execute and set(criteria) == {"wait"}:
+        if prefetch is not None:
+            prefetch.discard("only_local_wait")
+        timing.annotate(decision_source="executor_idle", action="wait", current_action="wait", outcome="executed")
+        execute_action({"kind": "wait"}, args.log, args.move_seconds)
+        return False
     timing.annotate(decision_source="synchronous")
     cached = prefetch.take(state, dispatch, plan=daily_plan) if prefetch is not None else None
     if cached is None:
@@ -940,7 +970,7 @@ def run_decision_cycle(
                 if state.get("player", {}).get("vitals", {}).get("dead"):
                     timing.annotate(outcome="terminal")
                     return True
-                criteria, dispatch = build_candidates(state)
+                criteria, dispatch = build_jev_candidates(state)
         request_started = time.monotonic()
         decision_state = state
         decision_candidates = list(criteria)
@@ -987,7 +1017,7 @@ def run_decision_cycle(
             timing.annotate(outcome="skipped")
             print("action_skipped: state changed while awaiting prefetched response")
             return False
-        _, fresh_dispatch = build_candidates(state)
+        _, fresh_dispatch = build_jev_candidates(state)
         match = current_action(selected, fresh_dispatch)
     if match is None:
         timing.annotate(outcome="skipped")
@@ -1008,6 +1038,18 @@ def run_decision_cycle(
         timing.annotate(outcome="abstained")
         print(f"abstained: confidence below {threshold:.2f}")
         return False
+
+    if selected["kind"] == "wait":
+        navigator.after_local_action("wait")
+        _, navigation_dispatch = build_candidates(state)
+        if run_executor_exploration(args, state, daily_plan, navigation_dispatch,
+                                    planner, prefetch, navigator, force=True):
+            timing.annotate(jev_local_choice="wait")
+            return False
+        if navigator.fresh_handoff is not None and navigator.handoff:
+            timing.annotate(outcome="skipped")
+            print("local handoff changed before exploration; requesting a fresh local decision")
+            return False
 
     pending = None
     prediction_submitted = False
@@ -1069,7 +1111,7 @@ def run_decision_cycle(
                     "current_action": current_choice, "stage": reason,
                     "decision_applies": "after_current_bounded_action",
                 }}
-                upcoming, actions = build_candidates(request_state)
+                upcoming, actions = build_jev_candidates(request_state)
                 with timing.span("decision.prefetch_submit"):
                     accepted = prefetch.submit(request_state, upcoming, actions, daily_plan, predicted=predicting)
                 if accepted and predicting:
@@ -1100,6 +1142,8 @@ def run_decision_cycle(
     if planner is not None:
         planner.record_action(state, choice, "executed" if executed else "skipped")
     timing.annotate(outcome="executed" if executed else "skipped")
+    if executed and selected["kind"] != "wait":
+        navigator.after_local_action(selected["kind"])
     print("action_executed" if executed else "action_skipped: state changed before execution")
     return False
 
@@ -1304,6 +1348,7 @@ def main() -> int:
 def run_control_loop(args, api_url, api_key, model, planner, prefetch):
     cycle = 0
     local_executor = LocalBoardExecutor()
+    exploration_executor = ExplorationExecutor()
     consecutive_errors = 0
     while True:
         cycle += 1
@@ -1311,7 +1356,8 @@ def run_control_loop(args, api_url, api_key, model, planner, prefetch):
             print(f"cycle={cycle}")
         with timing.CycleTrace(cycle, args.timing_log, args.timing_details):
             try:
-                terminal = run_decision_cycle(args, api_url, api_key, model, planner, prefetch, local_executor)
+                terminal = run_decision_cycle(args, api_url, api_key, model, planner, prefetch,
+                                              local_executor, exploration_executor)
                 consecutive_errors = 0
             except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
                 timing.annotate(outcome="retry_error", error_type=type(exc).__name__)

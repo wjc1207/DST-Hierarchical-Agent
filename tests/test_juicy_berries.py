@@ -26,16 +26,16 @@ class JuicyBerryTests(unittest.TestCase):
                 if expected:
                     self.assertEqual(dispatch["collect_berrybush_juicy"]["guid"], 22)
 
-    def test_new_bush_interrupts_once_and_observed_regrowth_interrupts_again(self):
-        detector = ExplorationEvents(state([]), available, set())
+    def test_new_type_interrupts_once_and_regrowth_changes_the_available_set(self):
+        detector = ExplorationEvents(state([]), available)
         ready = state([self.bush()])
-        event = detector.check(ready, night_unsafe=False, food_available=False)
-        self.assertEqual(event["reason"], "new_resource")
-        self.assertEqual(event["prefab"], "berrybush_juicy")
+        event = detector.check(ready, night_unsafe=False, food_available=False, distance=4)
+        self.assertEqual(event["reason"], "resource_types_changed")
+        self.assertEqual(event["added_types"], ["berries_juicy"])
         self.assertIsNone(detector.check(ready, night_unsafe=False, food_available=False))
-        detector.check(state([self.bush(False)]), night_unsafe=False, food_available=False)
-        self.assertEqual(detector.check(ready, night_unsafe=False, food_available=False)["reason"],
-                         "resource_available_again")
+        detector.check(state([self.bush(False)]), night_unsafe=False, food_available=False, distance=4)
+        self.assertEqual(detector.check(ready, night_unsafe=False, food_available=False, distance=4)["added_types"],
+                         ["berries_juicy"])
 
     def test_loose_raw_and_cooked_berries_are_collectible_and_edible(self):
         for prefab in ("berries_juicy", "berries_juicy_cooked"):

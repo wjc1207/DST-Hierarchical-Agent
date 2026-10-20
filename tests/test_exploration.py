@@ -1,4 +1,4 @@
-"""Topology travel and unknown-exit search remain independent JEV decisions."""
+"""Internal safe topology travel and unknown-exit options for the executor."""
 import copy
 import unittest
 from pathlib import Path

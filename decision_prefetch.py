@@ -8,8 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import timing_log as timing
-from controller import (EXPLORATION_RESOURCE_PREFABS, EXPLORATION_SEEN_RESOURCES,
-                        collect_target_available, collect_target_reachable)
+from controller import exploration_resource_available
+from exploration_events import resource_types
 
 
 def action_identity(action: dict) -> tuple:
@@ -46,9 +46,7 @@ def _inventory(state: dict) -> tuple:
 
 
 def _resources(state: dict) -> set:
-    return {(e.get("guid"), e.get("prefab")) for e in state.get("nearby", [])
-            if e.get("prefab") in EXPLORATION_RESOURCE_PREFABS
-            and collect_target_available(e) and collect_target_reachable(state, e)}
+    return resource_types(state, exploration_resource_available)
 
 
 def compatible(source: dict, current: dict, *, check_inventory: bool = True) -> bool:
@@ -69,12 +67,7 @@ def compatible(source: dict, current: dict, *, check_inventory: bool = True) -> 
     hunger_ratio = lambda p: float(p.get("vitals", {}).get("hunger") or 0) / max(1, float(p.get("vitals", {}).get("hunger_max") or 1))
     if hunger_ratio(old) >= 0.30 > hunger_ratio(new):
         return False
-    memory = EXPLORATION_SEEN_RESOURCES.get(old.get("guid"), {}) if old.get("guid") is not None else {}
-    newly_available = _resources(current) - _resources(source)
-    previously_empty = {(e.get("guid"), e.get("prefab")) for e in source.get("nearby", [])
-                        if e.get("pickable") is False}
-    if (newly_available - memory.get("seen", set())
-            or newly_available.intersection(previously_empty | set(memory.get("depleted", {})))):
+    if _resources(current) != _resources(source):
         return False
     a, b = old.get("position", {}), new.get("position", {})
     if a and b and math.hypot(float(a.get("x", 0)) - float(b.get("x", 0)),

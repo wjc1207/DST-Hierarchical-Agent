@@ -52,6 +52,22 @@ function M.gateway_crossing(crossing, px, pz, ax, az, bx, bz, arrival)
         or (projection >= 0 and projection <= length + arrival and lateral <= arrival)
 end
 
+function M.gateway_destination(ax, az, bx, bz, extension)
+    -- A coordinate arrival radius is not proof of entering the next room.
+    -- Use a fixed, bounded continuation, never a target that creeps ahead.
+    local length = distance(ax, az, bx, bz)
+    if length == 0 then return {x=bx,z=bz} end
+    return {x=bx+(bx-ax)/length*extension, z=bz+(bz-az)/length*extension}
+end
+
+function M.gateway_reached(px, pz, ax, az, bx, bz, arrival)
+    if distance(px,pz,bx,bz) <= arrival then return true end
+    local dx,dz=bx-ax,bz-az
+    local length=math.sqrt(dx*dx+dz*dz)
+    return length > 0 and (px-bx)*dx+(pz-bz)*dz >= 0
+        and math.abs((px-ax)*dz-(pz-az)*dx)/length <= 1.5
+end
+
 function M.frontier_gains(memory, region, neighbors)
     -- Unlabelled but observed land is a transit corridor, not endlessly new
     -- information. Follow it to genuinely unobserved space, without crossing
