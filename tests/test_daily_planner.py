@@ -7,8 +7,8 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import patch
 
-import daily_planner
-import jev_agent
+from mcp_agent import daily_planner
+from mcp_agent import jev_client as jev_agent
 
 
 def observed(day: int = 1, world_time: float = 0.1) -> dict:
@@ -50,7 +50,7 @@ class PlanResponse:
 
     def read(self):
         return json.dumps({"choices": [{"finish_reason": "stop", "message": {
-            "content": json.dumps({"goal": "Find gold", "steps": ["Explore"]}),
+            "content": json.dumps({"goal": "Find gold", "tasks": [{"id":"gold","title":"Find gold","target":{"type":"inventory","prefab":"goldnugget","count":1}}]}),
         }}]}).encode("utf-8")
 
 
@@ -78,7 +78,7 @@ class PlannerTests(unittest.TestCase):
             def read(self):
                 return json.dumps({
                     "choices": [{"finish_reason": "stop", "message": {
-                        "content": json.dumps({"goal": "Find gold", "steps": ["Explore"]})
+                        "content": json.dumps({"goal": "Find gold", "tasks": [{"id":"gold","title":"Find gold","target":{"type":"inventory","prefab":"goldnugget","count":1}}]})
                     }}]
                 }).encode("utf-8")
 
@@ -209,7 +209,7 @@ class PlannerTests(unittest.TestCase):
             def read(self):
                 return json.dumps(self.payload).encode("utf-8")
 
-        completed = json.dumps({"goal": "Collect gold", "steps": ["Mine rocks"]})
+        completed = json.dumps({"goal": "Collect gold", "tasks": [{"id":"gold","title":"Gold","target":{"type":"inventory","prefab":"goldnugget","count":1}}]})
         with (
             patch.object(daily_planner.urllib.request, "urlopen", side_effect=[
                 Response("length", '{"goal":"Collect'), Response("stop", completed),
@@ -299,7 +299,7 @@ class PlannerTests(unittest.TestCase):
         planner.update(observed(world_time=0.51))
         context = planner.executor.calls[0][1][4]
         self.assertEqual(context["planning_window"], {
-            "day": 1, "quarter": 3, "quarters_per_day": 4,
+            "day": 1, "quarter": 3, "quarters_per_day": 4, "mode": "review_not_reset",
         })
         self.assertIn("Science Machine", context["dst_knowledge"])
         self.assertIn("gold nugget + 4 logs + 4 rocks", context["dst_knowledge"])

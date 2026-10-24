@@ -5,13 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import controller
-import jev_agent
-import timing_log as timing
-from exploration_executor import ExplorationExecutor, sources_for
-from task_board import validate_board
-from test_exploration import observed, route
-from test_regressions import grass
+from mcp_agent import jev_client as jev_agent
+from common import timing_log as timing
+from mcp_agent.navigation_intents import ExplorationExecutor, sources_for
+from common.task_board import validate_board
+from fixtures import observed, route, native_navigation_dispatch
+from fixtures import grass
 
 
 def board(target):
@@ -23,13 +22,10 @@ def board(target):
 class ExplorationExecutorTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch("builtins.print"))
-        self.enterContext(patch.object(controller, "release_movement_keys"))
-        for memory in (controller.GRAPH_ROUTE_BLACKLIST, controller.GRAPH_GATEWAY_BLACKLIST):
-            self.enterContext(patch.dict(memory, clear=True))
         self.navigator = ExplorationExecutor()
 
     def choose(self, actual, plan=None):
-        return self.navigator.choose(actual, jev_agent.build_candidates(actual)[1], plan)
+        return self.navigator.choose(actual, native_navigation_dispatch(actual), plan)
 
     def test_known_gold_sources_use_bfs_hops_not_ordinary_rocks(self):
         actual = observed()
@@ -120,127 +116,14 @@ class ExplorationExecutorTests(unittest.TestCase):
                                       "activeThreat": True, "tags": ["hostile"]}]
             self.assertIsNone(self.choose(actual))
 
-    def test_only_exploration_options_are_removed_from_jev_candidates(self):
-        actual = observed()
-        actual["nearby"] = [grass(1, 1, True)]
-        criteria, actions = jev_agent.build_jev_candidates(actual)
-        self.assertIn("collect_grass", criteria)
-        self.assertIn("wait", criteria)
-        self.assertTrue(all(a["kind"] != "explore" for a in actions.values()))
 
-    def args(self, execute=True):
-        return SimpleNamespace(log=Path("unused"), execute=execute, move_seconds=1,
-                               show_probabilities=False, min_confidence=None)
 
-    def test_automatic_search_continues_without_model_or_prefetch(self):
-        actual = observed()
-        prefetch = Mock()
-        with (patch.object(controller, "latest_state", return_value=(actual, 1)),
-              patch.object(jev_agent, "execute_action", return_value=True) as execute,
-              patch.object(jev_agent, "call_jev") as api,
-              timing.CycleTrace(1, emit_console=False) as trace):
-            for _ in range(2):
-                jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                            prefetch=prefetch, exploration_executor=self.navigator)
-        self.assertEqual(execute.call_count, 2)
-        api.assert_not_called()
-        prefetch.take.assert_not_called()
-        self.assertEqual(trace.record["decision_source"], "exploration_auto")
-        self.assertNotIn("decision.request", trace.record["totals"])
 
-    def test_wait_releases_navigation_then_repeated_models_are_not_required(self):
-        actual = observed()
-        actual["nearby"] = [grass(1, 1, True)]
-        response = {"response": {"model": "test"}, "answer": {"choice": "wait", "confidence": 0.1}}
-        with (patch.object(controller, "latest_state", return_value=(actual, 1)),
-              patch.object(jev_agent, "execute_action", return_value=True) as execute,
-              patch.object(jev_agent, "call_jev", return_value=response) as api):
-            for _ in range(2):
-                jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                            exploration_executor=self.navigator)
-        api.assert_called_once()
-        self.assertTrue(all(c.args[0]["kind"] == "explore" for c in execute.call_args_list))
-        self.assertTrue(all(not k.startswith(("explore_", "travel_region_")) for k in api.call_args.args[4]))
 
-    def test_new_resource_before_movement_overrides_automatic_continuation(self):
-        actual = observed()
-        changed = copy.deepcopy(actual)
-        changed["nearby"] = [grass(1, 1, True)]
-        response = {"response": {"model": "test"},
-                    "answer": {"choice": "collect_grass", "confidence": 1}}
-        with (patch.object(controller, "latest_state", side_effect=[(actual, 1), (changed, 2), (changed, 2), (changed, 2)]),
-              patch.object(jev_agent, "execute_action", return_value=True) as execute,
-              patch.object(jev_agent, "call_jev", return_value=response) as api):
-            jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                        exploration_executor=self.navigator)
-        self.assertEqual(execute.call_args.args[0]["kind"], "collect")
-        self.assertIs(api.call_args.args[3], changed)
 
-    def test_real_event_loop_hands_new_resources_to_jev_without_exploration_prefetch(self):
-        current = [observed()]
-        legs = []
 
-        def move(*_args, **_kwargs):
-            fresh = copy.deepcopy(current[0])
-            fresh["player"]["position"]["z"] += 3
-            fresh["navigation"]["search"]["leg"]["z"] += 3
-            legs.append(fresh)
-            if len(legs) == 2:
-                fresh["nearby"] = [grass(1, 1, True)]
-            current[0] = fresh
-            return True
 
-        response = {"response": {"model": "test"},
-                    "answer": {"choice": "collect_grass", "confidence": 1}}
-        with (patch.object(controller, "latest_state", side_effect=lambda *_: (current[0], 1)),
-              patch.object(controller, "explore_leg", side_effect=move),
-              patch.object(controller, "collect", return_value=True) as collect,
-              patch.object(jev_agent, "call_jev", return_value=response) as api):
-            jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                        exploration_executor=self.navigator)
-            api.assert_not_called()
-            self.assertTrue(self.navigator.handoff)
-            self.assertEqual(self.navigator.last_event["reason"], "resource_types_changed")
-            jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                        exploration_executor=self.navigator)
-        self.assertEqual(len(legs), 2)
-        api.assert_called_once()
-        collect.assert_called_once()
 
-    def test_fresh_threat_before_start_is_handed_to_jev_not_movement(self):
-        actual = observed()
-        changed = copy.deepcopy(actual)
-        changed["nearby"] = [{"prefab": "hound", "guid": 99, "distance": 2,
-                               "dx": 2, "dz": 0, "activeThreat": True, "tags": ["hostile"]}]
-        response = {"response": {"model": "test"},
-                    "answer": {"choice": "flee_from_nearest_hostile", "confidence": 1}}
-        with (patch.object(controller, "latest_state", side_effect=[(actual, 1), (changed, 2), (changed, 2), (changed, 2)]),
-              patch.object(jev_agent, "execute_action", return_value=True) as execute,
-              patch.object(jev_agent, "call_jev", return_value=response) as api):
-            jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                        exploration_executor=self.navigator)
-        self.assertEqual(execute.call_args.args[0]["kind"], "flee_from_nearest_hostile")
-        self.assertIs(api.call_args.args[3], changed)
-
-    def test_only_idle_at_night_does_not_request_a_trivial_model_decision(self):
-        actual = observed()
-        actual["world"]["phase"] = "night"
-        with (patch.object(controller, "latest_state", return_value=(actual, 1)),
-              patch.object(jev_agent, "execute_action", return_value=True) as execute,
-              patch.object(jev_agent, "call_jev") as api):
-            jev_agent.run_decision_cycle(self.args(), "unused", "unused", "test",
-                                        exploration_executor=self.navigator)
-        self.assertEqual(execute.call_args.args[0]["kind"], "wait")
-        api.assert_not_called()
-
-    def test_dry_run_never_automatically_moves(self):
-        actual = observed()
-        with (patch.object(jev_agent, "execute_action") as execute,
-              patch.object(controller, "latest_state") as read):
-            self.assertFalse(jev_agent.run_executor_exploration(self.args(False), actual, None,
-                jev_agent.build_candidates(actual)[1], None, None, self.navigator))
-        execute.assert_not_called()
-        read.assert_not_called()
 
 
 if __name__ == "__main__":

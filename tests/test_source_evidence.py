@@ -3,26 +3,22 @@ import copy
 import unittest
 from unittest.mock import patch
 
-import controller
-import jev_agent
-from exploration_executor import ExplorationExecutor, usable_sources_for
-from test_exploration import observed, route
+from mcp_agent import jev_client as jev_agent
+from mcp_agent.navigation_intents import ExplorationExecutor, usable_sources_for
+from fixtures import observed, route, native_navigation_dispatch
 from test_exploration_executor import board
-from test_regressions import grass
+from fixtures import grass
 
 
 class SourceEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch("builtins.print"))
-        self.clock = self.enterContext(patch("exploration_executor.time.monotonic", return_value=100))
-        for memory in (controller.GRAPH_ROUTE_BLACKLIST, controller.GRAPH_GATEWAY_BLACKLIST,
-                       controller.COLLECTION_TARGET_PAUSES):
-            self.enterContext(patch.dict(memory, clear=True))
+        self.clock = self.enterContext(patch("mcp_agent.navigation_intents.time.monotonic", return_value=100))
         self.navigator = ExplorationExecutor()
         self.plan = board({"type": "inventory", "prefab": "flint", "count": 2})
 
     def choose(self, actual, plan=None):
-        return self.navigator.choose(actual, jev_agent.build_candidates(actual)[1], plan or self.plan)
+        return self.navigator.choose(actual, native_navigation_dispatch(actual), plan or self.plan)
 
     def at(self, node="A", seen=(), complete=False):
         actual = observed()

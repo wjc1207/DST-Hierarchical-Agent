@@ -1,0 +1,126 @@
+Don't Starve Together planning reference (standard Wilson-style recipes)
+
+This is strategic background, not live game state. Inventory, recipe availability,
+nearby entities, and Lua's allowed actions must be checked from telemetry.
+Character-specific recipes, world settings, and special circumstances may differ.
+
+Core recipes (verified against this DST installation's scripts/recipes.lua):
+- Torch: 2 cut grass (cutgrass) + 2 twigs (twigs); no science station required.
+- Axe: 1 twig + 1 flint; no science station required.
+- Pickaxe: 2 twigs + 2 flint; no science station required.
+- Campfire: 3 cut grass + 2 logs; no science station required.
+- Fire pit: 2 logs + 12 rocks; no science station required.
+- Science Machine (recipe name researchlab): 1 gold nugget + 4 logs + 4 rocks;
+  no science station required. This is the current longer-term milestone.
+- Rope: 3 cut grass; normally requires a Science Machine to prototype.
+- Spear: 2 twigs + 1 rope + 1 flint; normally requires a Science Machine.
+
+Planning considerations:
+- DeepSeek maintains a priority task_board with machine-checkable targets and
+  real dependencies, not a strict action sequence. Complete visible feasible goals
+  by priority; when none are visible, navigate for the highest ready goal. A missing
+  higher-priority resource does not block gathering another visible board resource.
+  Inventory counts mean CURRENT stock at completion, not additional gathering.
+  Observed completed goals stay done after materials are consumed. Explicitly
+  declare material/tool dependencies; the executor does not invent recipe tasks.
+  Quarterly review is a patch, not a reset: preserve IDs, valid goals and progress;
+  only cancel explicitly or revise with a reason based on changed facts. Time
+  passing and task completion are not reasons to inflate stock targets.
+  Each task has a bounded search time/distance; one route rejection does NOT prove
+  a resource is absent. JEV handles safety, new off-board opportunities, and gaps.
+- Runtime crafting only offers a new torch/axe/pickaxe when none is carried:
+  request at most count=1, never a second reserve torch. Campfire placement is
+  allowed only at night with no nearby lit fire. A dusk campfire task can wait
+  while other visible goals proceed; it is not proof of missing materials.
+- Klei room resource priors are supplied for OBSERVED topology room types. BGGrass
+  can generate grass/saplings/berries, FlowerPatch primarily flowers/fireflies/bees,
+  and BGRocky can generate rock1/rock2/flint. Identical ground tiles need not share
+  resources. Priors are possible initial spawns, not guarantees, current stock or
+  normalized probabilities. Layouts, functions and setting-dependent spawns may
+  be missing from the extracted table. Actual observations always take precedence.
+- A torch is portable light. A campfire or fire pit is stationary and does not
+  light the route away from it. Secure light before darkness.
+- Torch fuel is consumed while equipped. The native executor automatically unequips
+  a torch auto-equipped by crafting during day or dusk, but keeps it at night.
+- Judge portable-light reserves by remaining fuel and expected use, not count
+  alone. inventory_details.items and inventory_details.equipped retain each
+  item's durability_percent: for torches this is remaining fuel in [0,1], not a
+  percentage in [0,100]. Missing fuel is unknown; do not assume full or empty.
+  A nearly empty torch and a full torch are not equivalent reserves. Include
+  both backpack and equipped torches without counting the equipped one twice.
+- Local scripts/tuning.lua defines TORCH_FUEL = night_time * 1.25 with a base
+  night_time of 2 * 30 seconds: a full torch has 75 base seconds of fuel.
+  This is a reference, NOT guaranteed coverage of the current world's night.
+  Rain increases torch drain; skills and other modifiers can change consumption.
+  Seasons and world settings can change night length. Current telemetry gives
+  phase/progress, not actual phase durations, weather, or active fuel modifiers;
+  do not invent an exact remaining-night or effective-fuel duration from it.
+- lighting.torch_equipped reports portable light in the hand. Each entry in
+  lighting.observed_fires reports a campfire/firepit's observed distance and
+  lit status (from the fire tag); null means unreported. A structure's presence
+  alone does not mean it is burning. Remaining fire fuel/burn time is unknown.
+  Lua uses an 8-unit nearby-lit-fire rule for torch switching, not a
+  guarantee of safe illumination everywhere within that radius or all night.
+- Reserve targets must correspond to a concrete expected shortage. Consider
+  remaining torch fuel, stationary light, intended night travel, and the cost of
+  consuming grass/twigs needed for other tasks. If current reserves cover the
+  intended use with a justified margin, work on another unmet need. A completed
+  target or new quarter is not a reason to turn 1 torch into 2, then 3, then 4.
+  Extra crafting is allowed when needed, not a standing goal to maximize stock.
+  No fixed torch-count cap applies: low fuel, changed conditions, or a longer
+  trip can justify more, but state that reason using observed facts/uncertainty.
+- Chopping and mining actions include bounded pickup near the completed target.
+  Trees may yield logs and seeds (such as pinecones or acorns); mined rocks may
+  yield rocks, flint, nitre, or gold, depending on the target.
+- Source feasibility depends on prerequisites: without a usable pickaxe, a rock
+  that can drop flint is NOT an executable way to get the flint needed to make
+  that pickaxe. Seek loose flint or another obtainable source instead. A recipe
+  being available does not mean its tool exists. Tools need enough remaining
+  uses for a whole work target. Standard rock1 gives rocks/flint/nitre, not gold;
+  rock2 is the standard gold-bearing boulder. Neither can be mined without a
+  usable pickaxe. Loose gold/flint pickups do not require mining tools.
+- A past resources_seen record is not proof of a currently obtainable source.
+  The executor remembers failed region/product surveys instead of retrying an
+  unchanged record after a timer. New obtainable-source evidence can restore
+  its priority; an entrance, temporary hazard or path failure is not a complete
+  survey. A need that persists does not itself make a failed source valid again.
+- The eat_safe_food action can cook carried raw food at a nearby lit cooker and
+  then eat it when needed. Do not plan a separate cook action solely for that.
+- Exploration uses the game's topology IDs as region identity; ground tiles
+  supply terrain/resource hints, not region boundaries. One topology region can
+  contain mixed tiles; distinct regions can share a biome and get numbered names.
+  explore_current_region searches locally. explore_other_region searches for
+  NEW exits with a persistent outward heading and safe obstacle bypassing, not
+  road following. Already discovering a neighbor does not disable new-exit
+  search; completely observing the current boundary does.
+- travel_region_<observed index> goes to a known graph node, whether newly
+  discovered or previously visited; there is no separate return action. Use
+  observed node_id values in visit_region or survey_region targets. Paths use verified passable
+  gateways; the reported next-exit distance is not the final travel distance.
+  Resources_seen are past observations, not guaranteed current stock. Terrain
+  hints are only priors. No current action depends on following roads.
+- Exploration and region travel are selected by the executor, not JEV. It uses
+  priority goals, remembered source positions, known source-room records/BFS hops,
+  Klei generation priors, and depth-first unknown-branch traversal with backtracking.
+  JEV selects safety responses and worthwhile off-board opportunities; it is not
+  asked about every plant or short movement leg.
+  These are navigation policies, not a complete acquisition/tool-dependency solver.
+- Exploration continues across short movement legs without requesting JEV
+  after every leg. Ordinary resource events compare the SET of collectible,
+  reachable product types, not entity GUIDs or counts: more grass alone is not
+  a new type. Yield only while that set differs and displacement from execution
+  start is at least 4 units. Threats, unsafe lighting, phase/region changes, and
+  navigation failures can interrupt earlier; the 4-unit rule is not a safety delay.
+- Oasis and ordinary desert share desert ground cues; do not infer an oasis
+  without additional evidence. Prioritize resources actually observed nearby.
+- Terrain is only a search hint: forest often has trees and saplings; grassland
+  often has grass and saplings; savanna often has grass and may have beefalo;
+  rocky ground often has rocks and flint; swamp can contain reeds and hostile
+  creatures. World generation varies, so never assume an unseen resource is
+  present or safe to reach. For a needed material, prefer a biome likely to
+  contain it, then verify via the live nearby-entity observations.
+- PotentialThreat means a nearby hostile may attack on approach even while it
+  is not actively chasing. Avoid revisiting a recently observed enemy location
+  after fleeing; navigation remembers it briefly and filters unsafe legs.
+- Prefer feasible resource prerequisites and immediate survival over an invented
+  objective. A planned recipe is not necessarily currently craftable.

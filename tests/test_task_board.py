@@ -7,14 +7,12 @@ from pathlib import Path
 from concurrent.futures import Future
 from unittest.mock import Mock, patch
 
-import daily_planner
-import jev_agent
-import decision_prefetch
-from action_buffer import predict_success
-from task_board import (validate_board, board_view, format_board,
+from mcp_agent import daily_planner
+from mcp_agent import jev_client as jev_agent
+from common import game_rules as rules
+from common.task_board import (validate_board, board_view, format_board,
                         INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
-from test_prefetch import ControlledExecutor
-from test_regressions import state, grass
+from fixtures import state, grass
 
 
 def raw_board():
@@ -192,11 +190,12 @@ class BoardTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError): validate_board(raw, 1)
 
     def test_inventory_catalog_covers_current_collection_work_and_food_products(self):
-        products = {jev_agent.controller.COLLECT_PRODUCTS.get(name, name)
-                    for name in jev_agent.SAFE_COLLECT_PREFABS if name != "carrot_planted"} | {"carrot"}
-        products |= set().union(*jev_agent.controller.WORK_DROP_PREFABS.values())
-        products |= set(jev_agent.controller.SAFE_FOOD_PREFABS)
-        products |= set(jev_agent.controller.RAW_COOKABLE_FOOD_PREFABS)
+        products = set(rules.COLLECT_PRODUCTS.values()) | {"carrot"}
+        products |= set().union(*rules.MINE_PRODUCTS.values())
+        products |= {"log", "pinecone", "acorn", "charcoal", "livinglog", "marble", "moonrocknugget",
+                     "ice", "redgem", "bluegem", "purplegem", "thulecite", "thulecite_pieces"}
+        products |= set(rules.SAFE_FOOD_PREFABS)
+        products |= set(rules.RAW_COOKABLE_FOOD_PREFABS)
         products |= {"torch", "axe", "pickaxe"}
         self.assertTrue(products <= INVENTORY_TARGET_PREFABS, products - INVENTORY_TARGET_PREFABS)
 
@@ -224,18 +223,6 @@ class BoardTests(unittest.TestCase):
         actual["navigation"]["graph"] = {"current_node": "forest"}
         self.assertTrue(all(t["status"] == "done" for t in board_view(board, actual)["tasks"]))
 
-    def test_predicted_board_progress_is_not_written_into_observed_board(self):
-        board = validate_board(raw_board(), 1)
-        before = state([grass(22, 0.8, True)], cutgrass=3)
-        original = copy.deepcopy(board)
-        projected = predict_success(before, {"kind": "collect", "prefab": "grass", "guid": 22})
-        predicted = jev_agent.compact_game_state(projected, board)["task_board"]
-        actual = jev_agent.compact_game_state(before, board)["task_board"]
-        self.assertEqual(predicted["state_basis"], "predicted_success")
-        self.assertEqual(predicted["tasks"][0]["status"], "done")
-        self.assertEqual(actual["state_basis"], "observed")
-        self.assertEqual(actual["tasks"][0]["status"], "in_progress")
-        self.assertEqual(board, original)
 
     def test_expired_board_has_no_ready_tasks(self):
         board = validate_board(raw_board(), 1)
@@ -286,21 +273,22 @@ class BoardTests(unittest.TestCase):
         self.assertNotIn("daily_plan", supplied)
         self.assertEqual(body["questions"]["next_action"]["criteria"], {"wait": "Wait"})
 
-    def test_deepseek_is_prompted_for_structured_tasks(self):
+    def test_deepseek_is_prompted_for_interleaved_priority_goals(self):
         class Response:
             def __enter__(self): return self
             def __exit__(self, *_args): return False
             def read(self):
                 return json.dumps({"choices": [{"finish_reason": "stop", "message": {
-                    "content": json.dumps(raw_board())}}]}).encode()
+                    "content": json.dumps({"goal":"Gather","tasks":[
+                        {"id":"grass","title":"Grass","target":{"type":"inventory","prefab":"cutgrass","count":4}}]})}}]}).encode()
         with patch.object(daily_planner.urllib.request, "urlopen", return_value=Response()) as send:
             board = daily_planner.request_plan("https://example.invalid", "secret", "test", 1, {})
-        self.assertEqual(board["kind"], "task_board")
+        self.assertEqual(board["execution_policy"], "priority_goals")
         prompt = json.loads(send.call_args.args[0].data)["messages"][0]["content"]
         self.assertIn('"tasks"', prompt)
-        self.assertIn("do not select or force", prompt)
-        self.assertIn("automatically advances locally executable tasks", prompt)
-        self.assertIn("logs must be log", prompt)
+        self.assertIn("interleaved order", prompt)
+        self.assertIn("not each plant", prompt)
+        self.assertIn("log not logs", prompt)
 
     def test_unknown_inventory_target_retries_then_normalizes_known_alias(self):
         class Response:
@@ -308,8 +296,7 @@ class BoardTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *_args): return False
             def read(self):
-                raw = raw_board()
-                raw["tasks"][0]["target"]["prefab"] = self.prefab
+                raw = {"goal":"Get logs","tasks":[{"id":"logs","title":"Logs","target":{"type":"inventory","prefab":self.prefab,"count":4}}]}
                 return json.dumps({"choices": [{"finish_reason": "stop", "message": {
                     "content": json.dumps(raw)}}]}).encode()
         with patch.object(daily_planner.urllib.request, "urlopen",
@@ -327,15 +314,6 @@ class BoardTests(unittest.TestCase):
         self.assertIn("log", capabilities["inventory_target_prefabs"])
         self.assertNotIn("logs", capabilities["inventory_target_prefabs"])
 
-    def test_old_board_prefetch_is_discarded_when_board_changes(self):
-        with patch.object(decision_prefetch, "ThreadPoolExecutor", ControlledExecutor):
-            worker = decision_prefetch.DecisionPrefetch(Mock())
-        self.addCleanup(worker.close)
-        old = {"kind": "task_board", "board_id": "old"}
-        worker.submit(state([]), {"wait": "Wait"}, {"wait": {"kind": "wait"}}, old)
-        self.assertIsNone(worker.take(state([]), {"wait": {"kind": "wait"}},
-                                      plan={"kind": "task_board", "board_id": "new"}))
-        self.assertTrue(worker.abandoned)
 
     def test_verified_science_machine_fact_completes_task_even_after_leaving_it(self):
         raw = {"goal": "Research", "tasks": [{"id": "science", "title": "Build science machine",

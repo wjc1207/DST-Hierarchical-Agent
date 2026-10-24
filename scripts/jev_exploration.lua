@@ -175,6 +175,7 @@ function M.destinations(memory, current_id, immediate)
             table.sort(resources)
             table.insert(result, {
                 status = "ready", node_id = entry.id, name = node.name,
+                topology = node.region, room_type = string.match(node.region or entry.id,"([^:]+)$"),
                 biome = node.biome, terrain = node.terrain,
                 explored_area = node.explored_area, observed_cells = node.observed_cells,
                 boundary_complete = node.boundary_complete,

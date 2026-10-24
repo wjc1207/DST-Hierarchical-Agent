@@ -1,0 +1,994 @@
+{
+  "schema": 1,
+  "meaning": "possible initial prefabs, NOT guarantees or probabilities; layouts/functions/settings omitted",
+  "source_sha256": {
+    "scripts/map/rooms/forest/DLCrooms.lua": "4a0cbbe77be55ad1bc236a38b42d901991d143ee0b5cb69515908071d6944903",
+    "scripts/map/rooms/forest/bee.lua": "ddb93cd49c94c6ddf127e2ee70586e76ea6d29196f8ef6cfbca85b3cae17b44d",
+    "scripts/map/rooms/forest/beefalo.lua": "c7d7d98d9ec9835452bf240b8927aa7f226f1434abb0dc21f472e45b862aa209",
+    "scripts/map/rooms/forest/blockers.lua": "3d561bcf4ecbd30db4c347826dd2908ff85499a60b5e61d6fc50251e2baf2132",
+    "scripts/map/rooms/forest/chess.lua": "6ebb9106fd74d1bec7e7604cf13adbf7e10953dc8e83218c246fe54c1502bc46",
+    "scripts/map/rooms/forest/giants.lua": "a453f4a331bf56cb423a1a02bf48c852130a1b980b3a1daaf2210f04b6e4bd67",
+    "scripts/map/rooms/forest/graveyard.lua": "6ef0c666c5d92a79832e44a48f2c10524ed6060c3a29653dfd354723bfd7003a",
+    "scripts/map/rooms/forest/mandrake.lua": "0b4ec9b7989f5b86899e06b9d4247d80e051329ca164e1b351f55ffbeedf5f3e",
+    "scripts/map/rooms/forest/merms.lua": "bd7ed5739f2959394fa2396cd19a9200cfaec968d8d21800ce8152ec66ddbfc1",
+    "scripts/map/rooms/forest/pigs.lua": "b7f242dafda6d596b40de13b0ce2e0f32293870accdba28b73b177f86a0a09cf",
+    "scripts/map/rooms/forest/spider.lua": "0ebe2e4a4087aa91452a14f4c7b29a120fb68146a30ca037a77484600e115f6d",
+    "scripts/map/rooms/forest/starts.lua": "0bfbeaf4be9d265337b7bf50ae5850622398a942d047518c5fea6a7d7ecbce7e",
+    "scripts/map/rooms/forest/tallbird.lua": "33aa0bb5fffd14dd185c0183c6d69ef5c1bab99b6b51cf2d74abc3d35e098125",
+    "scripts/map/rooms/forest/terrain_dirt.lua": "c682e1ce3da41e31f65513a1d4d0653e106bee5a7a426e843b6af7b75047501e",
+    "scripts/map/rooms/forest/terrain_forest.lua": "fe120a60e41b0412345ecdbdf06b9ca955456a98291f6542382661f171a9f019",
+    "scripts/map/rooms/forest/terrain_grass.lua": "56f537cb1e4c5b93a11d8c937640927a4b6439dcdd1ba594321c56ca5994a3d1",
+    "scripts/map/rooms/forest/terrain_impassable.lua": "1b7ac9cb4bcea1de4bb0f4ac97728d578de32d364976a559e2fe498e37e19d1a",
+    "scripts/map/rooms/forest/terrain_marsh.lua": "6880bf9c9aaa4b4aed3af833162d447850ce19cdbfce02c0645beb40e17e927c",
+    "scripts/map/rooms/forest/terrain_moonisland.lua": "319d879e67057544a32f0ec72712a095af9a4209cea8e671d18777341d46b4a0",
+    "scripts/map/rooms/forest/terrain_noise.lua": "5ad419cde4e8d0736023e59096ac597f64b44f5642cf8a1b5713cd70b2aa9128",
+    "scripts/map/rooms/forest/terrain_ocean.lua": "acdddf3aa8fc1a4a22f2baa41a273889b198de256ceabd3181f33a63843733d8",
+    "scripts/map/rooms/forest/terrain_rocky.lua": "3cf1a7cbd0cca54c4cc3d3b088dbe72ed3e856d072256c7388be837383f93ce7",
+    "scripts/map/rooms/forest/terrain_savanna.lua": "8a16c972d5f1e79152bbab3f168d157b091f9296e8744fb85f28eef60d1e7413",
+    "scripts/map/rooms/forest/walrus.lua": "640309bd9112aceed2fddf243cb317d8cfc595a4b5f2d2dc75bddcd241ab3b99",
+    "scripts/map/rooms/forest/wormhole.lua": "06b7179a4c69e3f3a02cdbdff580ade0383266f94baa48f94cedcad6681cec91"
+  },
+  "rooms": {
+    "BGBadlands": [
+      "cactus",
+      "grass",
+      "grassgekko",
+      "houndbone",
+      "marsh_bush",
+      "marsh_tree",
+      "rock_flintless",
+      "tumbleweedspawner"
+    ],
+    "BGChessRocky": [
+      "flint",
+      "rock1",
+      "rock2",
+      "tallbirdnest"
+    ],
+    "BGCrappyForest": [
+      "evergreen_sparse",
+      "flower",
+      "grass",
+      "gravestone",
+      "green_mushroom",
+      "ground_twigs",
+      "pighouse",
+      "pond",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "BGDeciduous": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "carrot_planted",
+      "catcoonden",
+      "deciduoustree",
+      "deerspawningground",
+      "fireflies",
+      "flower",
+      "grass",
+      "green_mushroom",
+      "pighouse",
+      "pond",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "sapling",
+      "twiggytree"
+    ],
+    "BGDeepForest": [
+      "blue_mushroom",
+      "evergreen",
+      "fireflies",
+      "green_mushroom",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "spiderden"
+    ],
+    "BGDirt": [
+      "rock1",
+      "rock2",
+      "rock_ice"
+    ],
+    "BGForest": [
+      "berrybush",
+      "berrybush_juicy",
+      "evergreen",
+      "flower",
+      "grass",
+      "gravestone",
+      "green_mushroom",
+      "ground_twigs",
+      "pighouse",
+      "pond",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "BGGrass": [
+      "beehive",
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "carrot_planted",
+      "deciduoustree",
+      "evergreen",
+      "flint",
+      "flower",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "molehill",
+      "pond",
+      "rabbithole",
+      "red_mushroom",
+      "sapling",
+      "spawnpoint_multiplayer",
+      "spiderden",
+      "twiggytree"
+    ],
+    "BGGrassBurnt": [
+      "beehive",
+      "evergreen",
+      "flint",
+      "flower",
+      "grass",
+      "ground_twigs",
+      "molehill",
+      "rabbithole",
+      "rock1",
+      "rock2",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "BGImpassable": [],
+    "BGImpassableRock": [],
+    "BGLightningBluff": [
+      "buzzardspawner",
+      "houndbone",
+      "marsh_bush",
+      "oasis_cactus",
+      "rock_flintless"
+    ],
+    "BGMarsh": [
+      "blue_mushroom",
+      "ground_twigs",
+      "marsh_bush",
+      "marsh_tree",
+      "mermhouse",
+      "pond_mos",
+      "reeds",
+      "sapling",
+      "spiderden",
+      "tentacle",
+      "twiggytree"
+    ],
+    "BGNoise": [
+      "beehive",
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "deerspawningground",
+      "evergreen",
+      "flint",
+      "flower",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "molehill",
+      "pond",
+      "rabbithole",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "rocks",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "BGRocky": [
+      "flint",
+      "grassgekko",
+      "rock1",
+      "rock2",
+      "rock_ice",
+      "tallbirdnest"
+    ],
+    "BGSavanna": [
+      "flower",
+      "perma_grass",
+      "rabbithole",
+      "spiderden"
+    ],
+    "Badlands": [
+      "cactus",
+      "grass",
+      "grassgekko",
+      "houndbone",
+      "marsh_bush",
+      "marsh_tree",
+      "rock_flintless",
+      "tumbleweedspawner"
+    ],
+    "BarePlain": [
+      "perma_grass",
+      "rabbithole"
+    ],
+    "BeeClearing": [
+      "beehive",
+      "fireflies",
+      "flower"
+    ],
+    "BeeQueenBee": [
+      "beehive",
+      "beequeenhive",
+      "berrybush",
+      "berrybush_juicy",
+      "flower",
+      "sapling"
+    ],
+    "BeefalowPlain": [
+      "beefalo",
+      "grass"
+    ],
+    "BurntClearing": [
+      "evergreen",
+      "grass",
+      "ground_twigs",
+      "sapling",
+      "twiggytree"
+    ],
+    "BurntForest": [],
+    "BurntForestStart": [
+      "charcoal",
+      "firepit"
+    ],
+    "BuzzardyBadlands": [
+      "buzzardspawner",
+      "grass",
+      "grassgekko",
+      "houndbone",
+      "marsh_bush",
+      "marsh_tree",
+      "tumbleweedspawner"
+    ],
+    "ChessArea": [
+      "bishop",
+      "flower_evil",
+      "knight",
+      "marblepillar",
+      "marbletree",
+      "rook"
+    ],
+    "ChessBarrens": [
+      "flint",
+      "rock1",
+      "rock2",
+      "tallbirdnest"
+    ],
+    "ChessForest": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "evergreen_sparse",
+      "flower",
+      "grass",
+      "gravestone",
+      "green_mushroom",
+      "pighouse",
+      "pond",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "ChessMarsh": [
+      "marsh_bush",
+      "marsh_tree",
+      "pond_mos",
+      "tentacle"
+    ],
+    "Chessfield": [
+      "bishop",
+      "flower_evil",
+      "knight",
+      "marblepillar",
+      "marbletree",
+      "rook"
+    ],
+    "Clearing": [
+      "beehive",
+      "berrybush",
+      "berrybush_juicy",
+      "evergreen",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "pighouse",
+      "red_mushroom",
+      "sapling",
+      "spawnpoint_multiplayer",
+      "twiggytree"
+    ],
+    "CrappyDeepForest": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "evergreen_sparse",
+      "fireflies",
+      "grass",
+      "ground_twigs",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "CrappyForest": [
+      "berrybush",
+      "berrybush_juicy",
+      "evergreen_sparse",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "molehill",
+      "red_mushroom",
+      "rock1",
+      "sapling",
+      "spawnpoint_multiplayer",
+      "twiggytree"
+    ],
+    "CritterDen": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "critterlab",
+      "evergreen",
+      "evergreen_sparse",
+      "fireflies",
+      "flint",
+      "grass",
+      "grassgekko",
+      "green_mushroom",
+      "ground_twigs",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "sapling",
+      "twiggytree"
+    ],
+    "DeciduousClearing": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "deciduoustree",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "red_mushroom",
+      "sapling",
+      "twiggytree"
+    ],
+    "DeciduousMole": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "catcoonden",
+      "deciduoustree",
+      "fireflies",
+      "flint",
+      "grass",
+      "green_mushroom",
+      "molehill",
+      "red_mushroom",
+      "rock1",
+      "rocks",
+      "sapling",
+      "twiggytree"
+    ],
+    "DeepDeciduous": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "catcoonden",
+      "deciduoustree",
+      "deerspawningground",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "red_mushroom",
+      "sapling",
+      "twiggytree"
+    ],
+    "DeepForest": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "evergreen",
+      "evergreen_sparse",
+      "fireflies",
+      "grass",
+      "ground_twigs",
+      "sapling",
+      "twiggytree"
+    ],
+    "Deerclopsfield": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "deerclops",
+      "evergreen",
+      "flower",
+      "grass",
+      "gravestone",
+      "green_mushroom",
+      "pighouse",
+      "pond",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "DragonflyArena": [
+      "cactus",
+      "houndbone",
+      "marsh_bush",
+      "marsh_tree",
+      "rock_flintless"
+    ],
+    "Empty_Cove": [],
+    "EvilFlowerPatch": [
+      "fireflies",
+      "flower_evil",
+      "wasphive"
+    ],
+    "FlowerPatch": [
+      "beehive",
+      "fireflies",
+      "flower"
+    ],
+    "ForceDisconnectedRoom": [],
+    "Forest": [
+      "berrybush",
+      "berrybush_juicy",
+      "evergreen",
+      "evergreen_sparse",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "red_mushroom",
+      "rock1",
+      "sapling",
+      "spawnpoint_multiplayer",
+      "twiggytree"
+    ],
+    "ForestMole": [
+      "berrybush",
+      "berrybush_juicy",
+      "evergreen",
+      "evergreen_sparse",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "molehill",
+      "red_mushroom",
+      "rock1",
+      "sapling",
+      "twiggytree"
+    ],
+    "GenericRockyNoThreat": [
+      "blue_mushroom",
+      "flint",
+      "grassgekko",
+      "green_mushroom",
+      "red_mushroom",
+      "rock1",
+      "rock2",
+      "rock_ice",
+      "rocks"
+    ],
+    "GrassyMoleColony": [
+      "flint",
+      "flower",
+      "molehill",
+      "rocks"
+    ],
+    "GrassySinkhole": [
+      "cave_entrance",
+      "deciduoustree",
+      "grass",
+      "rocks",
+      "sapling",
+      "twiggytree"
+    ],
+    "Graveyard": [
+      "evergreen"
+    ],
+    "HoundyBadlands": [
+      "houndbone",
+      "houndmound",
+      "rock1",
+      "rock2"
+    ],
+    "Lightning": [
+      "cactus",
+      "grass",
+      "grassgekko",
+      "lightninggoat",
+      "marsh_bush",
+      "tumbleweedspawner"
+    ],
+    "LightningBluffAntlion": [
+      "houndbone",
+      "marsh_bush",
+      "oasis_cactus"
+    ],
+    "LightningBluffLightning": [
+      "marsh_bush",
+      "oasis_cactus"
+    ],
+    "LightningBluffOasis": [
+      "buzzardspawner",
+      "houndbone",
+      "marsh_bush",
+      "oasis_cactus"
+    ],
+    "MagicalDeciduous": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "catcoonden",
+      "fireflies",
+      "flower",
+      "grass",
+      "green_mushroom",
+      "molehill",
+      "red_mushroom",
+      "sapling",
+      "twiggytree"
+    ],
+    "MandrakeHome": [
+      "berrybush",
+      "berrybush_juicy",
+      "evergreen",
+      "fireflies",
+      "flower",
+      "grass",
+      "mandrake_planted",
+      "sapling",
+      "twiggytree"
+    ],
+    "MarbleForest": [
+      "bishop",
+      "flower_evil",
+      "knight",
+      "marblepillar",
+      "marbletree",
+      "rook"
+    ],
+    "Marsh": [
+      "blue_mushroom",
+      "evergreen",
+      "green_mushroom",
+      "pond_mos",
+      "reeds",
+      "spiderden",
+      "tentacle"
+    ],
+    "MermTown": [
+      "mermhouse",
+      "pond_mos",
+      "reeds",
+      "tentacle"
+    ],
+    "Mermfield": [
+      "marsh_bush",
+      "mermhouse",
+      "pond_mos",
+      "reeds"
+    ],
+    "Minefield": [
+      "beemine_maxwell",
+      "marsh_tree"
+    ],
+    "MolesvilleDeciduous": [
+      "berrybush",
+      "berrybush_juicy",
+      "blue_mushroom",
+      "deciduoustree",
+      "fireflies",
+      "flint",
+      "grass",
+      "green_mushroom",
+      "molehill",
+      "red_mushroom",
+      "rocks",
+      "sapling",
+      "twiggytree"
+    ],
+    "MolesvilleRocky": [
+      "flint",
+      "grass",
+      "grassgekko",
+      "marsh_bush",
+      "molehill",
+      "rock1",
+      "rock2",
+      "rock_ice",
+      "rocks"
+    ],
+    "MoonIsland_Baths": [
+      "carrat_planted",
+      "moon_fissure",
+      "moon_tree",
+      "moonglass_rock",
+      "rock_avocado_bush",
+      "sapling_moon"
+    ],
+    "MoonIsland_Beach": [
+      "bullkelp_beachedroot",
+      "dead_sea_bones",
+      "driftwood_small1",
+      "driftwood_small2",
+      "driftwood_tall",
+      "flint",
+      "lunar_island_rock1",
+      "lunar_island_rocks",
+      "moonspiderden",
+      "reeds",
+      "trap_starfish",
+      "twigs"
+    ],
+    "MoonIsland_Blank": [],
+    "MoonIsland_Forest": [
+      "carrat_planted",
+      "ground_twigs",
+      "moon_fissure",
+      "moon_tree",
+      "moon_tree_blossom_worldgen",
+      "moonglass_rock",
+      "rock_avocado_bush",
+      "sapling_moon"
+    ],
+    "MoonIsland_IslandShard": [
+      "bullkelp_beachedroot",
+      "dead_sea_bones",
+      "driftwood_log",
+      "driftwood_small1",
+      "driftwood_small2",
+      "flint",
+      "lunar_island_rocks",
+      "moon_fissure",
+      "moonglass",
+      "moonglass_rock",
+      "reeds",
+      "trap_starfish",
+      "twigs"
+    ],
+    "MoonIsland_Meadows": [
+      "carrat_planted",
+      "ground_twigs",
+      "moon_fissure",
+      "moon_tree",
+      "moon_tree_blossom_worldgen",
+      "moonglass_rock",
+      "rock_avocado_bush",
+      "sapling_moon",
+      "twigs"
+    ],
+    "MoonIsland_Mine": [
+      "flint",
+      "lunar_island_rock1",
+      "lunar_island_rock2",
+      "lunar_island_rocks",
+      "moon_fissure",
+      "moonglass",
+      "moonglass_rock",
+      "moonrocknugget",
+      "rock_moon"
+    ],
+    "MoonbaseOne": [
+      "berrybush_juicy",
+      "blue_mushroom",
+      "evergreen",
+      "fireflies",
+      "grass",
+      "green_mushroom",
+      "ground_twigs",
+      "sapling",
+      "twiggytree"
+    ],
+    "MooseGooseBreedingGrounds": [
+      "berrybush",
+      "berrybush_juicy",
+      "carrot_planted",
+      "evergreen",
+      "flint",
+      "flower",
+      "grass",
+      "moose_nesting_ground",
+      "pond",
+      "sapling",
+      "twiggytree"
+    ],
+    "Moundfield": [
+      "houndbone",
+      "houndmound",
+      "marsh_bush",
+      "marsh_tree",
+      "rock1",
+      "rock2",
+      "rocks"
+    ],
+    "Nothing": [],
+    "OceanCoastal": [
+      "boat_otterden",
+      "bullkelp_plant",
+      "driftwood_log",
+      "messagebottle"
+    ],
+    "OceanCoastalShore": [
+      "wobster_den_spawner_shore"
+    ],
+    "OceanHazardous": [
+      "boatfragment03",
+      "boatfragment04",
+      "boatfragment05",
+      "seastack"
+    ],
+    "OceanReef": [],
+    "OceanRough": [
+      "seastack",
+      "seastack_spawner_rough",
+      "waterplant_spawner_rough"
+    ],
+    "OceanSwell": [
+      "oceanfish_shoalspawner",
+      "seastack",
+      "seastack_spawner_swell"
+    ],
+    "PigCamp": [
+      "berrybush",
+      "berrybush_juicy",
+      "grass",
+      "poop",
+      "wall_hay"
+    ],
+    "PigCity": [],
+    "PigKingdom": [],
+    "PigShrine": [
+      "evergreen_normal",
+      "evergreen_tall"
+    ],
+    "PigTown": [
+      "berrybush",
+      "berrybush_juicy",
+      "grass",
+      "spawnpoint_multiplayer"
+    ],
+    "PigVillage": [
+      "berrybush",
+      "berrybush_juicy",
+      "grass"
+    ],
+    "Plain": [
+      "green_mushroom",
+      "perma_grass",
+      "rabbithole",
+      "rock1"
+    ],
+    "Pondopolis": [
+      "flower",
+      "grass",
+      "sapling",
+      "twiggytree"
+    ],
+    "PondyGrass": [
+      "berrybush",
+      "berrybush_juicy",
+      "catcoonden",
+      "deciduoustree",
+      "fireflies",
+      "grass",
+      "pond",
+      "sapling",
+      "twiggytree"
+    ],
+    "Rocky": [
+      "blue_mushroom",
+      "grassgekko",
+      "rock1",
+      "rock2",
+      "rock_ice",
+      "spiderden",
+      "tallbirdnest"
+    ],
+    "RockyBuzzards": [
+      "blue_mushroom",
+      "buzzardspawner",
+      "rock1",
+      "rock2"
+    ],
+    "SafeSwamp": [
+      "marsh_bush",
+      "marsh_tree"
+    ],
+    "SanityWormholeBlocker": [],
+    "Sinkhole": [
+      "cave_entrance",
+      "evergreen_normal",
+      "evergreen_short",
+      "evergreen_tall",
+      "grass",
+      "rocks",
+      "sapling",
+      "twiggytree"
+    ],
+    "SlightlyMermySwamp": [
+      "marsh_bush",
+      "marsh_tree",
+      "mermhouse",
+      "pighead",
+      "tentacle"
+    ],
+    "SpiderCity": [
+      "evergreen_sparse",
+      "spiderden"
+    ],
+    "SpiderCon": [
+      "marsh_bush",
+      "marsh_tree",
+      "spider",
+      "spider_warrior"
+    ],
+    "SpiderForest": [
+      "evergreen_sparse",
+      "ground_twigs",
+      "rock1",
+      "sapling",
+      "spiderden",
+      "twiggytree"
+    ],
+    "SpiderMarsh": [
+      "blue_mushroom",
+      "evergreen",
+      "pond_mos",
+      "reeds",
+      "spiderden",
+      "tentacle"
+    ],
+    "SpiderVillage": [
+      "rock1",
+      "rock2",
+      "rocks"
+    ],
+    "SpiderVillageSwamp": [
+      "marsh_bush",
+      "marsh_tree"
+    ],
+    "Spiderfield": [
+      "evergreen_sparse",
+      "spiderden"
+    ],
+    "SpiderfieldEasy": [
+      "evergreen_sparse",
+      "spiderden"
+    ],
+    "TallbirdNests": [
+      "blue_mushroom",
+      "rock1",
+      "rock2",
+      "rock_ice",
+      "spiderden",
+      "tallbirdnest"
+    ],
+    "Tallbirdfield": [
+      "rock1",
+      "rock2",
+      "tallbirdnest"
+    ],
+    "Tentacleland": [
+      "marsh_bush",
+      "marsh_tree",
+      "pond_mos",
+      "reeds",
+      "tentacle"
+    ],
+    "Trapfield": [
+      "homesign",
+      "houndbone",
+      "trap_teeth_maxwell"
+    ],
+    "TrappedForest": [
+      "evergreen_sparse",
+      "trap_teeth_maxwell"
+    ],
+    "WalrusHut_Grassy": [
+      "carrot_planted",
+      "evergreen",
+      "flint",
+      "flower",
+      "grass",
+      "pond",
+      "sapling",
+      "twiggytree",
+      "walrus_camp"
+    ],
+    "WalrusHut_Plains": [
+      "flower",
+      "grass",
+      "walrus_camp"
+    ],
+    "WalrusHut_Rocky": [
+      "flint",
+      "rock1",
+      "rock2",
+      "tallbirdnest",
+      "walrus_camp"
+    ],
+    "Walrusfield": [
+      "carrot_planted",
+      "evergreen",
+      "flint",
+      "flower",
+      "grass",
+      "pond",
+      "sapling",
+      "twiggytree",
+      "walrus_camp"
+    ],
+    "Waspnests": [
+      "beehive",
+      "flower",
+      "grass",
+      "wasphive"
+    ],
+    "Wormhole": [
+      "evergreen_normal",
+      "evergreen_short",
+      "evergreen_tall",
+      "grass",
+      "rocks",
+      "sapling",
+      "twiggytree",
+      "wormhole_MARKER"
+    ],
+    "Wormhole_Burnt": [
+      "evergreen",
+      "grass",
+      "rocks",
+      "sapling",
+      "twiggytree",
+      "wormhole_MARKER"
+    ],
+    "Wormhole_Plains": [
+      "grass",
+      "rock1",
+      "rock2",
+      "rocks",
+      "wormhole_MARKER"
+    ],
+    "Wormhole_Swamp": [
+      "marsh_bush",
+      "marsh_tree",
+      "rocks",
+      "wormhole_MARKER"
+    ]
+  }
+}

@@ -228,8 +228,9 @@ test("trajectory loops pause the old frontier instead of bouncing forever", func
     assert(m.searches.A.pauses["12:0"] == 31)
 end)
 
-local function simulated_mod(passable, topology, terrain, entities)
+local function simulated_mod(passable, topology, terrain, entities, bridge_config)
     local handlers, captured, errors = {}, nil, {}
+    local sim_init
     local x,z,now=0,0,0
     local ground={FOREST=1,GRASS=2,SAVANNA=3,MARSH=4,ROCKY=5,DECIDUOUS=6,DESERT_DIRT=7,DIRT=8}
     local map={
@@ -241,22 +242,31 @@ local function simulated_mod(passable, topology, terrain, entities)
         Transform={GetWorldPosition=function() return x,0,z end}}
     local G=setmetatable({GROUND=ground,ThePlayer=player,TheWorld={Map=map,state={phase="day"}},
         TheSim={FindEntities=function() return entities or {} end},
-        TheInput={AddKeyUpHandler=function(_,name,fn) handlers[name]=fn end},
         GetTime=function() return now end,
+        GetTimeRealSeconds=bridge_config and bridge_config.measurement_clock,
         ConvertTopologyIdToData=function(id) return {task_id=id} end,
     },{__index=function(_,k)
         if string.sub(k,1,4) == "KEY_" then return k end
         return _G[k]
     end})
     local env=setmetatable({GLOBAL=G,GetModConfigData=function() return nil end,
-        AddPlayerPostInit=function() end,AddSimPostInit=function() end,
+        AddPlayerPostInit=function() end,AddSimPostInit=function(fn) sim_init=fn end,
         require=function(name)
-            if name == "json" then return {encode=function(value) captured=value; return "{}" end} end
+            if name == "json" then return {encode=function(value) captured=value; return "{}" end,
+                decode=function() return bridge_config and bridge_config.reply end} end
+            if name == "jev_bridge_config" and bridge_config then return bridge_config end
             return require(name)
         end,
         print=function(value) table.insert(errors,value) end,
     },{__index=_G})
-    assert(loadfile("modmain.lua","t",env))()
+    local native=assert(loadfile("modmain.lua","t",env))()
+    -- Test-only aliases preserve existing native-action scenarios, not key events.
+    handlers={KEY_F2=native.emit_state,KEY_F4=native.cancel,
+        KEY_KP_MULTIPLY=native.craft_torch,KEY_KP_DIVIDE=native.equip_torch,
+        KEY_KP_MINUS=native.unequip_torch,KEY_KP_PLUS=native.craft_axe,KEY_KP_PERIOD=native.craft_pickaxe,
+        KEY_F6=native.build_campfire,KEY_F7=native.eat_safe_food,KEY_F8=native.chop,KEY_F9=native.mine,
+        KEY_F10=native.attack,KEY_F11=native.equip_weapon,KEY_F12=native.build_sciencemachine,
+        KEY_F3=native.cook_food,KEY_F5=native.reject_frontier,KEY_F1=native.reject_search}
     local function sample(ax,az)
         x,z,now=ax,az,now+1
         captured=nil
@@ -264,8 +274,31 @@ local function simulated_mod(passable, topology, terrain, entities)
         assert(captured,table.concat(errors,"\n"))
         return captured
     end
-    return sample, G.TheWorld, G, handlers
+    return sample, G.TheWorld, G, handlers, function() sim_init(); return captured end, function() return captured end
 end
+
+test("real Mod keeps escape routes for observed targeted hostiles beyond twelve units",function()
+    local x,targeted,blocked=11.9,true,false
+    local enemy={GUID=22,prefab="frog",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="hostile" end,
+        Transform={GetWorldPosition=function() return x,0,0 end},replica={}}
+    local sample,_,G=simulated_mod(function() return not blocked end,function() return "A" end,
+        function() return 2 end,{enemy})
+    enemy.replica.combat={GetTarget=function() return targeted and G.ThePlayer or nil end}
+    G.TheCamera={GetRightVec=function() return {x=1,z=0} end,
+        GetDownVec=function() return {x=0,z=-1} end}
+    for _,distance in ipairs({11.9,12,12.1,13,20}) do
+        x=distance
+        local s=sample(0,0)
+        assert(s.nearby[1].activeThreat and s.nearby[1].distance==distance)
+        assert(#s.navigation.escape_routes==8,"observed threat lost routes at distance "..distance)
+        assert(require("jev_native_executor").available(s).flee_from_nearest_hostile)
+    end
+    targeted=false
+    assert(#sample(0,0).navigation.escape_routes==0,"unlocked hostiles do not require escape routes")
+    targeted=true; blocked=true
+    assert(#sample(0,0).navigation.escape_routes==0,"impassable ground must still block escape routes")
+end)
 
 test("juicy berry telemetry respects replicated tags and CanBePicked", function()
     local ripe=true
@@ -708,4 +741,660 @@ test("unsafe gateway overshoot falls back to the passable endpoint without cross
     assert(route.leg.arrival_distance==0.2)
 end)
 
-print("PASS: " .. passed .. " Lua exploration checks")
+local N=require("jev_native_executor")
+local B=require("jev_bridge")
+local function bridge_state()
+    return {player={guid=1,position={x=0,z=0},vitals={health=150,hunger=100,hunger_max=150},
+        inventory={items={},equipped={}}},world={phase="day"},crafting={},nearby={},navigation={}}
+end
+local function native_test()
+    local calls,stops={},0
+    local executor=N.new({issue=function(id,a) calls[#calls+1]={id=id,action=a} end,
+        stop=function() stops=stops+1 end})
+    return executor,calls,function() return stops end
+end
+test("real Mod HTTP callback contains native dispatch exceptions instead of crashing",function()
+    local cfg={enabled=true,url="http://127.0.0.1:8765/v1/exchange",token=string.rep("x",32)}
+    local plant={GUID=22,prefab="grass",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="pickable" end,
+        Transform={GetWorldPosition=function() return 1,0,0 end}}
+    local _,world,G,_,start,captured=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{plant},cfg)
+    local ticks,callback={},nil
+    world.IsValid=function() return true end
+    world.DoTaskInTime=function(_,delay,fn) fn() end
+    G.ThePlayer.ListenForEvent=function() end
+    G.ThePlayer.DoPeriodicTask=function(_,interval,fn) ticks[interval]=fn; return {Cancel=function() end} end
+    G.ThePlayer.GetDistanceSqToInst=function() return 1 end
+    G.ThePlayer.components={playercontroller={IsBusy=function() return false end,
+        GetActionButtonAction=function() error("test_native_fault") end}}
+    G.Ents={[22]=plant}
+    G.TheSim.QueryServer=function(_,url,fn,method,body)
+        assert(url==cfg.url and method=="POST" and body=="{}"); callback=fn
+    end
+    start(); assert(ticks[0.2])
+    ticks[0.2](); local sent=captured(); assert(callback and sent.token==cfg.token)
+    cfg.reply={server_id="s",session_id=sent.session_id,sequence=sent.sequence,board_revision=0,
+        command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_grass",action={guid=22}}}
+    assert(pcall(function() callback("{}",true,200) end),"asynchronous native errors escaped into the game")
+    ticks[1](G.ThePlayer)
+    assert(captured().bridge.action_report.status=="failed")
+    assert(captured().bridge.action_report.reason=="native_exception")
+end)
+
+test("real Mod defers busy or cooling-down pickup and preserves native client RPC wiring",function()
+    for _,mode in ipairs({"master","predicting","nonpredicting"}) do
+        local cfg={enabled=true,url="http://127.0.0.1:8765/v1/exchange",token=string.rep("x",32)}
+        local item={GUID=22,prefab="log",IsValid=function() return true end,
+            HasTag=function(_,tag) return tag=="_inventoryitem" end,
+            Transform={GetWorldPosition=function() return 1,0,0 end}}
+        local _,world,G,handlers,start,captured=simulated_mod(function() return true end,
+            function() return "A" end,function() return 2 end,{item},cfg)
+        local ticks,callback={},nil
+        local clock,busy,ready,issued,rpcs,picker_calls=0,true,false,0,0,0
+        world.IsValid=function() return true end
+        world.DoTaskInTime=function(_,delay,fn) fn() end
+        G.GetTime=function() return clock end
+        G.ACTIONS={PICK={id="PICK"},PICKUP={id="PICKUP"}}
+        G.Ents={[22]=item}
+        G.ThePlayer.ListenForEvent=function() end
+        G.ThePlayer.DoPeriodicTask=function(_,interval,fn) ticks[interval]=fn; return {Cancel=function() end} end
+        G.ThePlayer.GetDistanceSqToInst=function() return 1 end
+        G.ThePlayer.components={playercontroller={ismastersim=mode=="master",
+            locomotor=mode=="predicting" and {} or nil,
+            IsBusy=function() return busy end,
+            GetActionButtonAction=function(_,target)
+                picker_calls=picker_calls+1; assert(target==item)
+                if ready then return {action=G.ACTIONS.PICKUP,target=item} end
+            end,
+            DoAction=function(_,action)
+                issued=issued+1
+                if mode=="predicting" then assert(action.preview_cb); action.preview_cb()
+                elseif mode=="nonpredicting" then assert(action.non_preview_cb); action.non_preview_cb()
+                else assert(not action.preview_cb and not action.non_preview_cb) end
+            end,
+            RemoteActionButton=function(_,action,released)
+                assert(action.target==item and action.action==G.ACTIONS.PICKUP and released); rpcs=rpcs+1
+            end}}
+        G.TheSim.QueryServer=function(_,url,fn) callback=fn end
+        start(); ticks[0.2](); local sent=captured()
+        cfg.reply={server_id="s",session_id=sent.session_id,sequence=sent.sequence,board_revision=0,
+            command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_log",action={guid=22}}}
+        callback("{}",true,200)
+        assert(issued==0 and picker_calls==0,"busy must defer pickup without an exception")
+        busy=false; clock=0.3; ticks[0.2]()
+        assert(issued==0 and picker_calls==1,"missing native action is a retry, not success")
+        ready=true; clock=0.6; ticks[0.2]()
+        assert(issued==1 and rpcs==(mode=="master" and 0 or 1))
+        ticks[1](G.ThePlayer)
+        assert(captured().bridge.action_report.status=="running","pickup still needs inventory verification")
+        handlers.KEY_F4(); clock=1; ticks[0.2](); assert(issued==1,"cancelled pickup must not retry")
+    end
+end)
+test("Lua action availability checks pickability, tools and portable light",function()
+    local s=bridge_state()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=false,collect_path={status="ready"}},
+        {prefab="rock1",guid=3,distance=1,work_required=6,tags={"MINE_workable"},collect_path={status="ready"}}}
+    assert(not N.available(s).collect_grass and not N.available(s).mine_nearest_rock)
+    s.nearby[1].pickable=true
+    s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
+    assert(N.available(s).collect_grass and N.available(s).mine_nearest_rock)
+    s.world.phase="night"; s.player.inventory.items={{prefab="torch"}}
+    assert(N.available(s).equip_torch and not N.available(s).collect_grass)
+    s.player.inventory.equipped={{prefab="torch"}}
+    assert(N.available(s).collect_grass and not N.available(s).unequip_torch)
+end)
+
+test("Lua accepts flee after damage and uses the latest route rather than requested coordinates",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.vitals.health=50
+    s.nearby={{guid=99,prefab="killerbee",activeThreat=true,distance=2,dx=2,dz=0}}
+    s.navigation.escape_routes={{dx=-1,dz=0,distance=6}}
+    assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile",
+        action={kind="flee_from_nearest_hostile",x=999,z=999}},s,1))
+    assert(#calls==1 and calls[1].action.x==-6 and calls[1].action.z==0)
+    s.player.vitals.health=20; s.player.position.x=-1; s.world.phase="dusk"
+    s.nearby[1].guid=100
+    executor:tick(s,2)
+    assert(executor.active and executor.report.status=="running","damage must not invalidate an ongoing escape")
+end)
+
+test("Lua rejects changed targets without switching to the new nearest plant",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.nearby={{prefab="grass",guid=21,distance=1,pickable=true,collect_path={status="ready"}}}
+    assert(not executor:start({action_id="old-target",choice="collect_grass",
+        action={kind="collect",guid=20,prefab="grass"}},s,1))
+    assert(#calls==0 and executor.report.reason=="target_changed")
+    assert(executor.report.choice=="collect_grass" and executor.report.status=="failed")
+end)
+
+test("Lua rejects stale pickability, recipes, danger and death before native input",function()
+    for _,case in ipairs({"picked","missing","recipe","danger","dead"}) do
+        local s=bridge_state(); local executor,calls=native_test()
+        s.nearby={{prefab="grass",guid=20,distance=1,pickable=true,collect_path={status="ready"}}}
+        local choice,action,reason="collect_grass",{kind="collect",guid=20,prefab="grass"},nil
+        if case=="picked" then s.nearby[1].pickable=false; reason="target_not_collectable"
+        elseif case=="missing" then s.nearby={}; reason="target_missing"
+        elseif case=="recipe" then choice="craft_torch"; action={kind="craft_torch"}; reason="action_unavailable"
+        elseif case=="danger" then s.nearby[2]={guid=99,activeThreat=true}; reason="targeted_by_hostile"
+        else s.player.vitals.dead=true; reason="player_dead" end
+        assert(not executor:start({action_id=case,choice=choice,action=action},s,1))
+        assert(#calls==0 and executor.report.reason==reason,case)
+    end
+end)
+
+test("Lua rejects obsolete flee intent when threats cleared or no safe route remains",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    assert(not executor:start({action_id="clear",choice="flee_from_nearest_hostile",
+        action={kind="flee_from_nearest_hostile"}},s,1))
+    assert(executor.report.reason=="threat_cleared" and #calls==0)
+    s.nearby={{guid=99,activeThreat=true}}
+    assert(not executor:start({action_id="blocked",choice="flee_from_nearest_hostile",
+        action={kind="flee_from_nearest_hostile"}},s,2))
+    assert(executor.report.reason=="no_safe_escape_route" and #calls==0)
+end)
+
+test("Lua remembers completed and rejected command IDs across later reports",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    assert(executor:start({action_id="a",choice="wait"},s,0))
+    executor:tick(s,1)
+    assert(not executor:start({action_id="b",choice="craft_torch"},s,2))
+    assert(executor:start({action_id="c",choice="wait"},s,3))
+    executor:tick(s,4)
+    assert(not executor:start({action_id="a",choice="wait"},s,5))
+    executor:cancel("cancelled-before-start")
+    assert(executor:start({action_id="d",choice="wait"},s,6))
+    executor:tick(s,7)
+    assert(not executor:start({action_id="cancelled-before-start",choice="wait"},s,8))
+    s.crafting.torch=true
+    assert(not executor:start({action_id="b",choice="craft_torch"},s,5))
+    assert(#calls==0,"replayed rejected command must not craft later")
+end)
+
+test("Lua HTTP delivery validates live facts rather than the uploaded observation",function()
+    local live=bridge_state(); local executor,calls=native_test()
+    live.nearby={{prefab="grass",guid=20,distance=1,pickable=true,collect_path={status="ready"}}}
+    local offered=N.available(live).collect_grass
+    local callback,sent
+    local env={session_id="live",now=function() return 1 end,state=function() return live end,
+        alive=function() return true end,available=N.available,
+        request=function(_,payload,fn) sent=payload; callback=fn end}
+    local bridge=B.new({},env,executor)
+    bridge:tick()
+    live=bridge_state(); live.nearby={{guid=99,prefab="killerbee",activeThreat=true}}
+    live.player.vitals.health=50
+    callback({session_id="live",sequence=sent.sequence,server_id="server",board_revision=0,
+        command={session_id="live",operation="start",action_id="stale-pick",
+            choice="collect_grass",action=offered}},true,200)
+    assert(#calls==0 and executor.report.reason=="targeted_by_hostile")
+    assert(executor.report.choice=="collect_grass" and not executor.active)
+end)
+test("Lua collection approaches a verified waypoint and requires actual inventory gain",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=5,pickable=true,
+        collect_path={status="ready",waypoint={x=4,z=0}}}}
+    assert(executor:start({action_id="a",choice="collect_grass",action={guid=2}},s,0))
+    assert(calls[1].id=="walk")
+    s=bridge_state(); s.player.position.x=4
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:tick(s,1); assert(calls[2].id=="collect_grass")
+    s.nearby[1].pickable=false; executor:tick(s,2)
+    assert(executor.active,"emptying the plant alone is not verified success")
+    s.player.inventory.items={{prefab="cutgrass",count=1}}
+    executor:tick(s,3); assert(executor.report.status=="completed")
+    assert(not executor:start({action_id="a",choice="wait"},s,4),"repeated command must not execute twice")
+end)
+test("Lua work is interrupted by night without choosing or equipping light",function()
+    local s=bridge_state(); local executor,calls,stops=native_test()
+    s.player.inventory.items={{prefab="axe",durability_percent=1},{prefab="torch"}}
+    s.nearby={{prefab="evergreen",guid=2,distance=1,work_required=15,tags={"CHOP_workable"},collect_path={status="ready"}}}
+    executor:start({action_id="a",choice="chop_nearest_tree",action={guid=2}},s,0)
+    local night=bridge_state(); night.world.phase="night"; night.player.inventory.items={{prefab="torch"}}
+    executor:tick(night,1)
+    assert(executor.report.status=="interrupted" and executor.report.reason=="light_changed")
+    assert(#calls==1 and stops()==1)
+    executor:start({action_id="b",choice="equip_torch"},night,2)
+    night.player.inventory.equipped={{prefab="torch"}}
+    executor:tick(night,3); assert(executor.report.status=="completed")
+end)
+test("Lua torch craft cleanup waits through inventory replication gaps",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.crafting.torch=true
+    executor:start({action_id="a",choice="craft_torch"},s,0)
+    local next=bridge_state()
+    next.player.inventory.equipped={{prefab="torch"}}
+    executor:tick(next,1); assert(calls[2].id=="unequip_torch")
+    next.player.inventory.equipped={}; executor:tick(next,2); assert(executor.active)
+    next.player.inventory.items={{prefab="torch"}}; executor:tick(next,3)
+    assert(executor.report.status=="completed")
+    next.crafting.torch=true; assert(not N.available(next).craft_torch)
+end)
+test("Lua mining collects different observed drops before reporting completion",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
+    s.nearby={{prefab="rock1",guid=2,distance=1,work_required=6,tags={"MINE_workable"},collect_path={status="ready"}}}
+    executor:start({action_id="a",choice="mine_nearest_rock",action={guid=2}},s,0)
+    s.work={sequence=1,target_guid=2,status="completed"}; executor:tick(s,1)
+    s.nearby={{prefab="nitre",guid=3,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}},
+        {prefab="flint",guid=4,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}}}
+    executor:tick(s,2); assert(calls[2].id=="collect_nitre")
+    s.player.inventory.items[#s.player.inventory.items+1]={prefab="nitre"}
+    executor:tick(s,3); assert(calls[3].id=="collect_flint" and executor.active)
+    s.player.inventory.items[#s.player.inventory.items+1]={prefab="flint"}
+    executor:tick(s,4); assert(executor.report.status=="completed")
+end)
+
+test("Lua chopping retries busy loot dispatch and waits for each inventory effect",function()
+    local s=bridge_state(); local calls,ready={},false
+    local executor=N.new({stop=function() end,issue=function(id,a)
+        calls[#calls+1]={id=id,action=a}
+        if a.kind=="collect" then return ready end
+    end})
+    s.player.inventory.items={{prefab="axe",durability_percent=1}}
+    s.nearby={{prefab="evergreen",guid=2,distance=1,work_required=10,
+        tags={"CHOP_workable"},collect_path={status="ready"}}}
+    assert(executor:start({action_id="chop",choice="chop_nearest_tree",action={guid=2}},s,0))
+    s.work={sequence=1,target_guid=2,status="completed"}; executor:tick(s,1)
+    s.nearby={{prefab="log",guid=3,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}},
+        {prefab="pinecone",guid=4,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}}}
+    executor:tick(s,1.2)
+    assert(executor.active and executor.active.stage=="collection_retry","busy chop recovery is not failure")
+    local n=#calls; executor:tick(s,1.3); assert(#calls==n,"do not spam retries between ticks")
+    ready=true; executor:tick(s,1.5)
+    assert(calls[#calls].action.guid==3 and executor.active.stage=="loot")
+    n=#calls; executor:tick(s,1.8); assert(#calls==n and executor.active,"dispatch alone is not pickup")
+    s.player.inventory.items[#s.player.inventory.items+1]={prefab="log"}; ready=false
+    executor:tick(s,2)
+    assert(executor.active.stage=="collection_retry" and calls[#calls].action.guid==4)
+    ready=true; executor:tick(s,2.3)
+    assert(executor.active.stage=="loot" and calls[#calls].action.guid==4)
+    s.player.inventory.items[#s.player.inventory.items+1]={prefab="pinecone"}
+    executor:tick(s,2.5)
+    assert(executor.report.status=="completed" and executor.report.reason=="work_and_drops_verified")
+end)
+
+test("Lua collection retry is bounded and never retargets or survives cancellation",function()
+    for _,mode in ipairs({"timeout","changed","cancel","danger"}) do
+        local s=bridge_state(); local calls=0
+        local executor=N.new({stop=function() end,issue=function() calls=calls+1; return false end})
+        s.nearby={{prefab="log",guid=3,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}}}
+        assert(executor:start({action_id="pickup",choice="collect_log",action={guid=3}},s,0))
+        assert(executor.active.stage=="collection_retry")
+        if mode=="changed" then s.nearby[1].guid=4
+        elseif mode=="cancel" then executor:cancel("pickup")
+        elseif mode=="danger" then s.nearby[2]={guid=9,activeThreat=true} end
+        executor:tick(s,mode=="timeout" and 3 or 0.5)
+        assert(not executor.active and calls==1)
+        local reason=mode=="timeout" and "collection_action_unavailable"
+            or mode=="changed" and "target_changed" or mode=="cancel" and "requested" or "targeted_by_hostile"
+        assert(executor.report.reason==reason,executor.report.reason)
+    end
+end)
+test("Lua local board execution is opt-in and never silently explores for missing goals",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    local board={kind="task_board",auto_execute=false,tasks={{id="grass",priority=1,depends_on={},
+        target={type="inventory",prefab="cutgrass",count=2}}}}
+    executor:set_board(board,1); executor:board_step(s,0); assert(#calls==0)
+    board.auto_execute=true; executor:set_board(board,2); executor:board_step(s,1)
+    assert(calls[1].id=="collect_grass")
+    executor:set_board(nil,3); assert(executor.report.status=="interrupted")
+    s.nearby={}; executor:set_board(board,4); executor:board_step(s,2)
+    assert(executor.active==nil and #calls==1)
+end)
+test("Lua exploration uses type sets, the displacement floor and immediate discovery events",function()
+    local s=bridge_state(); local executor=native_test()
+    s.navigation={status="ready",leg={x=4,z=0},graph={known_nodes=1,current_node="A"}}
+    executor:start({action_id="a",choice="explore_current_region"},s,0)
+    local fresh=bridge_state(); fresh.navigation=s.navigation
+    fresh.player.position.x=2
+    fresh.nearby={{prefab="grass",guid=2,pickable=true,collect_path={status="ready"}}}
+    executor:tick(fresh,1); assert(executor.active,"resource event must honor the displacement floor")
+    fresh.player.position.x=4; executor:tick(fresh,2)
+    assert(executor.report.reason=="resource_types_changed")
+    executor:start({action_id="b",choice="explore_current_region"},s,3)
+    fresh.player.position.x=1; fresh.navigation={graph={known_nodes=2,current_node="A"}}
+    executor:tick(fresh,4); assert(executor.report.reason=="region_discovered")
+end)
+test("Lua bounded flee survives damage and night changes until observed threat clears",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.nearby={{prefab="hound",guid=8,distance=2,dx=2,dz=0,activeThreat=true}}
+    s.navigation={escape_routes={{dx=-1,dz=0,distance=6}}}
+    assert(N.available(s).flee_from_nearest_hostile and not N.available(s).wait)
+    executor:start({action_id="a",choice="flee_from_nearest_hostile"},s,0)
+    assert(calls[1].action.x==-6)
+    local next=bridge_state(); next.world.phase="night"; next.player.vitals.health=50
+    next.nearby=s.nearby; next.player.position.x=-2
+    executor:tick(next,1); assert(executor.active)
+    next.nearby={}; executor:tick(next,2)
+    assert(executor.report.status=="completed" and executor.report.reason=="no_visible_targeted_hostile")
+end)
+test("Lua transport discards timed-out callbacks, expires its lease and rejects old worlds",function()
+    local clock,callbacks,starts,interrupts=0,{},0,0
+    local executor={active=nil,report=nil,board_paused=false,
+        tick=function() end,board_step=function() end,set_board=function() end,
+        finish=function(self) self.active=nil; interrupts=interrupts+1 end,
+        start=function() starts=starts+1 end}
+    local env={session_id="one",now=function() return clock end,state=bridge_state,alive=function() return true end,
+        available=N.available,request=function(_,payload,fn) callbacks[#callbacks+1]={payload=payload,fn=fn} end}
+    local bridge=B.new({url="local",token="test"},env,executor)
+    bridge:tick(); assert(#callbacks==1)
+    clock=4; executor.active={}; bridge:tick()
+    assert(interrupts==1 and #callbacks==2)
+    callbacks[1].fn({session_id="one",sequence=1,command={operation="start",session_id="one"}},true,200)
+    assert(starts==0 and not bridge.connected)
+    callbacks[2].fn({session_id="wrong-world",sequence=2},true,200); assert(not bridge.connected)
+    clock=5; bridge:tick()
+    callbacks[3].fn({session_id="one",sequence=3,server_id="server",command={operation="start",session_id="one"}},true,200)
+    assert(starts==1 and bridge.connected)
+    bridge:stop(); callbacks[3].fn({session_id="one",sequence=3},true,200)
+    assert(not bridge.connected)
+end)
+test("Lua reports atomic protocol capabilities, board readiness and retained terminal events",function()
+    local s=bridge_state(); local executor=native_test()
+    local board={kind="task_board",auto_execute=false,tasks={{id="grass",priority=1,depends_on={},
+        target={type="inventory",prefab="cutgrass",count=2}},
+        {id="regions",priority=2,depends_on={},target={type="known_regions",count=2}}}}
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:set_board(board,3)
+    assert(executor:board_choice(s,0)=="collect_grass")
+    local env={session_id="test",now=function() return 2 end,available=N.available}
+    local bridge=B.new({},env,executor)
+    local status=bridge:status(s)
+    assert(status.protocol==4 and status.board_revision==3 and status.board_ready and not status.board_auto_execute)
+    executor:start({action_id="a",choice="collect_grass",task_id="grass"},s,0,true)
+    local fresh=bridge_state(); fresh.player.inventory.items={{prefab="cutgrass"}}
+    executor:tick(fresh,1)
+    assert(executor.events[1].choice=="collect_grass" and executor.events[1].board_task_id=="grass")
+    executor:start({action_id="b",choice="wait"},fresh,1)
+    executor:tick(fresh,2)
+    assert(#executor.events==2 and executor.events[1].status=="completed")
+end)
+
+test("Lua failed target pauses expire and do not suppress a different GUID",function()
+    local s=bridge_state(); local executor=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:start({action_id="a",choice="collect_grass"},s,0)
+    executor:tick(s,12)
+    assert(executor.report.status=="failed" and not executor:available(s,13).collect_grass)
+    s.nearby[1].guid=3; assert(executor:available(s,13).collect_grass)
+    s.nearby[1].guid=2; assert(executor:available(s,28).collect_grass)
+end)
+
+test("Lua board retains verified Science Machine progress after leaving visibility",function()
+    local s=bridge_state(); local executor=native_test()
+    s.crafting.sciencemachine=true
+    executor:start({action_id="science",choice="build_sciencemachine"},s,0)
+    s.nearby={{prefab="sciencemachine",guid=2,distance=1}}
+    executor:tick(s,1); assert(executor.report.status=="completed")
+    s.nearby={}
+    executor:set_board({kind="task_board",tasks={{id="science",priority=1,depends_on={},
+        target={type="structure",prefab="sciencemachine"}}}},1)
+    assert(not executor:board_choice(s,2),"a built machine leaving sight must not trigger another build")
+end)
+
+test("Lua uploads completion and idle metadata atomically before the heartbeat deadline",function()
+    local s=bridge_state(); local executor=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:start({action_id="a",choice="collect_grass"},s,0)
+    local clock,requests,bridge=0,{},nil
+    local env={session_id="one",now=function() return clock end,alive=function() return true end,
+        available=N.available,state=function() s.bridge=bridge:status(s); return s end,
+        request=function(_,payload,fn) requests[#requests+1]={payload=payload,fn=fn} end}
+    bridge=B.new({},env,executor); bridge.connected=true
+    bridge:tick(); assert(#requests==1 and requests[1].payload.state.bridge.executor_busy)
+    clock=0.1
+    requests[1].fn({session_id="one",sequence=1,server_id="s",board_revision=-1},true,200)
+    clock=0.2; s=bridge_state(); s.player.inventory.items={{prefab="cutgrass"}}
+    bridge:tick()
+    assert(#requests==2,"completion must bypass the 0.5-second idle heartbeat")
+    local packet=requests[2].payload
+    assert(packet.action_report.status=="completed" and not packet.state.bridge.executor_busy)
+    assert(packet.state.bridge.action_report==packet.action_report)
+    assert(packet.state.bridge.sampled_at==0.2)
+    assert(math.abs(packet.state.bridge.transport.last_round_trip_ms-100)<0.001)
+    clock=0.3; bridge:tick(); assert(#requests==2,"urgent changes cannot overlap requests")
+end)
+
+test("Lua retains an urgent completion while HTTP is in flight and rejects late replies",function()
+    local s=bridge_state(); local executor=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:start({action_id="a",choice="collect_grass"},s,0)
+    local clock,requests=0,{}
+    local bridge=B.new({}, {session_id="one",now=function() return clock end,state=function() return s end,
+        alive=function() return true end,available=N.available,
+        request=function(_,payload,fn) requests[#requests+1]={payload=payload,fn=fn} end},executor)
+    bridge:tick()
+    clock=0.2; s=bridge_state(); s.player.inventory.items={{prefab="cutgrass"}}; bridge:tick()
+    assert(#requests==1 and bridge.dirty)
+    clock=0.3; requests[1].fn({session_id="one",sequence=1,server_id="s",board_revision=-1},true,200)
+    clock=0.4; bridge:tick()
+    assert(#requests==2 and requests[2].payload.action_report.status=="completed")
+    clock=4; bridge:tick(); assert(#requests==3)
+    requests[2].fn({session_id="one",sequence=2,server_id="s"},true,200)
+    assert(not bridge.connected,"timed-out callback must not reconnect the bridge")
+end)
+
+test("Lua board starts are uploaded busy rather than as the pre-tick idle state",function()
+    local s=bridge_state(); local executor=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:set_board({kind="task_board",auto_execute=true,tasks={{id="grass",priority=1,depends_on={},
+        target={type="inventory",prefab="cutgrass",count=2}}}},1)
+    local packet,bridge
+    bridge=B.new({}, {session_id="one",now=function() return 0 end,alive=function() return true end,
+        available=N.available,state=function() s.bridge=bridge:status(s); return s end,
+        request=function(_,payload) packet=payload end},executor)
+    bridge.connected=true; bridge:tick()
+    assert(packet.state.bridge.executor_busy and packet.action_report.status=="running")
+    assert(packet.action_report.action_id==executor.active.id)
+end)
+
+test("Lua distinguishes command acceptance, confirmed native start and next-action gap",function()
+    local s=bridge_state(); local executor=native_test()
+    s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:start({action_id="a",choice="collect_grass"},s,1)
+    assert(executor.report.started_at==1 and not executor.report.confirmed_started_at)
+    s.execution={action="PICK",target_guid=2,confirmed_start=true,issued_at=0.5,started_at=0.7}
+    executor:tick(s,1.2); assert(not executor.report.confirmed_started_at,"old starts cannot acknowledge a new request")
+    s.execution={action="PICK",target_guid=2,confirmed_start=true,issued_at=1,started_at=1.3,start_source="replicated_transition"}
+    executor:tick(s,1.4); assert(executor.report.confirmed_started_at==1.3)
+    s=bridge_state(); s.player.inventory.items={{prefab="cutgrass"}}; executor:tick(s,1.6)
+    assert(executor.events[1].confirmed_started_at==1.3 and executor.events[1].finished_at==1.6)
+    executor:start({action_id="b",choice="wait"},s,2)
+    assert(executor.report.previous_action_id=="a")
+    assert(math.abs(executor.report.handoff_gap_ms-400)<0.001)
+    executor:tick(s,3.1)
+    assert(not executor.report.confirmed_started_at,"timer completion is not native-start evidence")
+end)
+
+local function event_peer(s)
+    local clock,requests=0,{}
+    local executor=native_test()
+    local bridge=B.new({}, {session_id="events",now=function() return clock end,
+        alive=function() return true end,available=N.available,state=function() return s end,
+        request=function(_,payload,fn,receipt) requests[#requests+1]={payload=payload,fn=fn,receipt=receipt} end},executor)
+    local function tick(t) clock=t; bridge:tick(); return requests[#requests].payload end
+    local function reply(extra,success)
+        local request=requests[#requests]
+        local result={session_id="events",sequence=request.payload.sequence,server_id="s",board_revision=-1}
+        for k,v in pairs(extra or {}) do result[k]=v end
+        request.fn(result,success~=false,success==false and 500 or 200)
+        request.receipt.done=true
+    end
+    return bridge,requests,tick,reply
+end
+
+test("Lua sends stable moving-world facts once then uses small control heartbeats",function()
+    local s=bridge_state()
+    s.nearby={{prefab="grass",guid=20,distance=1,pickable=true,collect_path={status="ready"}}}
+    local bridge,requests,tick,reply=event_peer(s)
+    assert(tick(0).kind=="snapshot"); reply()
+    for i=1,8 do
+        s.player.position.x=i
+        s.nearby[1].guid=20+i
+        local packet=tick(i*0.6)
+        assert(packet.kind=="heartbeat" and packet.state==nil)
+        assert(packet.control and packet.control.available_actions==nil and packet.control.events==nil)
+        assert(packet.control.player==nil and packet.control.sampled_at==i*0.6)
+        reply()
+    end
+    assert(#requests==9 and bridge.connected)
+end)
+
+test("Lua snapshot requests bypass heartbeat delay and are acknowledged only once",function()
+    local _,requests,tick,reply=event_peer(bridge_state())
+    tick(0); reply()
+    assert(tick(0.6).kind=="heartbeat"); reply({snapshot_request_id=1})
+    local packet=tick(0.7)
+    assert(#requests==3 and packet.kind=="snapshot" and packet.snapshot_request_id==1)
+    reply({snapshot_request_id=1})
+    assert(tick(1.3).kind=="heartbeat"); reply({snapshot_request_id=1})
+    tick(1.4); assert(#requests==4,"acknowledged request must not keep uploading full state")
+end)
+
+test("Lua uploads inventory, danger, light and quarter events without waiting for heartbeat",function()
+    for _,case in ipairs({"inventory","threat","health","phase","quarter","resource"}) do
+        local s=bridge_state(); local _,requests,tick,reply=event_peer(s)
+        tick(0); reply()
+        if case=="inventory" then s.player.inventory.items={{prefab="cutgrass",count=2}}
+        elseif case=="threat" then s.nearby={{guid=9,prefab="frog",activeThreat=true}}
+        elseif case=="health" then s.player.vitals.health=140
+        elseif case=="phase" then s.world.phase="night"
+        elseif case=="quarter" then s.world.time=0.25
+        else s.nearby={{prefab="berrybush",guid=2,distance=1,pickable=true,collect_path={status="ready"}}} end
+        assert(tick(0.1).kind=="snapshot" and #requests==2,case)
+    end
+end)
+
+test("Lua retries unacknowledged snapshots and keeps changes arriving during flight",function()
+    local s=bridge_state(); local _,requests,tick,reply=event_peer(s)
+    tick(0); reply(nil,false)
+    assert(tick(0.1).kind=="snapshot" and #requests==2)
+    s.player.vitals.health=100
+    tick(0.2); assert(#requests==2)
+    reply()
+    assert(tick(0.3).kind=="snapshot" and #requests==3)
+    reply()
+end)
+
+test("Lua server restart on a heartbeat forces full-state resynchronization",function()
+    local _,requests,tick,reply=event_peer(bridge_state())
+    tick(0); reply()
+    assert(tick(0.6).kind=="heartbeat"); reply({server_id="new",need_snapshot=true})
+    assert(tick(0.7).kind=="snapshot" and #requests==3)
+    reply({server_id="new"})
+    assert(tick(1.3).kind=="heartbeat")
+end)
+
+test("Lua real-time measurements aggregate tick work without altering request cadence",function()
+    local clock,wall,requests=0,0,{}
+    local s=bridge_state(); local executor=native_test()
+    local bridge=B.new({}, {session_id="one",now=function() return clock end,wall_now=function() return wall end,
+        alive=function() return true end,available=N.available,
+        state=function(fields) wall=wall+0.003; fields.navigation_ms=2; return s end,
+        request=function(_,payload,fn,receipt) requests[#requests+1]={payload=payload,fn=fn,receipt=receipt} end},executor)
+    bridge:tick(); assert(#requests==1)
+    local m=requests[1].payload.measurement
+    assert(m.clock=="lua_real_seconds" and m.sampling.ticks==1)
+    assert(math.abs(m.sampling.sum_ms.state_total_ms-3)<0.001 and m.sampling.sum_ms.navigation_ms==2)
+    requests[1].receipt.done=true; requests[1].receipt.encode_ms=1
+    requests[1].fn({session_id="one",sequence=1,server_id="s",board_revision=-1},true,200)
+    clock=0.2; bridge:tick(); assert(#requests==1)
+    clock=0.4; bridge:tick(); assert(#requests==1)
+    clock=0.6; bridge:tick(); assert(#requests==2)
+    m=requests[2].payload.measurement
+    assert(m.sampling.ticks==3 and #m.previous_exchanges==1)
+    assert(m.previous_exchanges[1].sequence==1 and m.previous_exchanges[1].encode_ms==1)
+end)
+
+test("Lua missing real-time clocks stay unknown rather than measuring frozen simulation ticks",function()
+    local packet
+    local executor=native_test()
+    local bridge=B.new({}, {session_id="one",now=function() return 0 end,state=bridge_state,
+        alive=function() return true end,available=N.available,
+        request=function(_,payload) packet=payload end},executor)
+    bridge:tick()
+    assert(packet.measurement.clock=="unavailable" and packet.measurement.sampling.ticks==1)
+    assert(packet.measurement.sampling.sum_ms.state_total_ms==nil)
+end)
+
+test("real Mod measures JSON and QueryServer callback work without game inputs",function()
+    local wall=0
+    local cfg={enabled=true,url="http://127.0.0.1:8765/v1/exchange",token=string.rep("x",32),
+        measurement_clock=function() return wall end}
+    local _,world,G,_,start,captured=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{},cfg)
+    local tick,callback
+    world.IsValid=function() return true end
+    world.DoTaskInTime=function(_,delay,fn) fn() end
+    G.ThePlayer.ListenForEvent=function() end
+    G.ThePlayer.DoPeriodicTask=function(_,interval,fn)
+        if interval==0.2 then tick=fn end; return {Cancel=function() end}
+    end
+    G.TheSim.FindEntities=function() wall=wall+0.004; return {} end
+    G.TheSim.QueryServer=function(_,url,fn) callback=fn end
+    start(); tick(); local sent=captured(); assert(sent.sequence==1 and callback)
+    cfg.reply={session_id=sent.session_id,sequence=1,server_id="s",board_revision=0}
+    wall=wall+0.1; callback("{}",true,200)
+    tick(); sent=captured()
+    assert(sent.sequence==2)
+    local r=sent.measurement.previous_exchanges[1]
+    assert(r.sequence==1 and r.accepted and r.response_bytes==2)
+    assert(math.abs(r.query_to_callback_ms-100)<0.001 and r.encode_ms==0)
+    assert(r.decode_ms==0 and r.callback_dispatch_ms==0)
+    assert(sent.measurement.sampling.sum_ms.entities_ms>=3.99)
+end)
+
+local R=require("jev_resource_memory")
+test("resource memory stores only observed coordinates and invalidates picked plants",function()
+    local m={}; local p={x=10,z=20}
+    R.observe(m,p,{{guid=1,prefab="grass",pickable=true,dx=5,dz=0,tags={"pickable"}}},function() return "A" end,1,15,true)
+    assert(m.sources[1].x==15 and m.sources[1].node_id=="A")
+    R.observe(m,p,{{guid=1,prefab="grass",pickable=false,dx=5,dz=0,tags={"pickable"}}},function() return "A" end,2,15,true)
+    assert(not m.sources[1].available)
+    assert(#R.candidates(m,{x=40,z=20},"A",{})==0)
+end)
+test("resource disappearance needs an uncapped nearby scan and regeneration needs live evidence",function()
+    local m={}; local e={guid=1,prefab="grass",pickable=true,dx=1,dz=0,tags={"pickable"}}
+    local region=function() return "A" end
+    R.observe(m,{x=0,z=0},{e},region,1,15,true)
+    R.observe(m,{x=0,z=0},{},region,2,15,false)
+    assert(m.sources[1])
+    R.observe(m,{x=0,z=0},{},region,3,15,true)
+    assert(not m.sources[1])
+    e.pickable=false; R.observe(m,{x=0,z=0},{e},region,4,15,true)
+    assert(not m.sources[1].available)
+    e.pickable=true; R.observe(m,{x=0,z=0},{e},region,5,15,true)
+    assert(m.sources[1].available)
+end)
+test("remembered source candidates are current-room scoped and include distant visible work",function()
+    local m={}; local region=function(x) return x<20 and "A" or "B" end
+    local seen=R.observe(m,{x=0,z=0},{
+        {guid=1,prefab="evergreen",dx=10,dz=0,work_required=15,tags={"CHOP_workable"}},
+        {guid=2,prefab="rock2",dx=30,dz=0,work_required=6,tags={"MINE_workable"}}},region,1,15,true)
+    local found=R.candidates(m,{x=0,z=0},"A",seen)
+    assert(#found==1 and found[1].guid==1 and found[1].distance==10)
+end)
+test("remembered source diversity and memory size stay bounded",function()
+    local m={}; local entities={}
+    for i=1,520 do entities[i]={guid=i,prefab="log",dx=i,dz=0,tags={"_inventoryitem"}} end
+    entities[520].prefab="goldnugget"
+    R.observe(m,{x=0,z=0},entities,function() return "A" end,1,15,false)
+    local n=0; for _ in pairs(m.sources) do n=n+1 end; assert(n==512)
+    -- Give gold a fresh observation so it remains among bounded memory entries.
+    R.observe(m,{x=0,z=0},{entities[520]},function() return "A" end,2,15,false)
+    local candidates=R.candidates(m,{x=0,z=0},"A",{})
+    assert(#candidates==2 and candidates[2].prefab=="goldnugget")
+end)
+test("native navigation offers only ready remembered resource paths and keeps identity",function()
+    local N=require("jev_native_executor")
+    local s={player={inventory={items={},equipped={}},vitals={hunger=100,hunger_max=150}},world={phase="day"},nearby={},
+        navigation={resource_routes={{status="ready",guid=12,prefab="grass",distance=20,node_id="A",leg={x=4,z=0}},
+                                    {status="blocked",guid=13,prefab="rock2",node_id="A",leg={x=4,z=0}}}}}
+    local a=N.available(s)
+    assert(a.navigate_resource_12.mode=="resource" and a.navigate_resource_12.resource_guid==12)
+    assert(a.navigate_resource_12.prefab=="grass" and not a.navigate_resource_13)
+    s.world.phase="night"
+    assert(not N.available(s).navigate_resource_12,"memory never bypasses light gating")
+end)
+print("PASS: " .. passed .. " Lua exploration/bridge checks")

@@ -1,8 +1,15 @@
 local json = require("json")
 local exploration = require("jev_exploration")
+local resource_memory = require("jev_resource_memory")
 local execution_observer = require("jev_execution")
 local G = GLOBAL
 local protected_call = G.pcall
+local measurement = require("jev_timing")
+-- GetTime() is simulation ticks and cannot measure work inside one frame.
+local measurement_clock = G.GetTimeRealSeconds
+if not measurement_clock and G.GetTimeReal then
+    measurement_clock = function() return G.GetTimeReal()/1000 end
+end
 
 local LOG_PREFIX = "[JEV_DST_STATE]"
 local CHUNK_PREFIX = "[JEV_DST_CHUNK]"
@@ -629,7 +636,7 @@ end
 local function read_escape_routes(player, map, nearby)
     local threatened = false
     for _, entity in ipairs(nearby or {}) do
-        if entity.activeThreat == true and (entity.distance or math.huge) <= 12 then
+        if entity.activeThreat == true then
             threatened = true
             break
         end
@@ -1403,22 +1410,48 @@ local function read_collection_paths(player, nearby)
 end
 
 local emit_state
+local bridge_client
+local start_bridge
 
 local function read_execution(player)
     execution_observer.attach(player, G.GetTime, function() emit_state(player) end)
     return execution_observer.read(player, G.GetTime())
 end
 
-local function make_state(player)
+local function make_state(player, timings)
+    local function sample(key,fn) return measurement.call(measurement_clock,timings,key,fn) end
     local x, y, z = player.Transform:GetWorldPosition()
     local world = G.TheWorld ~= nil and G.TheWorld.state or {}
-    local camera = read_camera()
-    local nearby = read_nearby(player)
-    local navigation = read_navigation(player, nearby)
-    read_collection_paths(player, nearby)
+    local camera = sample("camera_ms",function() return read_camera() end)
+    local nearby = sample("entities_ms",function() return read_nearby(player) end)
+    local navigation = sample("navigation_ms",function() return read_navigation(player, nearby) end)
+    sample("collection_paths_ms",function() read_collection_paths(player, nearby) end)
+    sample("resource_memory_ms",function()
+        local memory = get_navigation_memory(G.TheWorld)
+        local position = {x=x,z=z}
+        local seen = resource_memory.observe(memory,position,nearby,function(tx,tz)
+            return observed_region_at(G.TheWorld.Map,tx,tz)
+        end,G.GetTime(),SCAN_RADIUS,#nearby<MAX_NEARBY)
+        local remembered = resource_memory.candidates(memory,position,navigation.graph and navigation.graph.current_node,seen)
+        read_collection_paths(player,remembered)
+        navigation.resource_routes = {}
+        for _,record in ipairs(remembered) do
+            local path = record.collect_path
+            if path and path.status=="ready" and path.waypoint then
+                local waypoint = path.waypoint
+                local length = math.sqrt((waypoint.x-x)^2+(waypoint.z-z)^2)
+                local scale = length>0 and math.min(1,NAV_LEG_DISTANCE/length) or 0
+                local leg = {x=round(x+(waypoint.x-x)*scale,2),z=round(z+(waypoint.z-z)*scale,2),
+                    distance=round(math.min(length,NAV_LEG_DISTANCE),2)}
+                table.insert(navigation.resource_routes,{status="ready",guid=record.guid,prefab=record.prefab,
+                    distance=path.distance,node_id=navigation.graph.current_node,
+                    target={x=record.x,z=record.z},leg=leg})
+            end
+        end
+    end)
     navigation.collection_paths = true
 
-    return
+    local state =
     {
         schema = 10,
         observed_at = round(G.GetTime(), 3),
@@ -1428,8 +1461,8 @@ local function make_state(player)
             guid = player.GUID,
             prefab = player.prefab or "unknown",
             position = { x = round(x, 2), y = round(y, 2), z = round(z, 2) },
-            vitals = read_vitals(player),
-            inventory = read_inventory(player),
+            vitals = sample("vitals_ms",function() return read_vitals(player) end),
+            inventory = sample("inventory_ms",function() return read_inventory(player) end),
         },
         world =
         {
@@ -1444,11 +1477,15 @@ local function make_state(player)
         },
         camera = camera,
         work = player._jev_dst_work,
-        execution = read_execution(player),
+        execution = sample("execution_read_ms",function() return read_execution(player) end),
         navigation = navigation,
-        crafting = read_crafting(player),
+        crafting = sample("crafting_ms",function() return read_crafting(player) end),
         nearby = nearby,
     }
+    if bridge_client then
+        state.bridge = sample("control_status_ms",function() return bridge_client:status(state,timings) end)
+    end
+    return state
 end
 
 emit_state = function(player)
@@ -1515,8 +1552,11 @@ local function start_telemetry(player)
         .. " radius=" .. tostring(SCAN_RADIUS))
     emit_state(player)
     player._jev_dst_telemetry_task = player:DoPeriodicTask(SAMPLE_INTERVAL, emit_state)
+    if start_bridge then start_bridge(player) end
 
     player:ListenForEvent("onremove", function()
+        if bridge_client then bridge_client:stop(); bridge_client = nil end
+        if player._jev_bridge_tick then player._jev_bridge_tick:Cancel(); player._jev_bridge_tick = nil end
         if player._jev_dst_telemetry_task ~= nil then
             player._jev_dst_telemetry_task:Cancel()
             player._jev_dst_telemetry_task = nil
@@ -1646,7 +1686,7 @@ local function find_sufficient_tool(inventory, tool_prefab, required)
     return best_uses >= required and best or nil, best_uses
 end
 
-local function perform_work_action(action, target_tag, tool_prefab)
+local function perform_work_action(action, target_tag, tool_prefab, preferred_guid)
     local player = G.ThePlayer
     if player == nil or not player:IsValid() then
         print("[JEV_DST_ACTION_ERROR]" .. string.lower(action.id) .. ":no_local_player")
@@ -1663,7 +1703,7 @@ local function perform_work_action(action, target_tag, tool_prefab)
     local candidates = G.TheSim:FindEntities(px, py, pz, 6, { target_tag }, EXCLUDE_TAGS)
     local target, required, tool, available, nearest_distance = nil, nil, nil, 0, nil
     for _, candidate in ipairs(candidates) do
-        if candidate ~= player and candidate:IsValid() then
+        if candidate ~= player and candidate:IsValid() and (preferred_guid == nil or candidate.GUID == preferred_guid) then
             local candidate_required = required_work(candidate, target_tag)
             local candidate_tool, candidate_available = nil, 0
             if candidate_required ~= nil then
@@ -1800,6 +1840,7 @@ local COOKABLE_FOOD_PRIORITY =
     "berries",
     "berries_juicy",
     "carrot",
+    "seeds",
 }
 
 local function cook_one_food()
@@ -1959,7 +2000,9 @@ local function build_campfire()
     controller:StartBuildPlacementMode(recipe, nil)
     print("[JEV_DST_ACTION]build_campfire:buffered")
 
+    local generation = player._jev_bridge_generation
     player:DoTaskInTime(0.35, function()
+        if player._jev_bridge_generation ~= generation then return end
         if not player:IsValid() or not builder:IsBuildBuffered(recipe.name) then
             print("[JEV_DST_ACTION_ERROR]build_campfire:buffer_lost_before_placement")
             return
@@ -2025,7 +2068,9 @@ local function build_science_machine()
     controller:StartBuildPlacementMode(recipe, nil)
     print("[JEV_DST_ACTION]build_science_machine:buffered")
 
+    local generation = player._jev_bridge_generation
     player:DoTaskInTime(0.35, function()
+        if player._jev_bridge_generation ~= generation then return end
         if not player:IsValid() or not builder:IsBuildBuffered(recipe.name) then
             print("[JEV_DST_ACTION_ERROR]build_science_machine:buffer_lost_before_placement")
             return
@@ -2174,9 +2219,10 @@ end
 
 -- Reserved bridge keys. The external controller emits these keys; the mod
 -- translates them into bounded semantic actions and validates prerequisites.
-G.TheInput:AddKeyUpHandler(G.KEY_F4, function()
+local function cancel_native_work()
     local player = G.ThePlayer
     if player == nil then return end
+    player._jev_bridge_generation = (player._jev_bridge_generation or 0) + 1
     if player._jev_dst_work_task ~= nil then
         player._jev_dst_work_task:Cancel()
         player._jev_dst_work_task = nil
@@ -2192,28 +2238,131 @@ G.TheInput:AddKeyUpHandler(G.KEY_F4, function()
         safe_call(function() controller.locomotor:Stop() end, nil)
     end
     print("[JEV_DST_ACTION]cancel_work:requested")
-end)
-G.TheInput:AddKeyUpHandler(G.KEY_KP_MULTIPLY, craft_torch)
-G.TheInput:AddKeyUpHandler(G.KEY_KP_DIVIDE, equip_torch)
-G.TheInput:AddKeyUpHandler(G.KEY_KP_MINUS, unequip_torch)
-G.TheInput:AddKeyUpHandler(G.KEY_KP_PLUS, function() craft_item("axe") end)
-G.TheInput:AddKeyUpHandler(G.KEY_KP_PERIOD, function() craft_item("pickaxe") end)
-G.TheInput:AddKeyUpHandler(G.KEY_F6, build_campfire)
-G.TheInput:AddKeyUpHandler(G.KEY_F7, eat_safe_food)
-G.TheInput:AddKeyUpHandler(G.KEY_F8, function() perform_work_action(G.ACTIONS.CHOP, "CHOP_workable", "axe") end)
-G.TheInput:AddKeyUpHandler(G.KEY_F9, function() perform_work_action(G.ACTIONS.MINE, "MINE_workable", "pickaxe") end)
-G.TheInput:AddKeyUpHandler(G.KEY_F10, attack_nearest_hostile)
-G.TheInput:AddKeyUpHandler(G.KEY_F11, equip_best_weapon)
-G.TheInput:AddKeyUpHandler(G.KEY_F12, build_science_machine)
-G.TheInput:AddKeyUpHandler(G.KEY_F5, reject_current_frontier)
-G.TheInput:AddKeyUpHandler(G.KEY_F3, cook_one_food)
-G.TheInput:AddKeyUpHandler(G.KEY_F2, function() emit_state(G.ThePlayer) end)
-G.TheInput:AddKeyUpHandler(G.KEY_F1, function()
-    if G.TheWorld ~= nil and G.ThePlayer ~= nil then
-        exploration.reject(get_navigation_memory(G.TheWorld), G.GetTime())
-        emit_state(G.ThePlayer)
+end
+
+start_bridge = function(player)
+    local loaded, config = protected_call(function() return require("jev_bridge_config") end)
+    if not loaded or type(config) ~= "table" or config.enabled ~= true then return end
+    if type(config.url) ~= "string" or not string.match(config.url, "^http://127%.0%.0%.1:%d+/v1/exchange$")
+        or type(config.token) ~= "string" or #config.token < 32 then
+        print("[JEV_DST_BRIDGE]invalid_local_configuration")
+        return
     end
-end)
+    local native = require("jev_native_executor")
+    local transport = require("jev_bridge")
+    local function controller()
+        return player.components and player.components.playercontroller
+    end
+    local function walk(action)
+        local pc = controller()
+        local point = G.Vector3(action.x, 0, action.z)
+        local px, _, pz = player.Transform:GetWorldPosition()
+        if pc == nil or not graph_segment_passable(G.TheWorld.Map, px, pz, point.x, point.z)
+            or (action.kind ~= "flee_from_nearest_hostile"
+                and hazard_segment_unsafe(get_navigation_memory(G.TheWorld), px, pz, point.x, point.z)) then
+            G.error("walk_destination_unavailable")
+        end
+        local buffered = G.BufferedAction(player, nil, G.ACTIONS.WALKTO, nil, point)
+        if not pc.ismastersim then
+            -- Mirror native LeftClick RPC wiring, including non-predicting clients.
+            local function send()
+                G.SendRPCToServer(G.RPC.LeftClick, G.ACTIONS.WALKTO.code, point.x, point.z,
+                    nil, nil, pc:EncodeControlMods(), G.ACTIONS.WALKTO.canforce)
+            end
+            if pc.locomotor == nil then buffered.non_preview_cb = send else buffered.preview_cb = send end
+        end
+        pc:DoAction(buffered)
+    end
+    local function collect_native(action)
+        local pc = controller()
+        local target = G.Ents[action.guid]
+        if pc == nil or target == nil or not target:IsValid() or target.prefab ~= action.prefab then
+            G.error("collection_target_changed")
+        end
+        if PICKABLE_SOURCE_PREFABS[target.prefab] and not can_be_picked(target) then G.error("target_not_pickable") end
+        if pc:IsBusy() then return false end
+        local buffered = pc:GetActionButtonAction(target)
+        if buffered == nil or buffered.target ~= target
+            or (buffered.action ~= G.ACTIONS.PICK and buffered.action ~= G.ACTIONS.PICKUP) then
+            -- Busy/recovery/remote cooldown can suppress the native action
+            -- briefly. The executor retries this exact GUID with a deadline.
+            return false
+        end
+        if not pc.ismastersim then
+            local function send() pc:RemoteActionButton(buffered, true) end
+            if pc.locomotor == nil then buffered.non_preview_cb = send else buffered.preview_cb = send end
+        end
+        pc:DoAction(buffered)
+        return true
+    end
+    local actions = {craft_torch=craft_torch,equip_torch=equip_torch,unequip_torch=unequip_torch,
+        eat_safe_food=eat_safe_food,cook_food=cook_one_food,build_campfire=build_campfire,
+        build_sciencemachine=build_science_machine,equip_weapon=equip_best_weapon}
+    local executor = native.new({now=G.GetTime,stop=function()
+        if player == G.ThePlayer then cancel_native_work() end
+    end,safe=function(action)
+        local px, _, pz = player.Transform:GetWorldPosition()
+        return graph_segment_passable(G.TheWorld.Map, px, pz, action.x, action.z)
+            and not hazard_segment_unsafe(get_navigation_memory(G.TheWorld), px, pz, action.x, action.z)
+    end,issue=function(_,action)
+        if action.kind == "collect" then return collect_native(action)
+        elseif action.kind == "explore" or action.kind == "flee_from_nearest_hostile" then walk(action)
+        elseif action.kind == "chop_nearest_tree" then
+            perform_work_action(G.ACTIONS.CHOP,"CHOP_workable","axe",action.guid)
+        elseif action.kind == "mine_nearest_rock" then
+            perform_work_action(G.ACTIONS.MINE,"MINE_workable","pickaxe",action.guid)
+        elseif action.kind == "craft_axe" then craft_item("axe")
+        elseif action.kind == "craft_pickaxe" then craft_item("pickaxe")
+        elseif actions[action.kind] then actions[action.kind]()
+        else G.error("unsupported_native_action") end
+    end})
+    bridge_client = transport.new(config,{
+        session_id=tostring(player.GUID)..":"..tostring(G.GetTime())..":"..tostring({}),
+        now=G.GetTime,wall_now=measurement_clock,available=native.available,
+        state=function(timings) return make_state(player,timings) end,
+        alive=function() return player:IsValid() and player == G.ThePlayer end,
+        request=function(url,payload,callback,receipt)
+            receipt=receipt or {}
+            local encode_at=measurement_clock and measurement_clock()
+            local encoded = json.encode(payload)
+            receipt.encode_ms=measurement.elapsed(measurement_clock,encode_at)
+            receipt.request_bytes=#encoded
+            local query_at=measurement_clock and measurement_clock()
+            local ok = protected_call(function()
+                G.TheSim:QueryServer(url,function(body,success,code)
+                    local arrived=measurement_clock and measurement_clock()
+                    receipt.query_to_callback_ms=measurement.elapsed(measurement_clock,query_at)
+                    receipt.response_bytes=type(body)=="string" and #body or 0
+                    receipt.http_status=type(code)=="number" and code or nil
+                    local decoded, result = protected_call(function() return json.decode(body) end)
+                    receipt.decode_ms=measurement.elapsed(measurement_clock,arrived)
+                    local dispatch_at=measurement_clock and measurement_clock()
+                    local handled, reason = protected_call(function()
+                        callback(decoded and result or nil,success,code)
+                    end)
+                    receipt.callback_dispatch_ms=measurement.elapsed(measurement_clock,dispatch_at)
+                    receipt.done=true
+                    if not handled then
+                        executor:finish("failed","native_exception")
+                        print("[JEV_DST_BRIDGE]callback_exception:"..tostring(reason))
+                    end
+                end,"POST",encoded)
+            end)
+            receipt.query_call_ms=measurement.elapsed(measurement_clock,query_at)
+            if not ok then receipt.done=true; receipt.http_status=0; callback(nil,false,0) end
+        end,
+    },executor)
+    player._jev_bridge_tick = player:DoPeriodicTask(0.2,function()
+        if bridge_client then
+            local ok, reason = protected_call(function() bridge_client:tick() end)
+            if not ok then
+                executor:finish("failed","native_exception")
+                print("[JEV_DST_BRIDGE]native_exception:"..tostring(reason))
+            end
+        end
+    end)
+    print("[JEV_DST_BRIDGE]enabled_loopback_http native_mcp_only")
+end
 
 -- ThePlayer is often still nil while player prefabs are being initialized on a
 -- joining client. Poll from the world instead of making a one-shot comparison.
@@ -2251,3 +2400,25 @@ AddSimPostInit(function()
         try_start_telemetry(G.ThePlayer)
     end)
 end)
+
+-- Returned handles allow offline native-action tests without installing input
+-- handlers. DST's Mod loader ignores this value; runtime commands arrive via MCP.
+return {
+    emit_state = function() emit_state(G.ThePlayer) end,
+    cancel = cancel_native_work,
+    craft_torch = craft_torch, equip_torch = equip_torch, unequip_torch = unequip_torch,
+    craft_axe = function() craft_item("axe") end,
+    craft_pickaxe = function() craft_item("pickaxe") end,
+    build_campfire = build_campfire, eat_safe_food = eat_safe_food,
+    chop = function() perform_work_action(G.ACTIONS.CHOP,"CHOP_workable","axe") end,
+    mine = function() perform_work_action(G.ACTIONS.MINE,"MINE_workable","pickaxe") end,
+    attack = attack_nearest_hostile, equip_weapon = equip_best_weapon,
+    build_sciencemachine = build_science_machine, cook_food = cook_one_food,
+    reject_frontier = reject_current_frontier,
+    reject_search = function()
+        if G.TheWorld and G.ThePlayer then
+            exploration.reject(get_navigation_memory(G.TheWorld),G.GetTime())
+            emit_state(G.ThePlayer)
+        end
+    end,
+}

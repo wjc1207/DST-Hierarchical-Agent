@@ -5,11 +5,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-import daily_planner
-import jev_agent
-from action_buffer import predict_success
-from model_state import model_game_state
-from test_regressions import grass, lit_campfire, state
+from mcp_agent import daily_planner
+from mcp_agent import jev_client as jev_agent
+from mcp_agent.model_state import model_game_state
+from fixtures import grass, lit_campfire, state
 
 
 class Response:
@@ -115,22 +114,13 @@ class SharedStateTests(unittest.TestCase):
         self.assertEqual(decider["inventory_details"]["equipped"][0]["durability_percent"], 0.04)
         self.assertEqual(decider["world"]["phase"], "night")
 
-    def test_prefetch_prediction_is_explicit_not_presented_as_observed(self):
-        actual = self.observed()
-        predicted = predict_success(actual, {"kind": "collect", "prefab": "grass", "guid": 11})
-        self.assertIsNotNone(predicted)
-        facts = self.assert_same_facts(predicted)
-        self.assertEqual(facts["state_basis"], "predicted")
-        self.assertTrue(facts["execution_context"]["predicted_success"])
-        self.assertEqual(facts["inventory"]["cutgrass"], 5)
-        self.assertEqual(self.assert_same_facts(actual)["inventory"]["cutgrass"], 4)
 
     def test_actual_api_payloads_share_facts_but_not_model_specific_roles(self):
         actual = self.observed()
         planning = daily_planner.planning_context(actual, [{"action": "collect_grass"}])
         planning["dst_knowledge"] = "strategic reference"
         response = Response({"choices": [{"finish_reason": "stop", "message": {
-            "content": json.dumps({"goal": "Find gold", "steps": ["Explore"]}),
+            "content": json.dumps({"goal":"Find gold","tasks":[{"id":"gold","title":"Gold","target":{"type":"inventory","prefab":"goldnugget","count":1}}]}),
         }}]})
         with patch.object(daily_planner.urllib.request, "urlopen", return_value=response) as send:
             daily_planner.request_plan("https://example.invalid/plan", "secret", "planner", 1, planning)
