@@ -2,7 +2,7 @@
 
 [中文版](README.md) · [Technical reference](docs/TECHNICAL.EN.md)
 
-An experimental Don't Starve Together agent. DeepSeek maintains prioritized resource goals. The executor completes visible tasks and searches for missing resources using Klei room-generation priors and observed map memory. Lua executes native actions and verifies effects; JEV handles emergencies and off-board opportunities instead of each planned pickup. The long-term goal is an Alchemy Engine; Science Machine construction is currently supported.
+An experimental Don't Starve Together agent. DeepSeek maintains prioritized resource goals. The executor completes visible tasks and searches for missing resources using Klei room-generation priors and observed map memory. Lua executes native actions and verifies effects; JEV handles emergencies and temporarily takes over during DeepSeek planning gaps. The long-term goal is an Alchemy Engine; Science Machine construction is currently supported.
 
 Previous milestones: [survive the first night](https://bilibili.com/video/BV1aehE6DEji) · [build a Science Machine](https://www.bilibili.com/video/BV1mFaV6aEQ2)
 

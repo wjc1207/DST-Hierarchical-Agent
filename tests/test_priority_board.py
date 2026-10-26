@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from mcp_agent import daily_planner
-from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
+from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals, task_signature
 from mcp_agent.navigation_intents import ExplorationExecutor, dispatch_for_navigation
 from mcp_agent.region_resources import expected_sources, room_resources
 from tools.extract_worldgen_resources import extract
@@ -38,6 +38,99 @@ NAV = {"explore_current_region": {"kind": "explore", "mode": "region", "x": 4, "
 
 
 class GoalTests(unittest.TestCase):
+    def test_navigation_targets_include_all_ready_local_goals_but_not_done_or_blocked(self):
+        goals = board(task("gold","goldnugget"), task("grass","cutgrass",priority=2),
+                      task("twigs","twigs",depends_on=["grass"]), task("logs","log"),
+                      task("rocks","rocks"), {"id":"food","title":"Food","priority":3,
+                      "target":{"type":"hunger_ratio","at_least":.8}})
+        runtime = PriorityBoardExecutor(); s = state(log=2)
+        runtime.view(goals,s)  # Completion remains latched after spending the logs.
+        s["player"]["inventory"]["items"] = []
+        runtime._record(goals["tasks"][4])["blocked"] = "search_budget_exhausted"
+        targets = runtime.navigation_targets(goals,s)
+        self.assertEqual(targets, [{"type":"inventory","prefab":"goldnugget","count":2},
+                                  {"type":"inventory","prefab":"cutgrass","count":2},
+                                  {"type":"hunger_ratio","at_least":.8}])
+        targets[0]["count"] = 99
+        self.assertEqual(goals["tasks"][0]["target"]["count"],2)
+        travel = board({"id":"visit","title":"Visit","target":{"type":"visit_region","node_id":"B"}})
+        self.assertEqual(runtime.navigation_targets(travel,s), [])
+
+    def hunger_board(self, **extra):
+        return board({"id": "food", "title": "Recover hunger", "priority": 1,
+                      "target": {"type": "hunger_ratio", "at_least": .6}, **extra})
+
+    def test_continuous_navigation_reviews_changes_and_preserves_room_and_goal_budgets(self):
+        clock = [0.]; runtime = PriorityBoardExecutor(clock=lambda:clock[0])
+        goals, s = board(task("gold","goldnugget")), state()
+        targets = runtime.navigation_targets(goals,s); signature = task_signature(goals["tasks"][0])
+        runtime.navigation, runtime.navigation_mode, runtime.selected = True, "region", "gold"
+        runtime.last_tick = 0
+        runtime.room_search[("gold","A:FlowerPatch")] = {"seconds":0.,"area":64}
+        self.assertIsNone(runtime.navigation_review_reason(goals,s,"gold",signature,targets))
+        clock[0] = 30
+        self.assertEqual(runtime.navigation_review_reason(goals,s,"gold",signature,targets),"room_search_budget")
+        revised = board(task("gold","goldnugget"),task("grass","cutgrass",priority=2))
+        self.assertEqual(runtime.navigation_review_reason(revised,s,"gold",signature,targets),"navigation_targets_changed")
+        runtime.records["gold"]["blocked"] = "search_budget_exhausted"
+        self.assertEqual(runtime.navigation_review_reason(goals,s,"gold",signature,targets),"goal_changed_or_blocked")
+        self.assertEqual(runtime.navigation_review_reason(None,s,"gold",signature,targets),"board_changed")
+
+    def test_hunger_goal_gathers_then_eats_and_finishes_from_observed_hunger(self):
+        goals = self.hunger_board(); runtime = PriorityBoardExecutor(); nav = ExplorationExecutor()
+        s = state(); s["player"]["vitals"]["hunger"] = 67
+        s["nearby"] = [{"guid": 2, "distance": 13.05}, {"guid": 3, "distance": 1}]
+        actions = {**NAV, "carrot": collect("carrot", "carrot_planted", 2),
+                   "flower": collect("petals", "flower", 3), "meat": collect("meat", "meat", 4)}
+        self.assertEqual(runtime.choose(goals, s, actions, nav)[1], "carrot")
+        s["player"]["inventory"]["items"] = [{"prefab": "carrot", "count": 1}]
+        actions["eat_safe_food"] = {"kind": "eat_safe_food"}
+        self.assertEqual(runtime.choose(goals, s, actions, nav)[1], "eat_safe_food")
+        self.assertEqual(runtime.view(goals, s)["status"], "active")
+        s["player"]["vitals"]["hunger"] = 90
+        self.assertIsNone(runtime.choose(goals, s, actions, nav))
+        self.assertEqual(runtime.view(goals, s)["status"], "completed")
+        s["player"]["vitals"]["hunger"] = 89
+        self.assertEqual(runtime.view(goals, s)["status"], "completed")
+
+    def test_hunger_search_uses_food_positions_rooms_priors_then_unknown_branches(self):
+        cases = [
+            ("remembered_source_position", "carrot_route", {}, [],
+             {"carrot_route": {"kind": "explore", "mode": "resource", "prefab": "carrot_planted",
+                               "resource_guid": 22, "node_id": "A:FlowerPatch", "distance": 20}}),
+            ("source_room", "explore_current_region", {"resources_seen": ["berrybush"]}, [], {}),
+            ("known_source_bfs", "travel_B", {},
+             [{"node_id": "B:Unknown", "resources_seen": ["carrot_planted"], "hops": 1}],
+             {"travel_B": {"kind": "explore", "mode": "graph", "node_id": "B:Unknown"}}),
+            ("worldgen_source_bfs", "travel_B", {}, [{"node_id": "B:BGGrass", "hops": 1}],
+             {"travel_B": {"kind": "explore", "mode": "graph", "node_id": "B:BGGrass"}}),
+            ("dfs_unknown_exit", "explore_other_region", {}, [], {}),
+        ]
+        for strategy, choice, current, routes, extra in cases:
+            with self.subTest(strategy=strategy):
+                s = state(); s["player"]["vitals"]["hunger"] = 67
+                s["navigation"]["graph"]["current"].update(current)
+                s["navigation"]["graph"]["routes"] = routes
+                actions = {**NAV, **extra, "grass_route": {"kind": "explore", "mode": "resource",
+                           "prefab": "grass", "resource_guid": 23, "node_id": "A:FlowerPatch", "distance": 1}}
+                nav = ExplorationExecutor()
+                self.assertEqual(PriorityBoardExecutor().choose(self.hunger_board(), s, actions, nav)[1], choice)
+                self.assertEqual(nav.strategy, strategy)
+
+    def test_hunger_search_retains_visible_first_scheduling_and_search_budget(self):
+        s = state(); s["player"]["vitals"]["hunger"] = 67
+        goals = self.hunger_board(search_budget_seconds=10)
+        goals = board(goals["tasks"][0], task("grass", "cutgrass", 2))
+        now = [0.]; runtime = PriorityBoardExecutor(clock=lambda: now[0]); nav = ExplorationExecutor()
+        self.assertEqual(runtime.choose(goals, s, {**NAV, "grass": collect("cutgrass")}, nav)[1], "grass")
+        self.assertEqual(runtime.choose(goals, s, NAV, nav)[0]["id"], "food")
+        now[0] = 11
+        food = next(t for t in runtime.view(goals, s)["tasks"] if t["id"] == "food")
+        self.assertEqual(food["blocked_reason"], "search_budget_exhausted")
+        # No invented movement when Lua offers only lighting/safety options.
+        self.assertIsNone(PriorityBoardExecutor().choose(self.hunger_board(), s,
+                          {"equip_torch": {"kind": "equip_torch"}}, ExplorationExecutor()))
+
     def test_visible_lower_priority_before_missing_higher_and_priority_among_visible(self):
         goals = board(task("gold", "goldnugget"), task("grass", "cutgrass", 2), task("twigs", "twigs", 3))
         actions = {**NAV, "grass": collect("cutgrass"), "twigs": collect("twigs", "sapling")}
@@ -232,10 +325,40 @@ class ReviewTests(unittest.TestCase):
 
     def test_completed_board_requests_new_plan_with_verified_progress(self):
         p = self.planner(); p.plan = board(task("grass", "cutgrass"))
+        p.goal_retry_at = daily_planner.time.monotonic() + 100
         result = p.update(state(cutgrass=2))
         self.assertEqual(result["status"], "completed")
         self.assertEqual(p.executor.calls[-1][4]["replan_reason"], "all_tasks_completed")
         self.assertEqual(p.executor.calls[-1][4]["current_task_board"]["tasks"][0]["status"], "done")
+
+    def test_unavailable_board_review_is_immediate_deduplicated_and_keeps_error_backoff(self):
+        p = self.planner(); p.plan = board({"id":"campfire","title":"Night fire",
+            "target":{"type":"structure","prefab":"campfire"}})
+        p.requested_slot = (1, 0)
+        p.goal_retry_at = 999
+        with patch.object(daily_planner.time, "monotonic", return_value=100):
+            view = p.request_review(state(), "no_feasible_action_or_route", immediate=True)
+            p.request_review(state(), "no_feasible_action_or_route")
+            self.assertEqual(len(p.executor.calls), 1)
+            self.assertEqual(view["tasks"][0]["id"], "campfire")
+            self.assertEqual(p.executor.calls[0][4]["replan_reason"], "no_feasible_action_or_route")
+            p.executor.futures[0].set_result((None, 1., RuntimeError("offline failure")))
+            p.update(state())
+            p.request_review(state(), "no_feasible_action_or_route", immediate=True)
+            self.assertEqual(len(p.executor.calls), 1)
+            self.assertEqual(p.goal_replan_reason, "review_retry")
+        with patch.object(daily_planner.time, "monotonic", return_value=116):
+            p.update(state())
+        self.assertEqual(len(p.executor.calls), 2)
+        self.assertIsNotNone(p.plan)
+
+    def test_empty_runtime_board_requests_evaluation_instead_of_waiting_for_quarter(self):
+        p = self.planner(); p.plan = {**board(task("grass", "cutgrass")), "tasks": []}
+        p.requested_slot = (1, 0)
+        p.goal_retry_at = daily_planner.time.monotonic() + 100
+        self.assertEqual(p.update(state())["status"], "completed")
+        self.assertEqual(len(p.executor.calls), 1)
+        self.assertEqual(p.executor.calls[0][4]["current_task_board"]["tasks"], [])
 
     def test_exact_native_failure_feedback_is_preserved_without_invalidating_board(self):
         p = self.planner(); p.plan = board(task("grass", "cutgrass"))

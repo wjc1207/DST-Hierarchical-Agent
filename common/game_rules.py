@@ -2,7 +2,8 @@
 import math
 
 COLLECT_PRODUCTS = {"flower": "petals", "grass": "cutgrass", "sapling": "twigs", "sapling_moon": "twigs",
-                    "berrybush": "berries", "berrybush2": "berries", "berrybush_juicy": "berries_juicy"}
+                    "berrybush": "berries", "berrybush2": "berries", "berrybush_juicy": "berries_juicy",
+                    "carrot_planted": "carrot"}
 PICKABLE_SOURCE_PREFABS = frozenset(COLLECT_PRODUCTS)
 EXPLORATION_RESOURCE_PREFABS = set(COLLECT_PRODUCTS) | {
     "twigs", "cutgrass", "flint", "log", "rocks", "goldnugget", "nitre", "pinecone", "acorn",
@@ -19,7 +20,30 @@ WORK_PRODUCTS = {
     **{product: ("mine_nearest_rock", {source for source, products in MINE_PRODUCTS.items() if product in products})
        for product in ("rocks", "flint", "nitre", "goldnugget")},
 }
-SAFETY_INTERRUPTS = {"targeted_by_hostile", "health_lost", "light_changed", "critical_hunger", "night_light_requires_decision"}
+SAFETY_INTERRUPTS = {"targeted_by_hostile", "health_lost", "light_changed", "critical_hunger",
+                     "critical_sanity", "critical_health", "night_light_requires_decision"}
+
+
+def survival_dangers(state):
+    """Known urgent facts, including low vitals without a carried remedy."""
+    reasons = set()
+    vitals = state.get("player", {}).get("vitals", {})
+    for vital in ("health", "hunger", "sanity"):
+        value, maximum = vitals.get(vital), vitals.get(vital + "_max")
+        if (type(value) in (int, float) and type(maximum) in (int, float)
+                and math.isfinite(value) and math.isfinite(maximum)
+                and maximum > 0 and value / maximum < .30):
+            reasons.add("critical_" + vital)
+    nearby = state.get("nearby", [])
+    if any(e.get("activeThreat") for e in nearby):
+        reasons.add("targeted_by_hostile")
+    torch = any(i.get("prefab") == "torch" for i in
+                state.get("player", {}).get("inventory", {}).get("equipped", []))
+    fire = any(e.get("prefab") in {"campfire", "firepit"} and "fire" in e.get("tags", [])
+               and e.get("distance", 999) <= 8 for e in nearby)
+    if state.get("world", {}).get("phase") == "night" and not torch and not fire:
+        reasons.add("night_light_requires_decision")
+    return reasons
 
 
 def collect_target_available(target):

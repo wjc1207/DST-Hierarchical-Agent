@@ -6,9 +6,9 @@ import json
 import math
 import time
 
-from common.game_rules import WORK_PRODUCTS, SAFETY_INTERRUPTS
+from common.game_rules import WORK_PRODUCTS, SAFETY_INTERRUPTS, SAFE_FOOD_PREFABS
 from common.task_board import validate_board, board_view
-from mcp_agent.navigation_intents import dispatch_for_navigation
+from mcp_agent.navigation_intents import dispatch_for_navigation, FOOD_SEARCH_PRODUCT
 
 
 def is_priority_board(board):
@@ -162,6 +162,13 @@ class PriorityBoardExecutor:
     @staticmethod
     def local_choices(task, actions):
         target = task["target"]
+        if target["type"] == "hunger_ratio":
+            if "eat_safe_food" in actions:
+                return [("eat_safe_food", actions["eat_safe_food"])]
+            # The native snapshot already validates pickability and the path.
+            # Gather one available safe food, then re-evaluate eating/goal progress.
+            return [(k, a) for k, a in actions.items() if a.get("kind") == "collect"
+                    and a.get("product", a.get("prefab")) in SAFE_FOOD_PREFABS]
         if target["type"] == "inventory":
             product = target["prefab"]
             candidates = [(k, a) for k, a in actions.items() if a.get("kind") == "collect" and a.get("product", a.get("prefab")) == product]
@@ -172,9 +179,34 @@ class PriorityBoardExecutor:
             if craft in actions:
                 candidates.append((craft, actions[craft]))
             return candidates
-        key = ("eat_safe_food" if target["type"] == "hunger_ratio" else
-               "build_" + target["prefab"] if target["type"] == "structure" else None)
+        key = "build_" + target["prefab"] if target["type"] == "structure" else None
         return [(key, actions[key])] if key in actions else []
+
+    def navigation_targets(self, board, state):
+        # Include all ready priorities, not just the goal owning the current
+        # route. Dependencies, latched completion and search blocks use view().
+        return [copy.deepcopy(task["target"]) for task in self.view(board, state)["tasks"]
+                if task["status"] in {"ready", "in_progress"}
+                and task["target"]["type"] in {"inventory", "structure", "hunger_ratio"}]
+
+    def navigation_review_reason(self, board, state, task_id, signature, targets):
+        """Longer native walks still obey planner updates and existing budgets."""
+        if not is_priority_board(board):
+            return "board_changed"
+        view = self.view(board, state)
+        task = next((t for t in view["tasks"] if t["id"] == task_id), None)
+        if not task or task_signature(task) != signature or task["status"] not in {"ready", "in_progress"}:
+            return "goal_changed_or_blocked"
+        current = [t["target"] for t in view["tasks"] if t["status"] in {"ready", "in_progress"}
+                   and t["target"]["type"] in {"inventory", "structure", "hunger_ratio"}]
+        if current != targets:
+            return "navigation_targets_changed"
+        graph = state.get("navigation", {}).get("graph") or {}
+        room = self.room_search.get((task_id, graph.get("current_node")))
+        if self.navigation_mode in {"region", "search", "resource"} and room and (
+                room["seconds"] >= 30 or (graph.get("current") or {}).get("explored_area", 0) - room["area"] >= 256):
+            return "room_search_budget"
+        return None
 
     def choose(self, board, state, actions, navigator):
         view, now = self.view(board, state), self.clock()
@@ -193,15 +225,16 @@ class PriorityBoardExecutor:
         nav = dispatch_for_navigation(actions, state)
         for task in ready:
             target = task["target"]
-            if target["type"] not in {"inventory", "visit_region", "survey_region", "known_regions"} or target.get("prefab") in {"torch", "axe", "pickaxe"}:
+            if target["type"] not in {"inventory", "hunger_ratio", "visit_region", "survey_region", "known_regions"} or target.get("prefab") in {"torch", "axe", "pickaxe"}:
                 continue
-            if target["type"] == "inventory":
+            if target["type"] in {"inventory", "hunger_ratio"}:
+                product = FOOD_SEARCH_PRODUCT if target["type"] == "hunger_ratio" else target["prefab"]
                 graph = state.get("navigation", {}).get("graph") or {}
                 node, area = graph.get("current_node"), graph.get("current") or {}
                 room_key = (task["id"], node)
                 survey = self.room_search.setdefault(room_key, {"seconds": 0., "area": area.get("explored_area", 0)})
                 if (survey["seconds"] >= 30 or area.get("explored_area", 0) - survey["area"] >= 256):
-                    navigator.exhaust_source(node, target["prefab"], area, "room_search_budget")
+                    navigator.exhaust_source(node, product, area, "room_search_budget")
                     self.room_search[room_key] = {"seconds": 0., "area": area.get("explored_area", 0)}
             # Dependencies were checked against the FULL board above. The
             # navigator receives just this goal, not dangling prerequisite IDs.

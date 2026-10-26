@@ -1,6 +1,8 @@
 local json = require("json")
 local exploration = require("jev_exploration")
 local resource_memory = require("jev_resource_memory")
+local campfire_siting = require("jev_campfire_siting")
+local tree_work = require("jev_tree_work")
 local execution_observer = require("jev_execution")
 local G = GLOBAL
 local protected_call = G.pcall
@@ -70,10 +72,8 @@ local RELEVANT_TAGS =
     "cooker",
 }
 
--- Conservative whole-target workloads from the shipped DST scripts. Trees
--- use the largest normal growth stage because growth stage/work-left is not
--- replicated to clients. Known rock prefabs can use their exact maximum.
-local DEFAULT_CHOP_WORK = 15
+-- Unknown tree stages retain a conservative maximum; known replicated
+-- animations provide stage-specific workloads. Rock maxima are prefab-specific.
 local MINE_WORK_BY_PREFAB =
 {
     rock1 = 6,
@@ -106,6 +106,11 @@ local WEAPON_PREFAB_SCORE =
     nightsword = 68,
     glasscutter = 68,
 }
+
+-- Stable agent names differ from Klei recipe/entity IDs. Normalize only at
+-- this boundary; every builder call still uses the actual game identifier.
+local SCIENCE_MACHINE_GAME_ID = "researchlab"
+local PREFAB_ALIASES = { [SCIENCE_MACHINE_GAME_ID] = "sciencemachine" }
 
 local RELEVANT_PREFABS =
 {
@@ -143,11 +148,12 @@ local RELEVANT_PREFABS =
     charcoal = true,
     marble = true,
     moonrocknugget = true,
-    sciencemachine = true,
+    [SCIENCE_MACHINE_GAME_ID] = true,
 }
 
 local PICKABLE_SOURCE_PREFABS =
 {
+    carrot_planted = true,
     flower = true,
     grass = true,
     sapling = true,
@@ -329,12 +335,15 @@ local function read_nearby(player)
             local record =
             {
                 guid = entity.GUID,
-                prefab = entity.prefab or "unknown",
+                prefab = PREFAB_ALIASES[entity.prefab] or entity.prefab or "unknown",
                 distance = round(math.sqrt(dx * dx + dz * dz), 2),
                 dx = round(dx, 2),
                 dz = round(dz, 2),
                 tags = entity_tags(entity),
             }
+            if PREFAB_ALIASES[entity.prefab] then
+                record.game_prefab = entity.prefab
+            end
             if PICKABLE_SOURCE_PREFABS[entity.prefab or ""] then
                 record.pickable = can_be_picked(entity)
             end
@@ -344,7 +353,8 @@ local function read_nearby(player)
                 end, 1)
             end
             if entity:HasTag("CHOP_workable") then
-                record.work_required = DEFAULT_CHOP_WORK
+                local tree=tree_work.read(entity,G.TUNING)
+                record.work_required,record.tree_stage=tree.work_required,tree.tree_stage
             elseif entity:HasTag("MINE_workable") then
                 record.work_required = MINE_WORK_BY_PREFAB[entity.prefab or ""]
             end
@@ -371,14 +381,18 @@ local function read_nearby(player)
 end
 
 local function read_crafting(player)
-    local result = { torch = false, campfire = false, axe = false, pickaxe = false }
+    local result = { torch = false, campfire = false, axe = false, pickaxe = false, sciencemachine = false }
     local builder = player.replica ~= nil and player.replica.builder or nil
     if builder ~= nil then
         result.torch = safe_call(function() return builder:CanBuild("torch") end, false)
-        result.campfire = safe_call(function() return builder:CanBuild("campfire") end, false)
+        result.campfire = safe_call(function()
+            return builder:CanBuild("campfire") or builder:IsBuildBuffered("campfire")
+        end, false)
         result.axe = safe_call(function() return builder:CanBuild("axe") end, false)
         result.pickaxe = safe_call(function() return builder:CanBuild("pickaxe") end, false)
-        result.sciencemachine = safe_call(function() return builder:CanBuild("sciencemachine") end, false)
+        result.sciencemachine = safe_call(function()
+            return builder:CanBuild(SCIENCE_MACHINE_GAME_ID) or builder:IsBuildBuffered(SCIENCE_MACHINE_GAME_ID)
+        end, false)
     end
     return result
 end
@@ -435,6 +449,7 @@ local function get_navigation_memory(world)
             graph_edges = {},
             gateway_targets = {},
             gateway_crossings = {},
+            route_pauses = {},
             current_node = nil,
             last_node_position = nil,
             return_stack = {},
@@ -1142,7 +1157,13 @@ observe_area_graph = function(player, map, memory, nearby)
     local node = ensure_graph_node(memory, current_id,
         memory.current_region, memory.current_biome)
     if memory.current_node ~= current_id then
-        memory.gateway_crossings = {}
+        local intent=memory.route_intent
+        -- A safe observed detour can briefly leave its source room. Continue
+        -- toward the committed physical entrance instead of returning to it.
+        if not intent or not intent.walking or not intent.entrance or current_id==intent.first then
+            memory.gateway_crossings = {}
+            memory.route_intent = nil
+        end
         local old_id = memory.current_node
         if old_id ~= nil then
             local old_position = memory.last_node_position
@@ -1195,6 +1216,15 @@ local function graph_route_leg(player, map, memory, gateway_id, side_x, side_z,
     local crossing = exploration.gateway_crossing(memory.gateway_crossings[gateway_id],
         px, pz, side_x, side_z, destination_x, destination_z, NAV_ARRIVAL_DISTANCE)
     memory.gateway_crossings[gateway_id] = crossing
+    -- A safe first four units do not make an unsafe entrance reachable.
+    -- Once already crossing, do not require returning to the source endpoint.
+    if not crossing and (hazard_penalty(memory,side_x,side_z)==math.huge
+        or hazard_penalty(memory,destination_x,destination_z)==math.huge
+        or not graph_segment_passable(map,side_x,side_z,destination_x,destination_z)
+        or hazard_segment_unsafe(memory,side_x,side_z,destination_x,destination_z)) then
+        exploration.count(memory,"graph_paths","unsafe_gateway_entrance")
+        return nil
+    end
     if crossing then
         local targets = {
             exploration.gateway_destination(side_x, side_z, destination_x, destination_z, 2),
@@ -1209,15 +1239,15 @@ local function graph_route_leg(player, map, memory, gateway_id, side_x, side_z,
             end
             if reason == "arrived" and graph_segment_passable(map, px, pz, target.x, target.z)
                 and not hazard_segment_unsafe(memory, px, pz, target.x, target.z) then
-                -- Keep this gateway in the graph during topology debounce.
-                -- Python bounds the confirmation wait and cancels on danger.
+                -- Keep the gateway during topology debounce. Lua bounds the
+                -- confirmation wait and pauses only this entrance on timeout.
                 leg = {x=px,z=pz,distance=0,awaiting_region=true}
             end
             if leg ~= nil and not hazard_segment_unsafe(memory, px, pz, leg.x, leg.z) then
                 leg.arrival_distance = 0.2
                 exploration.count(memory, "graph_paths", leg.awaiting_region
                     and "awaiting_region" or "gateway_ready")
-                return leg
+                return leg,math.sqrt((target.x-px)^2+(target.z-pz)^2)
             end
             exploration.count(memory, "graph_paths", reason or "unsafe_gateway")
         end
@@ -1225,14 +1255,16 @@ local function graph_route_leg(player, map, memory, gateway_id, side_x, side_z,
     end
     local direct = make_navigation_leg(player, map,
         { x = side_x, z = side_z }, NAV_ARRIVAL_DISTANCE)
-    if direct ~= nil and not hazard_segment_unsafe(memory, px, pz, direct.x, direct.z) then
+    local crossing_distance=math.sqrt((destination_x-side_x)^2+(destination_z-side_z)^2)+2
+    if direct ~= nil and graph_segment_passable(map,px,pz,side_x,side_z)
+        and not hazard_segment_unsafe(memory,px,pz,side_x,side_z) then
         exploration.count(memory, "graph_paths", "direct_ready")
-        return direct
+        return direct,math.sqrt((side_x-px)^2+(side_z-pz)^2)+crossing_distance
     end
     exploration.count(memory, "graph_paths", direct ~= nil and "direct_hazard" or "direct_blocked")
     -- Use safe observed land even if a detour crosses another known topology
     -- room. An observed region crossing still yields to JEV during execution.
-    local parents, start = observed_detour_paths(player, map, memory, true)
+    local parents, start, costs = observed_detour_paths(player, map, memory, true)
     if start == nil then return nil end
     local goal_key, goal_distance = nil, math.huge
     for key, cell in pairs(memory.cells) do
@@ -1255,17 +1287,20 @@ local function graph_route_leg(player, map, memory, gateway_id, side_x, side_z,
         table.insert(path, 1, memory.cells[next_key])
         next_key = parents[next_key]
     end
-    local waypoint = exploration.path_waypoint(path, px, pz, NAV_ARRIVAL_DISTANCE,
+    -- Keep a nearby corner if it is the only safe next point. The ordinary
+    -- exploration radius can otherwise skip it and cut across blocked land.
+    local waypoint = exploration.path_waypoint(path, px, pz, 0.2,
         NAV_LEG_DISTANCE * 2, function(ax, az, bx, bz)
             return graph_segment_passable(map, ax, az, bx, bz)
                 and not hazard_segment_unsafe(memory, ax, az, bx, bz)
         end)
     if waypoint then
-        local candidate = make_navigation_leg(player, map, waypoint, NAV_ARRIVAL_DISTANCE)
+        local candidate = make_navigation_leg(player, map, waypoint, 0.2)
         if candidate then
             exploration.count(memory, "graph_paths", "detour_ready")
             candidate.detour = true
-            return candidate
+            candidate.arrival_distance = 0.2
+            return candidate,(costs[goal_key] or 0)+goal_distance+crossing_distance
         end
     end
     exploration.count(memory, "graph_paths", "no_safe_next_leg")
@@ -1290,6 +1325,10 @@ read_area_graph = function(player, map, memory)
         unknown_boundary_cells = node.unknown_boundary_cells,
         boundary_complete = node.boundary_complete }
     local px, py, pz = player.Transform:GetWorldPosition()
+    local now=G.GetTime()
+    for id,pause in pairs(memory.route_pauses) do
+        if pause.until_time<=now then memory.route_pauses[id]=nil end
+    end
     local routes = {}
     local gateways = {}
     for _, entrances in pairs(memory.graph_edges) do
@@ -1304,8 +1343,11 @@ read_area_graph = function(player, map, memory)
                 local gateway_id = current_id .. ">" .. other_id .. ":"
                     .. tostring(side_x) .. ":" .. tostring(side_z)
                     .. ":" .. tostring(other_x) .. ":" .. tostring(other_z)
-                local leg = graph_route_leg(player, map, memory, gateway_id,
-                    side_x, side_z, other_x, other_z)
+                local leg,remaining
+                if not memory.route_pauses[gateway_id] then
+                    leg,remaining = graph_route_leg(player, map, memory, gateway_id,
+                        side_x, side_z, other_x, other_z)
+                else exploration.count(memory,"graph_paths","gateway_paused") end
                 if leg ~= nil and not hazard_segment_unsafe(memory, px, pz,
                     leg.x, leg.z)
                     and hazard_penalty(memory, other_x, other_z) < math.huge then
@@ -1313,9 +1355,12 @@ read_area_graph = function(player, map, memory)
                     local distance = math.sqrt((side_x - px) ^ 2 + (side_z - pz) ^ 2)
                     local route = { status = "ready", node_id = other_id,
                         gateway_id = gateway_id,
+                        source_node_id = current_id,
+                        entrance = {ax=side_x,az=side_z,bx=other_x,bz=other_z},
                         biome = other.biome, topology = other.region,
                         entered = other.entries > 0, resources_seen = graph_resources(other),
                         distance = round(distance, 2),
+                        remaining_distance = remaining and round(remaining,2),
                         target = { x = round(other_x, 2), z = round(other_z, 2) },
                         leg = { x = round(leg.x, 2), z = round(leg.z, 2),
                             distance = round(leg.distance, 2), detour = leg.detour == true,
@@ -1331,9 +1376,43 @@ read_area_graph = function(player, map, memory)
     end
     local selections = memory.gateway_targets[current_id] or {}
     memory.gateway_targets[current_id] = selections
-    for other_id, candidates in pairs(gateways) do
-        routes[other_id] = exploration.select_gateway(candidates, selections[other_id])
-        selections[other_id] = routes[other_id].gateway_id
+    local function select_routes()
+        routes={}
+        for other_id, candidates in pairs(gateways) do
+            local eligible={}
+            for _,candidate in ipairs(candidates) do
+                if not memory.route_pauses[candidate.gateway_id] then eligible[#eligible+1]=candidate end
+            end
+            local selected=exploration.select_gateway(eligible,selections[other_id])
+            routes[other_id]=selected
+            selections[other_id]=selected and selected.gateway_id or nil
+        end
+    end
+    select_routes()
+    local intent=memory.route_intent
+    local function transit_route()
+        if not intent or not intent.walking or intent.source==current_id or not intent.entrance
+            or memory.route_pauses[intent.gateway_id] then return end
+        local e=intent.entrance
+        local leg,remaining=graph_route_leg(player,map,memory,intent.gateway_id,e.ax,e.az,e.bx,e.bz)
+        if leg then
+            routes[intent.first]={status="ready",node_id=intent.first,gateway_id=intent.gateway_id,
+                source_node_id=intent.source,entrance=e,distance=math.sqrt((e.ax-px)^2+(e.az-pz)^2),
+                remaining_distance=remaining,target={x=e.bx,z=e.bz},leg=leg}
+        else routes[intent.first]=nil end
+    end
+    transit_route()
+    if intent and intent.walking then
+        local reason=exploration.route_progress(memory,routes[intent.first],now,px,pz)
+        if reason then
+            exploration.pause_gateway(memory,intent.gateway_id,now,reason)
+            select_routes()
+        end
+    end
+    local pause=memory.last_route_pause
+    if pause and pause.until_time>now then
+        graph.route_pause={gateway_id=pause.gateway_id,reason=pause.reason,
+            remaining_seconds=round(pause.until_time-now,2)}
     end
     -- Include all reachable known destinations, not a separate return action.
     graph.routes = exploration.destinations(memory, current_id, routes)
@@ -1409,6 +1488,76 @@ local function read_collection_paths(player, nearby)
     end
 end
 
+local function read_work_loot(player,origin)
+    -- An uncapped scan around the worked target, independent of the normal
+    -- nearby whitelist/cap and the player's movement between pickups.
+    local ok,entities=protected_call(function()
+        return G.TheSim:FindEntities(origin.x,0,origin.z,6,nil,{"INLIMBO"})
+    end)
+    if not ok or type(entities)~="table" then return nil end
+    local px,_,pz=player.Transform:GetWorldPosition()
+    local result={}
+    for _,entity in ipairs(entities) do
+        if entity:IsValid() and not entity:HasTag("INLIMBO") and entity:HasTag("_inventoryitem") then
+            local x,_,z=entity.Transform:GetWorldPosition()
+            if (x-origin.x)^2+(z-origin.z)^2<=36 then
+                result[#result+1]={guid=entity.GUID,prefab=entity.prefab,dx=x-px,dz=z-pz,
+                    distance=math.sqrt((x-px)^2+(z-pz)^2),tags={"_inventoryitem"},
+                    stack_count=safe_call(function() return entity.replica.stackable:StackSize() end,1)}
+            end
+        end
+    end
+    table.sort(result,function(a,b) return a.distance<b.distance or a.distance==b.distance and a.guid<b.guid end)
+    read_collection_paths(player,result)
+    return result
+end
+
+local function campfire_site(player)
+    local world = G.TheWorld
+    local builder = player and player.replica and player.replica.builder
+    local recipe = G.GetValidRecipe and G.GetValidRecipe("campfire")
+    if not player or not player:IsValid() or not world or not world.Map or not builder or not recipe
+        or not G.TheSim or not builder.CanBuildAtPoint then
+        return {status="blocked",reason="campfire_siting_unavailable"}
+    end
+    if not (world.state.isnight or world.state.phase=="night") then
+        return {status="waiting",reason="campfire_requires_night"}
+    end
+    local clearance=campfire_siting.clearance(G.TUNING)
+    local px,py,pz=player.Transform:GetWorldPosition()
+    local hazards={}
+    -- Do not use nearby's whitelist/cap or EXCLUDE_TAGS: dropped items and
+    -- non-clickable combustible entities must also protect the placement area.
+    local ok,entities=protected_call(function()
+        return G.TheSim:FindEntities(px,py,pz,campfire_siting.SEARCH_RADIUS+clearance,nil,{"INLIMBO"})
+    end)
+    if not ok or type(entities)~="table" then
+        return {status="blocked",reason="campfire_siting_scan_failed"}
+    end
+    for _,entity in ipairs(entities) do
+        if entity~=player and campfire_siting.combustible(entity) then
+            if not entity.Transform then return {status="blocked",reason="combustible_position_unknown"} end
+            local x,_,z=entity.Transform:GetWorldPosition()
+            table.insert(hazards,{x=x,z=z})
+        end
+    end
+    local memory=get_navigation_memory(world)
+    local point,gap=campfire_siting.select({x=px,z=pz},hazards,clearance,function(candidate)
+        return safe_call(function()
+            return builder:CanBuildAtPoint(G.Vector3(candidate.x,0,candidate.z),recipe,0)
+        end,false)
+    end,function(candidate)
+        return graph_segment_passable(world.Map,px,pz,candidate.x,candidate.z)
+            and not hazard_segment_unsafe(memory,px,pz,candidate.x,candidate.z)
+    end)
+    local result={status=point and "ready" or "blocked",reason=point and "clear_site" or "no_safe_campfire_position",
+        combustible_clearance=clearance,player_clearance=campfire_siting.PLAYER_CLEARANCE,
+        search_radius=campfire_siting.SEARCH_RADIUS,combustibles_observed=#hazards}
+    -- Retain exact coordinates: rounding a boundary point could reduce clearance.
+    if point then result.point={x=point.x,z=point.z}; result.nearest_combustible=gap<math.huge and round(gap,2) or nil end
+    return result
+end
+
 local emit_state
 local bridge_client
 local start_bridge
@@ -1482,6 +1631,10 @@ local function make_state(player, timings)
         crafting = sample("crafting_ms",function() return read_crafting(player) end),
         nearby = nearby,
     }
+    state.construction = {campfire={status="inactive",reason="not_craftable_or_not_needed"}}
+    if state.crafting.campfire and not has_nearby_lit_fire(player,8) then
+        state.construction.campfire = sample("campfire_siting_ms",function() return campfire_site(player) end)
+    end
     if bridge_client then
         state.bridge = sample("control_status_ms",function() return bridge_client:status(state,timings) end)
     end
@@ -1660,7 +1813,7 @@ end
 
 local function required_work(target, target_tag)
     if target_tag == "CHOP_workable" then
-        return DEFAULT_CHOP_WORK
+        return tree_work.read(target,G.TUNING).work_required
     end
     return MINE_WORK_BY_PREFAB[target.prefab or ""]
 end
@@ -1701,7 +1854,7 @@ local function perform_work_action(action, target_tag, tool_prefab, preferred_gu
 
     local px, py, pz = player.Transform:GetWorldPosition()
     local candidates = G.TheSim:FindEntities(px, py, pz, 6, { target_tag }, EXCLUDE_TAGS)
-    local target, required, tool, available, nearest_distance = nil, nil, nil, 0, nil
+    local target, required, tool, available, best = nil, nil, nil, 0, nil
     for _, candidate in ipairs(candidates) do
         if candidate ~= player and candidate:IsValid() and (preferred_guid == nil or candidate.GUID == preferred_guid) then
             local candidate_required = required_work(candidate, target_tag)
@@ -1710,12 +1863,16 @@ local function perform_work_action(action, target_tag, tool_prefab, preferred_gu
                 candidate_tool, candidate_available = find_sufficient_tool(inventory, tool_prefab, candidate_required)
             end
             local distance = player:GetDistanceSqToInst(candidate)
-            if candidate_tool ~= nil and (target == nil or distance < nearest_distance) then
+            local facts={distance=distance,guid=candidate.GUID,
+                tree_stage=target_tag=="CHOP_workable" and tree_work.read(candidate,G.TUNING).tree_stage or nil}
+            local preferred=target_tag=="CHOP_workable" and tree_work.prefer(facts,best)
+                or target_tag~="CHOP_workable" and (not best or distance<best.distance)
+            if candidate_tool ~= nil and preferred then
                 target = candidate
                 required = candidate_required
                 tool = candidate_tool
                 available = candidate_available
-                nearest_distance = distance
+                best = facts
             end
         end
     end
@@ -1959,33 +2116,37 @@ local function attack_nearest_hostile()
     print("[JEV_DST_ACTION]attack_nearest_hostile:left_click target=" .. tostring(target.GUID))
 end
 
-local function build_campfire()
+local function build_campfire(on_failure)
+    local function fail(reason)
+        print("[JEV_DST_ACTION_ERROR]build_campfire:"..reason)
+        if on_failure then on_failure(reason) end
+        return false,reason
+    end
     local player = G.ThePlayer
     local builder = player ~= nil and player.replica ~= nil and player.replica.builder or nil
     local recipe = G.GetValidRecipe("campfire")
     if player == nil or not player:IsValid() or builder == nil or recipe == nil then
-        print("[JEV_DST_ACTION_ERROR]build_campfire:builder_unavailable")
-        return
+        return fail("builder_unavailable")
     end
     if G.TheWorld == nil or not G.TheWorld.state.isnight then
-        print("[JEV_DST_ACTION_ERROR]build_campfire:not_night")
-        return
+        return fail("not_night")
     end
     if has_nearby_lit_fire(player, 8) then
-        print("[JEV_DST_ACTION_ERROR]build_campfire:lit_fire_nearby")
-        return
+        return fail("lit_fire_nearby")
     end
     local already_buffered = builder:IsBuildBuffered(recipe.name)
     if builder:IsBusy() or (not already_buffered and not builder:CanBuild("campfire")) then
-        print("[JEV_DST_ACTION_ERROR]build_campfire:not_craftable_or_busy")
-        return
+        return fail("not_craftable_or_busy")
     end
 
     local controller = player.components ~= nil and player.components.playercontroller or nil
     if controller == nil then
-        print("[JEV_DST_ACTION_ERROR]build_campfire:controller_unavailable")
-        return
+        return fail("controller_unavailable")
     end
+
+    -- Reject unsafe surroundings BEFORE buffering/spending ingredients.
+    local site=campfire_site(player)
+    if site.status~="ready" then return fail(site.reason) end
 
     -- Match DoRecipeClick for recipes with placers: first buffer/craft the
     -- structure, then enter placement mode. MakeRecipeAtPoint alone is
@@ -1994,8 +2155,7 @@ local function build_campfire()
         builder:BufferBuild(recipe.name)
     end
     if not builder:IsBuildBuffered(recipe.name) then
-        print("[JEV_DST_ACTION_ERROR]build_campfire:buffer_failed")
-        return
+        return fail("buffer_failed")
     end
     controller:StartBuildPlacementMode(recipe, nil)
     print("[JEV_DST_ACTION]build_campfire:buffered")
@@ -2004,31 +2164,19 @@ local function build_campfire()
     player:DoTaskInTime(0.35, function()
         if player._jev_bridge_generation ~= generation then return end
         if not player:IsValid() or not builder:IsBuildBuffered(recipe.name) then
-            print("[JEV_DST_ACTION_ERROR]build_campfire:buffer_lost_before_placement")
-            return
+            return fail("buffer_lost_before_placement")
         end
 
-        local px, py, pz = player.Transform:GetWorldPosition()
-        local point = nil
-        local radii = { 1.25, 1.5, 1.75, 2.0 }
-        for _, radius in ipairs(radii) do
-            for angle = 0, 315, 45 do
-                local radians = angle * G.DEGREES
-                local candidate = G.Vector3(px + math.cos(radians) * radius, 0, pz + math.sin(radians) * radius)
-                if builder:CanBuildAtPoint(candidate, recipe, 0) then
-                    point = candidate
-                    break
-                end
-            end
-            if point ~= nil then
-                break
-            end
-        end
-        if point == nil then
+        if not (G.TheWorld and G.TheWorld.state.isnight) or has_nearby_lit_fire(player,8) then
             controller:CancelPlacement()
-            print("[JEV_DST_ACTION_ERROR]build_campfire:no_valid_position")
-            return
+            return fail("campfire_conditions_changed")
         end
+
+        -- Re-scan after the asynchronous build delay. Items/players may have
+        -- moved since the command was accepted; never fall back to an unsafe spot.
+        site=campfire_site(player)
+        if site.status~="ready" then controller:CancelPlacement(); return fail(site.reason) end
+        local point=G.Vector3(site.point.x,0,site.point.z)
 
         if controller.placer ~= nil then
             controller.placer.Transform:SetPosition(point.x, point.y, point.z)
@@ -2037,19 +2185,20 @@ local function build_campfire()
         builder:MakeRecipeAtPoint(recipe, point, 0)
         controller:CancelPlacement()
         print("[JEV_DST_ACTION]build_campfire:placed x=" .. tostring(round(point.x, 2))
-            .. " z=" .. tostring(round(point.z, 2)))
+            .. " z=" .. tostring(round(point.z, 2)).." combustible_clearance="..tostring(site.combustible_clearance))
     end)
 end
 
 local function build_science_machine()
     local player = G.ThePlayer
     local builder = player ~= nil and player.replica ~= nil and player.replica.builder or nil
-    local recipe = G.GetValidRecipe("sciencemachine")
+    local recipe = G.GetValidRecipe(SCIENCE_MACHINE_GAME_ID)
     if player == nil or not player:IsValid() or builder == nil or recipe == nil then
         print("[JEV_DST_ACTION_ERROR]build_science_machine:builder_unavailable")
         return
     end
-    if builder:IsBusy() or not builder:CanBuild("sciencemachine") then
+    local already_buffered = builder:IsBuildBuffered(recipe.name)
+    if builder:IsBusy() or (not already_buffered and not builder:CanBuild(SCIENCE_MACHINE_GAME_ID)) then
         print("[JEV_DST_ACTION_ERROR]build_science_machine:not_craftable_or_busy")
         return
     end
@@ -2060,7 +2209,9 @@ local function build_science_machine()
         return
     end
 
-    builder:BufferBuild(recipe.name)
+    if not already_buffered then
+        builder:BufferBuild(recipe.name)
+    end
     if not builder:IsBuildBuffered(recipe.name) then
         print("[JEV_DST_ACTION_ERROR]build_science_machine:buffer_failed")
         return
@@ -2262,6 +2413,14 @@ start_bridge = function(player)
                 and hazard_segment_unsafe(get_navigation_memory(G.TheWorld), px, pz, point.x, point.z)) then
             G.error("walk_destination_unavailable")
         end
+        local memory=get_navigation_memory(G.TheWorld)
+        if action.mode=="graph" then
+            exploration.commit_route(memory,action.source_node_id or memory.current_node,action.node_id,
+                action.gateway_id,action.next_node_id,G.GetTime(),px,pz,action.remaining_distance,action.entrance)
+        elseif action.mode or action.kind=="flee_from_nearest_hostile" then
+            memory.route_intent=nil
+        else exploration.pause_route(memory) end
+        if action.awaiting_region then return end
         local buffered = G.BufferedAction(player, nil, G.ACTIONS.WALKTO, nil, point)
         if not pc.ismastersim then
             -- Mirror native LeftClick RPC wiring, including non-predicting clients.
@@ -2298,7 +2457,9 @@ start_bridge = function(player)
     local actions = {craft_torch=craft_torch,equip_torch=equip_torch,unequip_torch=unequip_torch,
         eat_safe_food=eat_safe_food,cook_food=cook_one_food,build_campfire=build_campfire,
         build_sciencemachine=build_science_machine,equip_weapon=equip_best_weapon}
-    local executor = native.new({now=G.GetTime,stop=function()
+    local executor
+    executor = native.new({now=G.GetTime,loot=function(origin) return read_work_loot(player,origin) end,stop=function()
+        if G.TheWorld then exploration.pause_route(get_navigation_memory(G.TheWorld)) end
         if player == G.ThePlayer then cancel_native_work() end
     end,safe=function(action)
         local px, _, pz = player.Transform:GetWorldPosition()
@@ -2313,6 +2474,11 @@ start_bridge = function(player)
             perform_work_action(G.ACTIONS.MINE,"MINE_workable","pickaxe",action.guid)
         elseif action.kind == "craft_axe" then craft_item("axe")
         elseif action.kind == "craft_pickaxe" then craft_item("pickaxe")
+        elseif action.kind == "build_campfire" then
+            local id=executor.active and executor.active.id
+            return build_campfire(function(reason)
+                if executor.active and executor.active.id==id then executor:finish("failed",reason) end
+            end)
         elseif actions[action.kind] then actions[action.kind]()
         else G.error("unsupported_native_action") end
     end})
@@ -2404,6 +2570,7 @@ end)
 -- Returned handles allow offline native-action tests without installing input
 -- handlers. DST's Mod loader ignores this value; runtime commands arrive via MCP.
 return {
+    scan_work_loot = read_work_loot,
     emit_state = function() emit_state(G.ThePlayer) end,
     cancel = cancel_native_work,
     craft_torch = craft_torch, equip_torch = equip_torch, unequip_torch = unequip_torch,

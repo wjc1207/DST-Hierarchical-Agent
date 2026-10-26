@@ -45,6 +45,7 @@ def model_game_state(state: dict) -> dict:
         "inventory_details": inventory_details,
         "lighting": {"torch_equipped": torch_equipped, "observed_fires": fires},
         "crafting": state.get("crafting", {}),
+        "construction": state.get("construction", {}),
         "navigation": state.get("navigation", {}),
         "region_resource_priors": knowledge_for_graph(state.get("navigation", {}).get("graph") or {}),
         # No model-specific nearest-20 cut: retain all entities reported by the Mod,

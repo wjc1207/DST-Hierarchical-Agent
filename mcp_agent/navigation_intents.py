@@ -22,6 +22,9 @@ WORK_SOURCES = {
        ("evergreen", "evergreen_sparse", "deciduoustree", "twiggytree")},
 }
 
+# Internal source-search key, not a new inventory target for the planner.
+FOOD_SEARCH_PRODUCT = "safe_food"
+
 
 def local_candidates(criteria, dispatch):
     """Keep all navigation choices out of local model arbitration."""
@@ -43,6 +46,8 @@ def dispatch_for_navigation(actions, state):
 
 
 def sources_for(product):
+    if product == FOOD_SEARCH_PRODUCT:
+        return set().union(*(sources_for(food) for food in rules.SAFE_FOOD_PREFABS))
     sources = {product} | {k for k, v in rules.COLLECT_PRODUCTS.items() if v == product}
     sources.update(k for k, v in MINE_PRODUCTS.items() if product in v)
     if product == "log":
@@ -152,6 +157,8 @@ class ExplorationExecutor:
                 target = task["target"]
                 if target["type"] == "inventory":
                     return ("inventory", target["prefab"])
+                if target["type"] == "hunger_ratio":
+                    return ("inventory", FOOD_SEARCH_PRODUCT)
                 if target["type"] == "visit_region":
                     return ("visit", target["node_id"])
                 if target["type"] == "survey_region":
@@ -340,10 +347,13 @@ class ExplorationExecutor:
         self.last_event = event
         reason = event.get("reason")
         self.handoff = reason in {"resource_types_changed", "targeted_by_hostile", "potential_threat",
-                                  "health_lost", "critical_hunger_with_food", "night_light_lost",
+                                  "health_lost", "critical_hunger_with_food", "critical_sanity", "critical_health", "night_light_lost",
                                   "phase_changed", "player_dead", "player_changed"}
+        if reason in {"route_no_progress", "route_gateway_unavailable", "region_confirmation_timeout"}:
+            # Lua pauses the failed entrance, not every route to this region.
+            self.intent = None
         if reason in {"destination_reached", "region_changed", "path_unavailable", "route_paused", "region_route_unavailable",
-                      "movement_stalled", "region_confirmation_timeout"}:
+                      "movement_stalled"}:
             if self.intent and reason not in {"destination_reached", "region_changed"}:
                 self.paused[self.intent] = time.monotonic() + 15
             self.intent = None

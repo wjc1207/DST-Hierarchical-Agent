@@ -93,7 +93,8 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
         self.assertEqual(body["response_format"], {"type": "json_object"})
         self.assertEqual(body["model"], "deepseek-flash")
-        self.assertIn("Torch: 2 cut grass", body["messages"][1]["content"])
+        self.assertIn("Torch: 2 cut grass", body["messages"][0]["content"])
+        self.assertNotIn("dst_knowledge", json.loads(body["messages"][1]["content"]))
         sent_context = json.loads(body["messages"][1]["content"])
         self.assertEqual(sent_context["inventory_details"], context["inventory_details"])
         self.assertEqual(sent_context["lighting"], context["lighting"])
@@ -117,7 +118,7 @@ class PlannerTests(unittest.TestCase):
                          ["system", "user", "assistant", "user", "assistant", "user"])
         self.assertEqual([(messages[i]["content"], messages[i + 1]["content"])
                           for i in (1, 3)], history)
-        self.assertEqual(json.loads(messages[-1]["content"]), latest)
+        self.assertEqual(json.loads(messages[-1]["content"]), daily_planner.planning_snapshot(latest))
         self.assertIn("FINAL user", messages[0]["content"])
         self.assertIn("not evidence of execution", messages[0]["content"])
 
@@ -139,7 +140,59 @@ class PlannerTests(unittest.TestCase):
                                        latest, history)
         messages = json.loads(send.call_args.args[0].data)["messages"]
         self.assertEqual([m["role"] for m in messages], ["system", "user"])
-        self.assertEqual(json.loads(messages[-1]["content"]), latest)
+        self.assertEqual(json.loads(messages[-1]["content"]), {"inventory": {"torch": 2}})
+        self.assertIn(latest["dst_knowledge"], messages[0]["content"])
+
+    def test_static_prefix_survives_world_changes_and_references_are_not_replayed_in_users(self):
+        class CachedResponse(PlanResponse):
+            def read(self):
+                payload = json.loads(super().read())
+                payload["usage"] = {"prompt_tokens": 3000, "prompt_cache_hit_tokens": 2000,
+                                    "prompt_cache_miss_tokens": 1000, "private_data": "do-not-print"}
+                return json.dumps(payload).encode()
+
+        latest = daily_planner.planning_context(observed(), [])
+        latest.update(dst_knowledge="local recipe reference",
+                      supported_capabilities={"unused_legacy_contract": True},
+                      planning_window={"day": 1, "quarter": 1, "quarters_per_day": 4, "mode": "review_not_reset"},
+                      control={**daily_planner.CONTROL_CONTRACT, "protocol": 4,
+                               "available_actions": {"collect_grass": {"kind": "collect", "guid": 123456789}}})
+        old = {**latest, "dst_knowledge": "old copied knowledge"}
+        history = [(json.dumps(old), '{"goal":"Old plan"}')]
+        newer = json.loads(json.dumps(latest))
+        newer.update(day=2, phase="night", region_resource_priors={"BGRocky": ["rock2"]})
+        newer["navigation"] = {"graph": {"known_nodes": 3, "current_node": "B:BGRocky"}}
+        newer["control"]["available_actions"] = {"equip_torch": {"kind": "equip_torch"}}
+        newer["planning_window"] = {"day": 2, "quarter": 4}
+        before = json.dumps([latest, newer, history], sort_keys=True)
+        with (patch.object(daily_planner.urllib.request, "urlopen", return_value=CachedResponse()) as send,
+              patch("builtins.print") as printed):
+            for context in (latest, newer):
+                daily_planner.request_plan("https://example.invalid/chat", "secret", "model", 1, context, history)
+        self.assertEqual(printed.call_count, 2)
+        self.assertIn("prompt_cache_hit_tokens=2000", printed.call_args.args[0])
+        self.assertIn("prompt_cache_miss_tokens=1000", printed.call_args.args[0])
+        self.assertNotIn("do-not-print", str(printed.call_args_list))
+        first, second = [json.loads(call.args[0].data)["messages"] for call in send.call_args_list]
+        self.assertEqual(first[0], second[0], "game changes must not alter the system prefix")
+        reference = json.loads(first[0]["content"].split(daily_planner.STATIC_REFERENCE_MARKER)[1])
+        self.assertEqual(reference["dst_knowledge"], "local recipe reference")
+        self.assertIn("rock2", reference["region_resource_priors"]["BGRocky"])
+        self.assertIn("berrybush", reference["region_resource_priors"]["BGGrass"])
+        self.assertEqual(reference["supported_capabilities"]["execution_policy"], "priority_goals")
+        self.assertNotIn("123456789", first[0]["content"])
+        for messages in (first, second):
+            for message in messages:
+                if message["role"] != "user":
+                    continue
+                snapshot = json.loads(message["content"])
+                for key in ("dst_knowledge", "region_resource_priors", "supported_capabilities"):
+                    self.assertNotIn(key, snapshot)
+                self.assertNotIn("execution_owner", snapshot["control"])
+                self.assertNotIn("quarters_per_day", snapshot["planning_window"])
+                self.assertIn("available_actions", snapshot["control"])
+        self.assertEqual(json.loads(second[-1]["content"])["navigation"], newer["navigation"])
+        self.assertEqual(json.dumps([latest, newer, history], sort_keys=True), before)
 
     def test_accepted_turn_is_an_immutable_snapshot_used_on_next_request(self) -> None:
         with patch.object(daily_planner, "ThreadPoolExecutor", FakeExecutor):
@@ -223,7 +276,7 @@ class PlannerTests(unittest.TestCase):
         first = json.loads(send.call_args_list[0].args[0].data)
         second = json.loads(send.call_args_list[1].args[0].data)
         self.assertEqual(first["max_tokens"], daily_planner.PLAN_MAX_TOKENS)
-        self.assertEqual(first["reasoning_effort"], "low")
+        self.assertEqual(first["reasoning_effort"], "medium")
         self.assertEqual(second["reasoning_effort"], "none")
         self.assertEqual(first["messages"], second["messages"])
         self.assertIn("finish_reason=length", printed.call_args.args[0])
@@ -293,22 +346,24 @@ class PlannerTests(unittest.TestCase):
                 self.assertEqual(planner.plan["quarter"], expected_calls)
         planner.close()
 
-    def test_planning_context_includes_local_knowledge(self) -> None:
+    def test_local_knowledge_and_capabilities_are_separate_from_dynamic_request(self) -> None:
         with patch.object(daily_planner, "ThreadPoolExecutor", FakeExecutor):
             planner = daily_planner.DailyPlanner("secret")
         planner.update(observed(world_time=0.51))
         context = planner.executor.calls[0][1][4]
-        self.assertEqual(context["planning_window"], {
-            "day": 1, "quarter": 3, "quarters_per_day": 4, "mode": "review_not_reset",
-        })
-        self.assertIn("Science Machine", context["dst_knowledge"])
-        self.assertIn("gold nugget + 4 logs + 4 rocks", context["dst_knowledge"])
-        self.assertIn("remaining fuel in [0,1]", context["dst_knowledge"])
-        self.assertIn("travel_region_<observed index>", context["dst_knowledge"])
-        self.assertLess(len(context["dst_knowledge"]), daily_planner.MAX_KNOWLEDGE_CHARS)
-        self.assertNotIn("explore_adjacent_", context["dst_knowledge"])
-        self.assertNotIn("return_previous_region", context["dst_knowledge"])
-        self.assertNotIn("follows an observed road", context["dst_knowledge"])
+        reference = planner.executor.calls[0][1][6]
+        self.assertEqual(context["planning_window"], {"day": 1, "quarter": 3})
+        self.assertEqual(reference["planning_policy"], {"quarters_per_day": 4, "mode": "review_not_reset"})
+        self.assertNotIn("dst_knowledge", context)
+        self.assertNotIn("supported_capabilities", context)
+        self.assertIn("Science Machine", reference["dst_knowledge"])
+        self.assertIn("gold nugget + 4 logs + 4 rocks", reference["dst_knowledge"])
+        self.assertIn("remaining fuel in [0,1]", reference["dst_knowledge"])
+        self.assertIn("travel_region_<observed index>", reference["dst_knowledge"])
+        self.assertLess(len(reference["dst_knowledge"]), daily_planner.MAX_KNOWLEDGE_CHARS)
+        self.assertNotIn("explore_adjacent_", reference["dst_knowledge"])
+        self.assertNotIn("return_previous_region", reference["dst_knowledge"])
+        self.assertNotIn("follows an observed road", reference["dst_knowledge"])
         planner.close()
 
     def test_context_keeps_counts_fuel_and_equipped_slots_separate(self) -> None:
@@ -402,7 +457,7 @@ class PlannerTests(unittest.TestCase):
             patch.object(daily_planner.time, "monotonic", side_effect=[10.0, 10.4]),
         ):
             plan, elapsed, error = daily_planner.timed_request_plan("url", "key", "model", 1, {}, history)
-        request.assert_called_once_with("url", "key", "model", 1, {}, history)
+        request.assert_called_once_with("url", "key", "model", 1, {}, history, None)
         self.assertEqual(plan["goal"], "Find gold")
         self.assertAlmostEqual(elapsed, 0.4)
         self.assertIsNone(error)
@@ -441,3 +496,16 @@ class PlannerTests(unittest.TestCase):
         context = planner.executor.calls[-1][1][4]
         self.assertTrue(context["science_machine_built_this_run"])
         planner.close()
+
+    def test_observed_real_science_machine_is_preserved_after_leaving_sight(self) -> None:
+        with patch.object(daily_planner, "ThreadPoolExecutor", FakeExecutor):
+            planner = daily_planner.DailyPlanner("secret", board_log_dir=None)
+        self.addCleanup(planner.close)
+        current=observed()
+        current["nearby"]=[{"prefab":"sciencemachine","game_prefab":"researchlab","guid":42}]
+        planner.update(current)
+        self.assertTrue(planner.science_machine_built)
+        self.assertTrue(planner.executor.calls[-1][1][4]["science_machine_built_this_run"])
+        current["nearby"]=[]
+        planner.update(current)
+        self.assertTrue(planner.science_machine_built)

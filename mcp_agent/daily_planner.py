@@ -11,13 +11,15 @@ import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 from common.paths import DATA_DIR, LOG_DIR
 from mcp_agent.model_state import model_game_state
+from mcp_agent.region_resources import room_resources
 from common.task_board import (validate_board, board_view, format_board,
                         INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
-from mcp_agent.action_sequence import ACTION_TYPES, SequenceExecutor, is_sequence, validate_sequence, format_sequence
+from mcp_agent.action_sequence import SequenceExecutor, is_sequence, validate_sequence, format_sequence
 from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, validate_goals, merge_goals
 
 
@@ -31,6 +33,19 @@ BOARD_LOG_DIR = LOG_DIR
 COMPLETION_REPLAN_INTERVAL = 15.0
 PLAN_HISTORY_TURNS = 3
 PLAN_HISTORY_CHARS = 48000
+STATIC_REFERENCE_MARKER = "\n\nStatic reference JSON (background, not a live observation):\n"
+PLANNING_POLICY = {"quarters_per_day": 4, "mode": "review_not_reset"}
+CONTROL_CONTRACT = {
+    "transport": "mcp", "execution_owner": "lua", "navigation_intent_owner": "python",
+    "unsupported": ["attack", "equip_weapon", "automatic_tool_prerequisite_solver", "alchemyengine"],
+}
+SUPPORTED_CAPABILITIES = {
+    "execution_policy": "priority_goals",
+    "inventory_target_prefabs": sorted(INVENTORY_TARGET_PREFABS),
+    "inventory_prefab_aliases": dict(INVENTORY_PREFAB_ALIASES),
+    "target_types": ["inventory", "structure", "hunger_ratio", "visit_region", "survey_region", "known_regions"],
+    "constraints": {"max_carried_tools_or_torches": 1, "campfire_build_phase": "night"},
+}
 
 
 def planning_slot(state: dict) -> Optional[tuple[int, int]]:
@@ -50,6 +65,41 @@ def planning_slot(state: dict) -> Optional[tuple[int, int]]:
 
 def load_dst_knowledge(path: Path = KNOWLEDGE_PATH) -> str:
     return path.read_text(encoding="utf-8").strip()[:MAX_KNOWLEDGE_CHARS]
+
+
+def planning_reference(knowledge_path: Path = KNOWLEDGE_PATH, *, knowledge: Optional[str] = None) -> dict:
+    """Only installed knowledge/contracts enter the stable system prefix, never live state."""
+    if knowledge is None:
+        try:
+            knowledge = load_dst_knowledge(knowledge_path)
+        except (OSError, UnicodeError) as exc:
+            knowledge = ""
+            print(f"daily_plan_knowledge_unavailable={type(exc).__name__}")
+    return deepcopy({
+        "dst_knowledge": knowledge[:MAX_KNOWLEDGE_CHARS],
+        "region_resource_priors": {room: sorted(prefabs) for room, prefabs in room_resources().items()},
+        "supported_capabilities": SUPPORTED_CAPABILITIES,
+        "control_contract": CONTROL_CONTRACT,
+        "planning_policy": PLANNING_POLICY,
+    })
+
+
+def planning_snapshot(context: dict) -> dict:
+    """Remove references repeated by older callers/history without changing live facts."""
+    result = deepcopy(context)
+    for key in ("dst_knowledge", "region_resource_priors", "supported_capabilities"):
+        result.pop(key, None)
+    if isinstance(result.get("control"), dict):
+        for key in CONTROL_CONTRACT:
+            result["control"].pop(key, None)
+    if isinstance(result.get("planning_window"), dict):
+        for key in PLANNING_POLICY:
+            result["planning_window"].pop(key, None)
+    return result
+
+
+def snapshot_message(context: dict) -> str:
+    return json.dumps(planning_snapshot(context), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
 def planning_context(state: dict, history: list[dict]) -> dict:
@@ -114,7 +164,8 @@ def recent_exchanges(exchanges) -> list[tuple[str, str]]:
 
 
 def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
-                 conversation: Optional[list[tuple[str, str]]] = None) -> dict:
+                 conversation: Optional[list[tuple[str, str]]] = None,
+                 reference: Optional[dict] = None) -> dict:
     # Goal scheduling is deterministic. The model supplies needs, not movement legs.
     system_prompt = (
         "You maintain a priority task_board for Don't Starve Together. Return JSON only, not an action sequence. "
@@ -124,12 +175,18 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "hunger_ratio {at_least:0..1}; visit_region {node_id} for a known node; known_regions {count}. "
         "survey_region {node_id,area:16..4096} reveals ADDITIONAL area in an observed room (default256). "
         "The executor FIRST performs feasible visible goals by priority, skipping unavailable higher ones, "
-        "then navigates for the highest ready goal. Goals can be completed in interleaved order; "
-        "use depends_on only for real prerequisites such as a pickaxe before mining. "
+        "then navigates for the highest ready goal. Goals can be completed in interleaved order. "
+        "A hunger_ratio goal eats carried safe food, otherwise gathers nearby safe food or searches for food sources until the hunger target is observed. "
+        "Use depends_on only for real prerequisites such as a pickaxe before mining. "
         "It uses observed source positions, region resource memory, Klei room generation priors, then unknown branches. "
         "Priors are possible initial resources, not guarantees, remaining stock, or spawn probabilities. "
         "A route failure is not proof that a resource is absent. Safety always overrides execution; "
-        "JEV handles emergencies and worthwhile off-board opportunities, not each plant or movement leg. "
+        "JEV handles emergencies and temporary planning gaps only; off-board opportunities do not trigger it. "
+        "Include needed food, sanity recovery and resource reserves explicitly in the board. "
+        "If no tasks remain or no offered action/route can advance the board, reassess and update it. "
+        "Keep useful future goals, but include feasible work or resource search for the current phase; "
+        "a night-only campfire must not be the sole remaining daytime work. "
+        "JEV temporarily handles local decisions while this evaluation is pending. "
         "Quarterly review is a PATCH, not a reset: preserve current goals, priorities, IDs and progress unless "
         "changed facts justify an update. Omitted tasks remain; explicitly cancel using cancel_task_ids with "
         "an explanation in goal/reasons. Do not raise targets just because time passed. "
@@ -140,6 +197,10 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "No wait-second or equip-torch goals: illumination is handled by safety decisions when phase changes. "
         "Read the FINAL user snapshot as current truth; older user snapshots and assistant plans are "
         "history, not evidence of execution. Use observed facts, recent outcomes and DSTKnowledge. "
+        "Static reference JSON below supplies DSTKnowledge, supported_capabilities, control_contract, "
+        "planning_policy and the complete Klei room-type resource priors. A listed room type is not "
+        "evidence that this world contains that room or that it has been discovered; use these priors "
+        "only for room types in the observed navigation graph. Priors never override live resource facts. "
         "Use canonical inventory IDs from supported_capabilities.inventory_target_prefabs: log not logs, "
         "cutgrass not grass. Never invent GUIDs, coordinates, unknown node IDs or unsupported recipes. "
         "Alchemy engine is a future milestone, not currently buildable. Do not build another science "
@@ -154,17 +215,31 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         '{"id":"torch","title":"One torch","priority":1,"depends_on":["grass","twigs"],'
         '"target":{"type":"inventory","prefab":"torch","count":1}}]}'
     )
+    if reference is None:
+        # Compatibility for direct callers; runtime passes a separate local reference.
+        reference = planning_reference(knowledge=context.get("dst_knowledge"))
+    system_prompt += STATIC_REFERENCE_MARKER + json.dumps(
+        reference, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    history = []
+    for user, assistant in conversation or []:
+        try:
+            old_context = json.loads(user)
+        except (ValueError, TypeError):
+            old_context = None
+        if isinstance(old_context, dict):
+            user = snapshot_message(old_context)
+        history.append((user, assistant))
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            *[message for user, assistant in recent_exchanges(conversation or [])
+            *[message for user, assistant in recent_exchanges(history)
               for message in ({"role": "user", "content": user},
                               {"role": "assistant", "content": assistant})],
-            {"role": "user", "content": json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
+            {"role": "user", "content": snapshot_message(context)},
         ],
         "response_format": {"type": "json_object"},
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
         "max_tokens": PLAN_MAX_TOKENS,
         "stream": False,
     }
@@ -190,13 +265,22 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         except urllib.error.URLError as exc:
             raise RuntimeError(f"DeepSeek planning connection failed: {exc.reason}") from exc
 
+        usage = payload.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        cache_counts = {key: usage[key] for key in (
+            "prompt_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
+            if type(usage.get(key)) is int and usage[key] >= 0}
+        if cache_counts:
+            print(f"daily_plan_usage attempt={attempt + 1} " + " ".join(
+                f"{key}={value}" for key, value in cache_counts.items()))
         choices = payload.get("choices") or []
         if not choices or not isinstance(choices[0], dict):
             raise RuntimeError("DeepSeek planning response has no choice")
         choice = choices[0]
         finish_reason = choice.get("finish_reason")
         content = (choice.get("message") or {}).get("content") or ""
-        completion_tokens = (payload.get("usage") or {}).get("completion_tokens")
+        completion_tokens = usage.get("completion_tokens")
         if finish_reason == "stop" and content:
             try:
                 return validate_goals(json.loads(content), day)
@@ -216,11 +300,12 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
 
 
 def timed_request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
-                       conversation: Optional[list[tuple[str, str]]] = None) -> tuple:
+                       conversation: Optional[list[tuple[str, str]]] = None,
+                       reference: Optional[dict] = None) -> tuple:
     """Measure the worker's request, excluding the JEV cycle's polling delay."""
     started_at = time.monotonic()
     try:
-        plan = request_plan(api_url, api_key, model, day, context, conversation)
+        plan = request_plan(api_url, api_key, model, day, context, conversation, reference)
     except Exception as exc:
         return None, time.monotonic() - started_at, exc
     return plan, time.monotonic() - started_at, None
@@ -330,7 +415,19 @@ class DailyPlanner:
         except OSError as exc:
             print(f"action_sequence_log_unavailable error={type(exc).__name__}")
 
+    def request_review(self, state: dict, reason: str, *, immediate: bool = False) -> Optional[dict]:
+        """One asynchronous evaluation; repeated polls keep the existing request/backoff."""
+        if self.future is None:
+            self.goal_replan_reason = self.goal_replan_reason or reason
+            if immediate and self.goal_replan_reason != "review_retry":
+                self.goal_retry_at = 0.
+        return self.update(state)
+
     def update(self, state: dict) -> Optional[dict]:
+        # The Mod normalizes Klei's researchlab to the public structure name.
+        # An observed existing machine is also a verified milestone.
+        if any(e.get("prefab") == "sciencemachine" for e in state.get("nearby", [])):
+            self.science_machine_built = True
         # Legacy clients/history retain their old semantics, never the new DS path.
         if self.legacy_mode or (self.plan is not None and not is_priority_board(self.plan)):
             self.legacy_mode = True
@@ -389,30 +486,29 @@ class DailyPlanner:
             if marker != self.goal_terminal:
                 self.goal_terminal = marker
                 self.previous_board = view
-                self.goal_replan_reason = "all_tasks_completed" if view["status"] == "completed" else "search_or_prerequisite_blocked"
+                if self.goal_replan_reason != "review_retry":
+                    self.goal_replan_reason = "all_tasks_completed" if view["status"] == "completed" else "search_or_prerequisite_blocked"
+                    # A newly terminal board needs evaluation now, even if the
+                    # last normal review was recent. Keep failed-request backoff.
+                    if self.future is None:
+                        self.goal_retry_at = now
                 print(f"task_board_review_requested reason={self.goal_replan_reason}")
         reason = self.goal_replan_reason or ("quarter_review" if self.plan else "initial_plan")
         if self.future is None and now >= self.goal_retry_at and (self.requested_slot != slot or self.goal_replan_reason):
             context = planning_context(state, list(self.history))
             context.update(replan_reason=reason, current_task_board=view, previous_task_board=self.previous_board,
                            science_machine_built_this_run=self.science_machine_built,
-                           supported_capabilities={"execution_policy": "priority_goals", "inventory_target_prefabs": sorted(INVENTORY_TARGET_PREFABS),
-                               "inventory_prefab_aliases": dict(INVENTORY_PREFAB_ALIASES),
-                               "target_types": ["inventory", "structure", "hunger_ratio", "visit_region", "survey_region", "known_regions"],
-                               "constraints": {"max_carried_tools_or_torches": 1, "campfire_build_phase": "night"}},
-                           planning_window={"day": day, "quarter": quarter + 1, "quarters_per_day": 4, "mode": "review_not_reset"})
-            try:
-                context["dst_knowledge"] = load_dst_knowledge(self.knowledge_path)
-            except (OSError, UnicodeError):
-                context["dst_knowledge"] = ""
-            context = json.loads(json.dumps(context, ensure_ascii=False))
-            self.pending_user_message = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+                           planning_window={"day": day, "quarter": quarter + 1})
+            reference = planning_reference(self.knowledge_path)
+            context = planning_snapshot(context)
+            self.pending_user_message = snapshot_message(context)
             self.pending_basis = (state.get("player", {}).get("guid"), state.get("bridge", {}).get("session_id"), state.get("observed_at"))
-            self.future = self.executor.submit(timed_request_plan, self.api_url, self.api_key, self.model, day, context, list(self.conversation))
+            self.future = self.executor.submit(timed_request_plan, self.api_url, self.api_key, self.model, day,
+                                               context, list(self.conversation), reference)
             self.pending_slot = self.requested_slot = slot
             self.goal_replan_reason = None
             self.goal_retry_at = now + COMPLETION_REPLAN_INTERVAL
-            print(f"daily_plan_requested day={day} quarter={quarter + 1}/4 reason={reason} knowledge_chars={len(context['dst_knowledge'])} history_turns={len(self.conversation)}")
+            print(f"daily_plan_requested day={day} quarter={quarter + 1}/4 reason={reason} knowledge_chars={len(reference['dst_knowledge'])} history_turns={len(self.conversation)}")
         self._publish_board(view)
         return view
 
@@ -503,29 +599,14 @@ class DailyPlanner:
             context["science_machine_built_this_run"] = self.science_machine_built
             context["previous_task_board"] = self._board(state) or self.previous_board
             context["previous_action_sequence"] = self.previous_board if is_sequence(self.previous_board) else None
-            context["supported_capabilities"] = {
-                "inventory_target_prefabs": sorted(INVENTORY_TARGET_PREFABS),
-                "inventory_prefab_aliases": dict(INVENTORY_PREFAB_ALIASES),
-                "actions": ["collect_<observed prefab>", "explore_current_region", "explore_other_region",
-                            "travel_region_<observed index>", "craft_axe", "craft_pickaxe", "craft_torch",
-                            "chop_nearest_tree", "mine_nearest_rock", "cook_food", "eat_safe_food",
-                            "build_campfire", "build_sciencemachine", "equip_torch", "unequip_torch",
-                            "equip_weapon", "attack_nearest_hostile", "flee_from_nearest_hostile", "wait"],
-                "sequence_actions": list(ACTION_TYPES),
-                "sequence_execution": "Strict ordered steps; collect/craft count is current stock, cook count is additional cooked items.",
-                "note": "Use sequence_actions for executable plans. Actual candidates and safety rules take precedence."}
-            context["planning_window"] = {"day": day, "quarter": quarter + 1, "quarters_per_day": 4}
-            try:
-                context["dst_knowledge"] = load_dst_knowledge(self.knowledge_path)
-            except (OSError, UnicodeError) as exc:
-                context["dst_knowledge"] = ""
-                print(f"daily_plan_knowledge_unavailable={exc}")
+            context["planning_window"] = {"day": day, "quarter": quarter + 1}
+            reference = planning_reference(self.knowledge_path)
             # Snapshot the actual request, not a later observation or mutated board.
-            context = json.loads(json.dumps(context, ensure_ascii=False))
-            self.pending_user_message = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+            context = planning_snapshot(context)
+            self.pending_user_message = snapshot_message(context)
             self.future = self.executor.submit(
                 timed_request_plan, self.api_url, self.api_key, self.model, day, context,
-                list(self.conversation),
+                list(self.conversation), reference,
             )
             self.pending_slot = slot
             if completing:
@@ -533,7 +614,7 @@ class DailyPlanner:
             self.completion_replan_slot = None
             print(
                 f"daily_plan_requested day={day} quarter={quarter + 1}/4 "
-                f"knowledge_chars={len(context['dst_knowledge'])} "
+                f"knowledge_chars={len(reference['dst_knowledge'])} "
                 f"history_turns={len(self.conversation)} reason={reason}"
             )
         view = self._board(state) if self.plan and self.plan["day"] == day else None

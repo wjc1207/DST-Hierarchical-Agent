@@ -178,13 +178,13 @@ class TransportTests(unittest.TestCase):
 
     def test_lua_fields_are_bounded_numeric_and_content_free(self):
         value = {"clock": "lua_real_seconds", "token": "do-not-log", "prompt": "do-not-log",
-            "sampling": {"ticks": 3, "sum_ms": {"navigation_ms": 2, "token": 123,
+            "sampling": {"ticks": 3, "sum_ms": {"navigation_ms": 2, "campfire_siting_ms": 1.5, "token": 123,
                                                  "state_total_ms": math.nan}, "max_ms": []},
             "previous_exchanges": [{"sequence": 1, "encode_ms": 2, "decode_ms": -3,
                                     "token": "do-not-log", "action_id": "a", "accepted": True},
                                    {"sequence": 99, "encode_ms": 2}]}
         result = lua_measurements(value, 2)
-        self.assertEqual(result["sampling"]["sum_ms"], {"navigation_ms": 2})
+        self.assertEqual(result["sampling"]["sum_ms"], {"navigation_ms": 2, "campfire_siting_ms": 1.5})
         self.assertEqual(len(result["previous_exchanges"]), 1)
         self.assertNotIn("decode_ms", result["previous_exchanges"][0])
         self.assertNotIn("token", json.dumps(result))

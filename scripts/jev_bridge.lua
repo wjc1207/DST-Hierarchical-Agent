@@ -78,7 +78,7 @@ function M.new(config,env,executor)
         end
         local timings={}
         local state=measurement.call(env.wall_now,timings,"state_total_ms",function() return env.state(timings) end)
-        measurement.call(env.wall_now,timings,"native_tick_ms",function() executor:tick(state,now) end)
+        measurement.call(env.wall_now,timings,"native_tick_ms",function() executor:tick(state,now,self.connected) end)
         if self.connected then
             measurement.call(env.wall_now,timings,"board_step_ms",function() executor:board_step(state,now) end)
         end

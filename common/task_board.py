@@ -31,6 +31,20 @@ def normalize_inventory_prefab(value):
     return prefab
 
 
+def validate_navigation_targets(targets):
+    """Bounded local goals watched during one native navigation action."""
+    if not isinstance(targets, list) or len(targets) > MAX_TASKS:
+        raise ValueError("Navigation targets require a list of at most six targets")
+    if not targets:
+        return []
+    if any(not isinstance(t, dict) or t.get("type") not in {"inventory", "structure", "hunger_ratio"}
+           for t in targets):
+        raise ValueError("Navigation targets must be local inventory, structure or hunger goals")
+    board = validate_board({"goal": "Watch board work", "tasks": [{"id": str(i), "title": "Navigation interrupt", "target": target}
+                                      for i, target in enumerate(targets)]}, 1)
+    return [task["target"] for task in board["tasks"]]
+
+
 def text(value, limit=120):
     return " ".join(value.split())[:limit] if isinstance(value, str) else ""
 

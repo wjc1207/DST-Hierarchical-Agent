@@ -17,6 +17,15 @@ from mcp_agent import jev_client
 
 
 class RuleTests(unittest.TestCase):
+    def test_survival_thresholds_require_known_vitals_and_include_no_food_hunger(self):
+        for name in ("health", "hunger", "sanity"):
+            for value, maximum, expected in ((29,100,True),(30,100,False),(0,0,False),
+                                              (0,None,False),(float("nan"),100,False)):
+                with self.subTest(vital=name,value=value,maximum=maximum):
+                    s={"player":{"vitals":{name:value,name+"_max":maximum}}}
+                    self.assertEqual("critical_"+name in rules.survival_dangers(s), expected)
+        self.assertFalse(rules.survival_dangers({}))
+
     def test_pickable_sources_require_explicit_positive_evidence(self):
         for prefab in rules.PICKABLE_SOURCE_PREFABS:
             for pickable, expected in ((None,False),(False,False),(True,True)):

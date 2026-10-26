@@ -21,6 +21,7 @@ from mcp_agent.daily_planner import DailyPlanner, DEFAULT_API_URL as DS_URL, DEF
 from mcp_agent.navigation_intents import ExplorationExecutor, dispatch_for_navigation
 from common.config import load_dotenv, resolve_env_path
 from mcp_agent.jev_client import call_jev, DEFAULT_API_URL, DEFAULT_MODEL
+from common.game_rules import survival_dangers, SAFE_FOOD_PREFABS
 from mcp_server.game_bridge import TERMINAL, finite_time, BridgePortUnavailable, check_bridge_port
 from mcp_agent.action_sequence import SequenceExecutor, is_sequence
 from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, task_signature
@@ -71,8 +72,8 @@ class MCPAgent:
         self.sequence_actions = {}
         self.goals = getattr(planner, "goals", None) or PriorityBoardExecutor()
         self.goal_actions = {}
-        self.opportunity_signature = None
-        self.goal_idle_since = None
+        self.deferred_safety = None
+        self.goal_gap_marker = None
         self.goal_light = None
 
     def measured_decision(self, request_id, submitted_at, metadata, state, criteria, plan):
@@ -275,6 +276,15 @@ class MCPAgent:
                     timing.annotate(outcome="executed" if result["status"] == "completed" else result["status"],
                                     action_reason=result.get("reason"))
                     return
+                owner = self.goal_actions.get(self.active_id)
+                if owner and owner[2].get("kind") == "explore" and "navigation_targets" in owner[2] \
+                        and result["status"] != "cancel_requested":
+                    reason = self.goals.navigation_review_reason(self.plan, packet["state"], *owner[:2],
+                                                                 owner[2]["navigation_targets"])
+                    if reason:
+                        timing.event("navigation.review_requested", reason=reason, action_id=self.active_id)
+                        print(f"navigation_review reason={reason}")
+                        await self.rpc("cancel_action", action_id=self.active_id)
                 if time.monotonic() - self.active_started > 140:
                     await self.rpc("cancel_action", action_id=self.active_id)
                     raise RuntimeError("Native action exceeded its bound; cancellation requested, awaiting confirmation")
@@ -290,12 +300,19 @@ class MCPAgent:
                      previous_action_id=self.last_terminal[0] if self.last_terminal else None,
                      host_observed_to_submit_ms=round((time.monotonic()-self.last_terminal[1])*1000, 3)
                      if self.last_terminal else None)
-        result = await self.rpc("start_action", choice=choice, observation_id=packet["observation_id"])
+        arguments = {"choice": choice, "observation_id": packet["observation_id"]}
+        if goal_task is not None and packet["actions"][choice]["kind"] == "explore" and is_priority_board(self.plan):
+            arguments["navigation_targets"] = self.goals.navigation_targets(self.plan, packet["state"])
+            timing.annotate(navigation_target_count=len(arguments["navigation_targets"]))
+        result = await self.rpc("start_action", **arguments)
         self.active_id, self.active_started = result["action_id"], time.monotonic()
         if sequence_step is not None:
             self.sequence_actions[self.active_id] = (self.sequence.identity, sequence_step)
         if goal_task is not None:
-            self.goal_actions[self.active_id] = (goal_task["id"], task_signature(goal_task), packet["actions"][choice])
+            owned_action = copy.deepcopy(packet["actions"][choice])
+            if "navigation_targets" in arguments:
+                owned_action["navigation_targets"] = arguments["navigation_targets"]
+            self.goal_actions[self.active_id] = (goal_task["id"], task_signature(goal_task), owned_action)
         timing.event("action.command_queued", choice=choice, action_id=self.active_id)
         print(f"mcp_action_started choice={choice} id={self.active_id}")
         await self.wait_action()
@@ -339,7 +356,7 @@ class MCPAgent:
             result = self.pending.result()
         await self.observe()
         choice = result["answer"]["choice"]
-        if choice not in local:
+        if choice not in criteria:
             raise RuntimeError("JEV returned a choice outside the requested options")
         seconds = time.monotonic() - started
         timing.annotate(confidence=float(result["answer"].get("confidence", 0)), decision_time=seconds)
@@ -405,6 +422,21 @@ class MCPAgent:
         elif self.execute and self.auto_enabled:
             await self.sync_board(None, False)
             packet = await self.observe()
+        return await self.run_local_control(packet, planning_gap=self.planner is not None and self.plan is None)
+
+    def board_can_resume(self, packet):
+        return (is_priority_board(self.plan) and
+                self.goals.choose(self.plan, packet["state"], packet["actions"], self.navigator) is not None)
+
+    def gap_packet(self, packet):
+        # Temporary control must respect exact-choice failure pauses too.
+        paused = {(choice, guid) for (_, choice, guid), until in self.goals.paused.items()
+                  if until > time.monotonic()}
+        return {**packet, "actions": {k: a for k, a in packet["actions"].items()
+                                     if (k, a.get("guid")) not in paused}}
+
+    async def run_local_control(self, packet, *, planning_gap=False):
+        """Existing no-plan control also fills gaps without dropping future board goals."""
         if packet["state"]["bridge"].get("executor_busy"):
             timing.annotate(outcome="skipped", decision_source="native_busy")
             await asyncio.sleep(self.poll)
@@ -414,15 +446,26 @@ class MCPAgent:
         # A stable wait-only night does not upload full facts on each idle cycle.
         if packet.get("state_age_ms", 0) > 1000 and set(packet["actions"]) - {"wait"}:
             packet = await self.observe(refresh=True)
+        if planning_gap and self.board_can_resume(packet):
+            timing.annotate(decision_source="goal_resume", outcome="skipped")
+            return False
+        if planning_gap:
+            packet = self.gap_packet(packet)
         actions = packet["actions"]
-        navigation = self.navigator.choose(packet["state"], dispatch_for_navigation(actions, packet["state"]), self.plan)
+        navigation = self.navigator.choose(packet["state"], dispatch_for_navigation(actions, packet["state"]),
+                                           None if planning_gap else self.plan)
         local = {k: a for k, a in actions.items() if a["kind"] not in {"explore", "wait"}}
-        if navigation and (not local or not self.navigator.handoff):
+        if navigation and (not local or (not planning_gap and not self.navigator.handoff)):
             choice = navigation[0]
-            timing.annotate(decision_source="exploration_auto", exploration_strategy=self.navigator.strategy)
+            timing.annotate(decision_source="gap_navigation" if planning_gap else "exploration_auto",
+                            exploration_strategy=self.navigator.strategy)
         else:
-            timing.annotate(decision_source="jev")
-            choice, packet = await self.choose_local(packet)
+            timing.annotate(decision_source="jev_planning_gap" if planning_gap else "jev")
+            choice, packet = await self.choose_local(packet, handoff="planning_gap" if planning_gap else "local")
+            if planning_gap and self.board_can_resume(self.packet):
+                timing.event("decision.discarded", choice=choice, reason="task_board_actionable")
+                timing.annotate(decision_source="goal_resume", outcome="skipped")
+                return False
             if choice is None:
                 await asyncio.sleep(self.poll)
                 return False
@@ -430,11 +473,17 @@ class MCPAgent:
                 # Navigation is a separate executor choice, not the model's
                 # original target, and must use its own fresh observation.
                 packet = await self.observe()
+                if planning_gap and self.board_can_resume(packet):
+                    timing.annotate(decision_source="goal_resume", outcome="skipped")
+                    return False
+                if planning_gap:
+                    packet = self.gap_packet(packet)
                 self.navigator.after_local_action("wait")
-                navigation = self.navigator.choose(packet["state"], dispatch_for_navigation(packet["actions"], packet["state"]), self.plan)
+                navigation = self.navigator.choose(packet["state"], dispatch_for_navigation(packet["actions"], packet["state"]),
+                                                   None if planning_gap else self.plan)
                 if navigation:
                     choice = navigation[0]
-                    timing.annotate(decision_source="exploration_auto", jev_local_choice="wait",
+                    timing.annotate(decision_source="gap_navigation" if planning_gap else "exploration_auto", jev_local_choice="wait",
                                     exploration_strategy=self.navigator.strategy)
                 else:
                     timing.annotate(decision_source="executor_idle")
@@ -462,21 +511,7 @@ class MCPAgent:
         step_id = view["current_step_id"]
         timing.annotate(sequence_id=self.plan.get("sequence_id"), sequence_step_id=step_id,
                         sequence_step_index=view["step_index"], decision_source="sequence")
-        vitals = state["player"].get("vitals", {})
-        fires = any(e.get("prefab") in {"campfire", "firepit"} and "fire" in e.get("tags", [])
-                    and e.get("distance", 999) <= 8 for e in state.get("nearby", []))
-        torch = any(i.get("prefab") == "torch" for i in state["player"].get("inventory", {}).get("equipped", []))
-        emergency = (self.sequence.needs_safety_decision
-                     or any(e.get("activeThreat") for e in state.get("nearby", []))
-                     or (state["world"].get("phase") == "night" and not torch and not fires)
-                     or (vitals.get("hunger", 100) / max(vitals.get("hunger_max", 150), 1) < 0.3
-                         and "eat_safe_food" in actions))
-        if emergency:
-            timing.annotate(decision_source="sequence_safety")
-            choice, source = await self.choose_local(packet, handoff="safety")
-            if choice is not None:
-                self.sequence.needs_safety_decision = False
-                await self.perform(choice, source)
+        if await self.handle_safety(packet, self.sequence, "sequence_safety"):
             return
         choice = self.sequence.choose(self.plan, state, actions, self.navigator)
         if choice is None:
@@ -490,6 +525,39 @@ class MCPAgent:
         print(f"action_sequence_step index={view['step_index'] + 1}/{len(view['steps'])} id={step_id} choice={choice}")
         await self.perform(choice, packet, sequence_step=step_id)
 
+    async def handle_safety(self, packet, owner, source, *, light_changed=False):
+        state, actions = packet["state"], packet["actions"]
+        reasons = survival_dangers(state)
+        forced = light_changed or owner.needs_safety_decision
+        if not reasons and not forced:
+            self.deferred_safety = None
+            return False
+        remedies = tuple(sorted(k for k, a in actions.items()
+            if a["kind"] in {"eat_safe_food", "cook_food", "craft_torch", "equip_torch",
+                             "unequip_torch", "build_campfire", "flee_from_nearest_hostile"}
+            or a["kind"] == "collect" and a.get("product") in {*SAFE_FOOD_PREFABS, "petals"}))
+        vitals = state["player"].get("vitals", {})
+        bands = tuple((name, int(max(0, vitals[name] / vitals[name + "_max"]) * 10))
+                      for name in ("health", "hunger", "sanity") if "critical_" + name in reasons)
+        hostiles = tuple(sorted(str(e.get("guid", e.get("prefab", "unknown")))
+                                for e in state.get("nearby", []) if e.get("activeThreat")))
+        signature = (tuple(sorted(reasons)), remedies, bands, hostiles)
+        # A model-selected wait acknowledges this situation. Do not ask again
+        # merely because low sanity persists without any new available remedy.
+        # Native damage/light/threshold events always override this acknowledgement.
+        if not forced and signature == self.deferred_safety:
+            return False
+        if isinstance(owner, PriorityBoardExecutor):
+            owner.pause_accounting()
+        timing.annotate(decision_source=source, safety_reasons=sorted(reasons))
+        print(f"jev_safety reasons={','.join(sorted(reasons)) or 'native_or_light_change'}")
+        choice, offered = await self.choose_local(packet, handoff="safety")
+        self.deferred_safety = signature if choice in {None, "wait"} else None
+        if choice is not None:
+            owner.needs_safety_decision = False
+            await self.perform(choice, offered)
+        return True
+
     async def run_priority_board(self, packet):
         if packet["state"]["bridge"].get("executor_busy"):
             timing.annotate(outcome="skipped", decision_source="native_busy")
@@ -500,49 +568,19 @@ class MCPAgent:
         if not is_priority_board(self.plan):
             return
         state, actions = packet["state"], packet["actions"]
-        vitals = state["player"].get("vitals", {})
         fire = any(e.get("prefab") in {"campfire", "firepit"} and "fire" in e.get("tags", []) and e.get("distance", 999) <= 8 for e in state.get("nearby", []))
-        torch = any(i.get("prefab") == "torch" for i in state["player"].get("inventory", {}).get("equipped", []))
         light = (state["world"].get("phase"), fire)
         light_changed = self.goal_light is not None and (light[0] != self.goal_light[0]
                         or light[0] == "night" and light[1] != self.goal_light[1])
         self.goal_light = light
-        emergency = (light_changed or self.goals.needs_safety_decision or any(e.get("activeThreat") for e in state.get("nearby", []))
-                     or (state["world"].get("phase") == "night" and not torch and not fire)
-                     or (vitals.get("hunger", 100) / max(vitals.get("hunger_max", 150), 1) < .3 and "eat_safe_food" in actions))
-        if emergency:
-            self.goals.pause_accounting()
-            timing.annotate(decision_source="goal_safety")
-            choice, source = await self.choose_local(packet, handoff="safety")
-            if choice is not None:
-                self.goals.needs_safety_decision = False
-                await self.perform(choice, source)
+        if await self.handle_safety(packet, self.goals, "goal_safety", light_changed=light_changed):
             return
         selected = self.goals.choose(self.plan, state, actions, self.navigator)
         if selected:
             task, choice, action = selected
-            self.goal_idle_since = None
-            # Off-board opportunities are considered by TYPE/capability, never per GUID.
-            # Visible board work always takes precedence. Only navigation may yield.
-            signature = (tuple(sorted({a.get("product", a.get("prefab", k)) for k, a in actions.items()
-                                       if a.get("kind") not in {"explore", "wait"}})),
-                         tuple(sorted(i.get("prefab", "") for i in state["player"].get("inventory", {}).get("items", []) if i.get("prefab") in {"axe", "pickaxe"})))
-            if action.get("kind") == "explore" and signature != self.opportunity_signature and signature[0]:
-                self.opportunity_signature = signature
-                self.goals.pause_accounting()
-                timing.annotate(decision_source="goal_opportunity")
-                opportunistic, source = await self.choose_local(packet, handoff="opportunity")
-                if opportunistic and opportunistic != "wait":
-                    await self.perform(opportunistic, source)
-                    return
-                # A review/model request can change goals and actions. Reselect from fresh facts.
-                packet = await self.observe()
-                if not is_priority_board(self.plan):
-                    return
-                selected = self.goals.choose(self.plan, packet["state"], packet["actions"], self.navigator)
-                if not selected:
-                    return
-                task, choice, action = selected
+            self.goal_gap_marker = None
+            # New resources may reschedule board work, but never request an
+            # off-board model decision. JEV owns only safety and planning gaps.
             timing.annotate(decision_source="goal_navigation" if action.get("kind") == "explore" else "goal_local",
                             goal_task_id=task["id"], task_board_id=self.plan.get("board_id"),
                             exploration_strategy=self.navigator.strategy if action.get("kind") == "explore" else None)
@@ -551,14 +589,17 @@ class MCPAgent:
             await self.perform(choice, packet, goal_task=task)
             return
         self.goals.pause_accounting()
-        self.goal_idle_since = self.goal_idle_since or time.monotonic()
-        # A missing action (e.g. dusk campfire) is not a failed task. Allow phase changes;
-        # a bounded idle interval requests review without discarding remaining goals.
-        if time.monotonic() - self.goal_idle_since >= 15 and isinstance(self.planner, DailyPlanner):
-            self.planner.goal_replan_reason = "no_feasible_action_or_route"
-            self.goal_idle_since = time.monotonic()
-        timing.annotate(decision_source="goal_idle", outcome="skipped", goal_reason=self.goals.reason)
-        await asyncio.sleep(self.poll)
+        reason = "no_tasks" if not self.plan.get("tasks") else self.goals.reason or "no_feasible_action_or_route"
+        marker = (self.board_id(self.plan), reason)
+        first_gap = marker != self.goal_gap_marker
+        self.goal_gap_marker = marker
+        if isinstance(self.planner, DailyPlanner):
+            with timing.span("planner.update"):
+                self.plan = self.planner.request_review(state, reason, immediate=first_gap)
+        if first_gap:
+            print(f"task_board_handoff reason={reason} controller=jev_planning_gap")
+        timing.annotate(goal_reason=reason)
+        await self.run_local_control(packet, planning_gap=True)
 
     async def shutdown(self):
         self.drain_request_timings()

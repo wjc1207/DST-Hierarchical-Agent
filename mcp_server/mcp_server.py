@@ -48,9 +48,16 @@ def create_server(bridge):
         return await asyncio.to_thread(invoke, bridge.get_available_actions, True) if refresh else invoke(bridge.get_available_actions)
 
     @server.tool()
-    def start_action(choice: str, observation_id: str) -> dict[str, Any]:
-        """Queue one offered action. Returns an action ID, not completion. No arbitrary code or coordinates."""
-        return invoke(bridge.start_action, choice, observation_id)
+    def start_action(choice: str, observation_id: str,
+                     navigation_targets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Queue one offered action; returns an ID, not completion. No arbitrary code or coordinates.
+
+        For navigation only, navigation_targets watches up to six local inventory,
+        structure or hunger goals. Only an offered action advancing one may yield
+        for resources. [] ignores ordinary resources; omission keeps resource-set
+        events for planning gaps. Safety/region/path interruptions always apply.
+        """
+        return invoke(bridge.start_action, choice, observation_id, navigation_targets)
 
     @server.tool()
     def get_action_status(action_id: str) -> dict[str, Any]:

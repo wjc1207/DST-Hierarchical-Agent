@@ -27,11 +27,23 @@ Planning considerations:
   only cancel explicitly or revise with a reason based on changed facts. Time
   passing and task completion are not reasons to inflate stock targets.
   Each task has a bounded search time/distance; one route rejection does NOT prove
-  a resource is absent. JEV handles safety, new off-board opportunities, and gaps.
+  a resource is absent. JEV handles safety and planning gaps only; off-board
+  opportunities do not trigger it. Include needed food and sanity recovery in goals.
 - Runtime crafting only offers a new torch/axe/pickaxe when none is carried:
   request at most count=1, never a second reserve torch. Campfire placement is
   allowed only at night with no nearby lit fire. A dusk campfire task can wait
   while other visible goals proceed; it is not proof of missing materials.
+- Campfire recipe availability is not placement feasibility. Check
+  construction.campfire.status/reason: Lua scans combustible dropped items and
+  entities independently of the normal nearby whitelist and cap. A site must
+  have at least 5 units of combustible clearance (Klei's maximum base spread
+  radius 4 plus margin 1, expanded for a larger seasonal range modifier).
+  Lua searches 3-6 units from the player's current position, checks passability
+  and known hazards, then rescans before placement. With no safe site the build
+  option is hidden; consider portable light or reaching a clearing rather than
+  repeatedly requesting construction. A buffered campfire can be placed later
+  without spending its ingredients again. A clear site does not establish safe
+  character temperature or prove the cause of health loss.
 - Klei room resource priors are supplied for OBSERVED topology room types. BGGrass
   can generate grass/saplings/berries, FlowerPatch primarily flowers/fireflies/bees,
   and BGRocky can generate rock1/rock2/flint. Identical ground tiles need not share
@@ -72,6 +84,12 @@ Planning considerations:
 - Chopping and mining actions include bounded pickup near the completed target.
   Trees may yield logs and seeds (such as pinecones or acorns); mined rocks may
   yield rocks, flint, nitre, or gold, depending on the target.
+  Lua prefers tall reachable trees over normal/short trees among observed,
+  executable candidates, breaking size ties by distance. Standard growth stages
+  require 15/10/5 axe uses; an unknown stage reserves 15. Current work-left is
+  used when a server component reports it. Species, season and burnt state can
+  change drops. Cleanup scans within 6 units of the original work point and
+  includes existing nearby drops and partial stacks, not only newly spawned GUIDs.
 - Source feasibility depends on prerequisites: without a usable pickaxe, a rock
   that can drop flint is NOT an executable way to get the flint needed to make
   that pickaxe. Seek loose flint or another obtainable source instead. A recipe
@@ -86,6 +104,16 @@ Planning considerations:
   survey. A need that persists does not itself make a failed source valid again.
 - The eat_safe_food action can cook carried raw food at a nearby lit cooker and
   then eat it when needed. Do not plan a separate cook action solely for that.
+- collect_berrybush_juicy includes picking the bush AND gathering its fallen
+  juicy berries. Fruit on the ground is not yet food in inventory; Lua waits for
+  actual inventory gain and clears nearby fruit before completing the action.
+  Ordinary berrybush harvesting and loose-fruit pickup retain their direct behavior.
+- A hunger_ratio goal includes acquisition: eat carried safe food first; otherwise
+  gather nearby safe food (including planted carrots) or navigate to remembered
+  food sources, known source rooms, room priors, then unexplored branches.
+  It completes from observed hunger, not merely from collecting or eating once.
+  Existing safety checks, dependencies and search budgets still apply. The goal
+  does not require a separate inventory task for every possible kind of food.
 - Exploration uses the game's topology IDs as region identity; ground tiles
   supply terrain/resource hints, not region boundaries. One topology region can
   contain mixed tiles; distinct regions can share a biome and get numbered names.
@@ -102,15 +130,16 @@ Planning considerations:
 - Exploration and region travel are selected by the executor, not JEV. It uses
   priority goals, remembered source positions, known source-room records/BFS hops,
   Klei generation priors, and depth-first unknown-branch traversal with backtracking.
-  JEV selects safety responses and worthwhile off-board opportunities; it is not
-  asked about every plant or short movement leg.
+  JEV selects safety responses and fills planning gaps; off-board opportunities
+  do not trigger it. It is not asked about every plant or short movement leg.
   These are navigation policies, not a complete acquisition/tool-dependency solver.
-- Exploration continues across short movement legs without requesting JEV
-  after every leg. Ordinary resource events compare the SET of collectible,
-  reachable product types, not entity GUIDs or counts: more grass alone is not
-  a new type. Yield only while that set differs and displacement from execution
-  start is at least 4 units. Threats, unsafe lighting, phase/region changes, and
-  navigation failures can interrupt earlier; the 4-unit rule is not a safety delay.
+- Board navigation ignores unrelated resources. After 4 units, an offered local
+  action advancing a ready unfinished goal yields. Tree/ore work needs a usable
+  tool and path, not a collectible-set change. Completed/blocked/dependent goals
+  are not watched. Planner updates and search budgets remain enforced while walking.
+- In planning gaps, changed collectible/reachable product TYPE sets after 4 units
+  can request JEV. GUID/count changes alone do not. Threats, unsafe lighting,
+  phase/region changes and path failures interrupt earlier; safety never waits.
 - Oasis and ordinary desert share desert ground cues; do not infer an oasis
   without additional evidence. Prioritize resources actually observed nearby.
 - Terrain is only a search hint: forest often has trees and saplings; grassland

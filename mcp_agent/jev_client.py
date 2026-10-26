@@ -11,6 +11,7 @@ from .navigation_intents import exploration_key
 
 DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
+CONTINUE_MAIN_TASK = "continue_main_task"
 
 @timing.timed("decision.state_compact")
 def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
@@ -19,13 +20,14 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
         "goal": "Survive indefinitely and steadily improve food, light, tools, resources, and safety.",
         "hard_rules": [
             "Choose only an action listed in the available criteria; unavailable actions cannot be executed.",
+            "During daytime the executor automatically unequips a held torch to save fuel; this does not require your decision.",
             "At night without an equipped torch, exploration and collection are blocked even beside a stationary fire; fleeing an immediate threat is an exception.",
             "A torch can be equipped only at night and only when no lit campfire or firepit is nearby. A campfire can be built only at night when no lit fire is nearby.",
         ],
         "decision_guidance": [
-            "Exploration and known-region travel are owned by the executor, not by you. Choose a useful available local action or wait to return control; wait is not a request to stop safe exploration. Resource opportunities and survival changes can interrupt navigation, whose intent is preserved for resumption.",
+            "Exploration and known-region travel are owned by the executor, not by you. Choose a useful available local action or wait to return control; wait is not a request to stop safe exploration. You are called for safety or planning gaps, not ordinary off-board resource opportunities. Navigation intent is preserved for resumption.",
             "Both models use the same game-state fields. inventory_details separates backpack items and equipped slots; durability_percent is a 0..1 remaining fraction (torch fuel), with missing values unknown. lighting.observed_fires reports current burning and distance, not remaining fire lifetime. state_basis marks observed versus predicted snapshots.",
-            "Exploration watches the SET of currently collectible, reachable resource product types, not individual GUIDs or counts. Ordinary resource changes yield only after at least 4 world units of displacement from the execution start and while that set differs; threats and other safety/navigation events may interrupt earlier.",
+            "Board navigation ignores unrelated resource changes and yields only for an offered action advancing a ready unfinished local goal after at least 4 world units. During planning gaps, exploration watches the SET of collectible reachable product types instead of GUIDs or counts. Safety and navigation events may interrupt earlier.",
             "Assess immediate threats, darkness, and starvation before optional progress; compare the remaining safe actions rather than following a fixed script.",
             "eat_safe_food is a complete eating action: if no preferred cooked food is carried and a lit cooker is nearby, it cooks one item and then eats; cook_food alone only prepares food for later.",
             "craft_torch is a complete native action: if DST auto-equips the new torch before night, Lua unequips it to preserve fuel.",
@@ -52,11 +54,23 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
                 compact["task_board"] = daily_plan
                 compact["decision_guidance"] = [
                     "The executor continuously advances this priority board and owns all navigation. "
-                    "You arbitrate a safety interruption or a new off-board opportunity, not each plant. "
-                    "For safety, resolve the immediate threat/light/hunger issue. For an opportunity, "
-                    "choose a worthwhile bounded local action or wait to continue goal navigation. "
+                    "You are called only for safety or a DeepSeek planning gap; off-board opportunity arbitration is disabled. "
+                    "For safety, resolve immediate enemies, damage, unsafe lighting, or health/hunger/sanity below 30%. "
+                    "Choose a supplied local remedy, including gathering food or flowers when needed; "
+                    "do not divert into unrelated crafting or optional gathering. "
+                    "If no useful local remedy is available, wait acknowledges the situation so the executor "
+                    "can resume safe board work/navigation until the danger or available remedies change. "
                     "Do not create a plan or repeat done/blocked tasks. See task_board.handoff_reason."
                 ]
+                if daily_plan.get("handoff_reason") == "planning_gap":
+                    compact["decision_guidance"] = [
+                        "No task on this board can currently be advanced. DeepSeek is evaluating/updating it; "
+                        "temporarily choose useful safe local work from the supplied criteria. "
+                        "The board is context, not an instruction to wait for a future phase or repeat done tasks. "
+                        "Handle survival first. Do not create another plan. If no local work is worthwhile, "
+                        "wait returns control for safe executor exploration when a route exists. "
+                        "Automatic board execution resumes as soon as a task becomes actionable."
+                    ]
             else:
                 compact["task_board"] = board_view(daily_plan, state)
         else:

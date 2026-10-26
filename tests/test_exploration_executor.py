@@ -99,6 +99,19 @@ class ExplorationExecutorTests(unittest.TestCase):
         self.assertNotEqual(selected[1].get("target_node_id"), "B")
         self.assertFalse(actual["navigation"]["graph"]["current"]["boundary_complete"])
 
+    def test_lua_entrance_pause_does_not_ban_other_routes_to_the_same_region(self):
+        for reason in ("route_no_progress", "route_gateway_unavailable", "region_confirmation_timeout"):
+            with self.subTest(reason=reason):
+                self.navigator = ExplorationExecutor()
+                actual = observed()
+                plan = board({"type": "visit_region", "node_id": "B"})
+                self.choose(actual, plan)
+                self.navigator.on_event({"reason": reason}, actual)
+                self.assertIsNone(self.navigator.intent)
+                self.assertFalse(self.navigator.paused)
+                self.assertEqual(self.choose(actual, plan)[1]["target_node_id"], "B")
+                self.assertFalse(self.navigator.source_failures)
+
     def test_entered_but_unfinished_room_remains_a_pending_branch(self):
         actual = observed()
         actual["navigation"].update(status="no_frontier", search={"status": "boundary_complete"})

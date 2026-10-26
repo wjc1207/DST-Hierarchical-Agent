@@ -39,6 +39,65 @@ function M.select_gateway(candidates, previous)
     return best
 end
 
+function M.commit_route(memory, source, destination, gateway, first, now, px, pz, remaining, entrance)
+    if not gateway or not first then return end
+    local route = memory.route_intent
+    if not route or route.source ~= source or route.destination ~= destination
+        or route.gateway_id ~= gateway or route.first ~= first then
+        route = {source=source,destination=destination,gateway_id=gateway,first=first}
+        memory.route_intent = route
+    end
+    route.entrance = entrance or route.entrance
+    if not route.last_position or distance(px,pz,route.last_position.x,route.last_position.z)>8 then
+        -- A local collection detour is not evidence of oscillating navigation.
+        route.progress_anchor,route.elapsed,route.travelled = remaining,0,0
+    end
+    route.walking,route.sample_at,route.last_position = true,now,{x=px,z=pz}
+end
+
+function M.pause_route(memory)
+    if memory.route_intent then
+        memory.route_intent.walking = false
+        memory.route_intent.confirmation_since = nil
+    end
+end
+
+function M.route_progress(memory, first, now, px, pz)
+    local route = memory.route_intent
+    if not route then return end
+    if not first or first.gateway_id ~= route.gateway_id then return "route_gateway_unavailable" end
+    if not route.walking then route.sample_at=now; return end
+    local previous = route.last_position
+    local moved = previous and distance(px,pz,previous.x,previous.z) or 0
+    local elapsed = math.max(0,now-(route.sample_at or now))
+    route.last_position,route.sample_at = {x=px,z=pz},now
+    if (first.leg or {}).awaiting_region then
+        route.confirmation_since=route.confirmation_since or now
+        if now-route.confirmation_since>=3 then return "region_confirmation_timeout" end
+        return
+    end
+    route.confirmation_since=nil
+    local remaining = first.remaining_distance
+    if type(remaining) ~= "number" then return end
+    if not route.progress_anchor or moved>12 or remaining<=route.progress_anchor-2 then
+        route.progress_anchor,route.elapsed,route.travelled = remaining,0,0
+    else
+        route.elapsed = (route.elapsed or 0)+math.min(elapsed,2)
+        route.travelled = (route.travelled or 0)+moved
+    end
+    if (route.elapsed or 0)>=12 and ((route.travelled or 0)>=16 or (route.travelled or 0)<1) then
+        return "route_no_progress"
+    end
+end
+
+function M.pause_gateway(memory, gateway, now, reason)
+    memory.route_pauses = memory.route_pauses or {}
+    local pause = {gateway_id=gateway,until_time=now+30,reason=reason}
+    memory.route_pauses[gateway],memory.last_route_pause = pause,pause
+    memory.route_intent = nil
+    M.count(memory,"graph_paths",reason)
+end
+
 function M.gateway_crossing(crossing, px, pz, ax, az, bx, bz, arrival)
     -- Once across the source-side threshold, never steer back to that side.
     -- A collection detour far from the entrance starts a fresh approach.
@@ -183,14 +242,43 @@ function M.destinations(memory, current_id, immediate)
                 entered = node.entries > 0, resources_seen = resources,
                 hops = entry.hops, next_node_id = entry.first,
                 gateway_id = first.gateway_id,
+                source_node_id = first.source_node_id, entrance = first.entrance,
                 -- Distance is to the FIRST exit, not a fabricated full route length.
-                distance = first.distance, target = first.target, leg = first.leg,
+                distance = first.distance, remaining_distance = first.remaining_distance,
+                target = first.target, leg = first.leg,
             })
         end
         for _, id in ipairs(adjacency[entry.id] or {}) do
             if not seen[id] then
                 seen[id] = true
                 table.insert(queue, { id = id, first = entry.first, hops = entry.hops + 1 })
+            end
+        end
+    end
+    -- Keep the first hop of the route actually being executed, even when a
+    -- shorter alternative reappears. Other destinations retain ordinary BFS.
+    local locked = memory.route_intent
+    local first = locked and locked.walking and immediate[locked.first]
+    if first and first.gateway_id==locked.gateway_id then
+        local pending,visited,index = {{id=locked.first,hops=1}},{[current_id]=true,[locked.first]=true},1
+        while index<=#pending do
+            local entry=pending[index]; index=index+1
+            if entry.id==locked.destination then
+                for _, route in ipairs(result) do
+                    if route.node_id==locked.destination then
+                        route.hops,route.next_node_id,route.gateway_id = entry.hops,locked.first,first.gateway_id
+                        route.distance,route.remaining_distance = first.distance,first.remaining_distance
+                        route.target,route.leg = first.target,first.leg
+                        route.source_node_id,route.entrance = first.source_node_id,first.entrance
+                        break
+                    end
+                end
+                break
+            end
+            for _, id in ipairs(adjacency[entry.id] or {}) do
+                if not visited[id] then
+                    visited[id]=true; pending[#pending+1]={id=id,hops=entry.hops+1}
+                end
             end
         end
     end

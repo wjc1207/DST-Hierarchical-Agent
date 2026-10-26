@@ -46,6 +46,10 @@ class SharedStateTests(unittest.TestCase):
         actual["work"] = {"action": "chop", "status": "completed", "sequence": 9,
                           "target_guid": 33}
         actual["execution"] = {"doing": False, "sequence": 10}
+        actual["construction"] = {"campfire": {
+            "status": "blocked", "reason": "no_safe_campfire_position",
+            "combustible_clearance": 5, "combustibles_observed": 8,
+        }}
         return actual
 
     def assert_same_facts(self, actual):
@@ -73,6 +77,7 @@ class SharedStateTests(unittest.TestCase):
         self.assertEqual(facts["best_weapon"], "pickaxe")
         self.assertEqual(facts["work"]["target_guid"], 33)
         self.assertEqual(facts["vitals"]["sanity_max"], 200)
+        self.assertEqual(facts["construction"]["campfire"], self.observed()["construction"]["campfire"])
 
     def test_farther_entities_are_not_filtered_for_only_one_model(self):
         actual = self.observed()
@@ -90,6 +95,16 @@ class SharedStateTests(unittest.TestCase):
         self.assertEqual(facts["nearby"][0]["collect_path"], actual["nearby"][0]["collect_path"])
         self.assertFalse(facts["nearby_lit_fire"])
         self.assertTrue(facts["lighting"]["observed_fires"][0]["lit"])
+
+    def test_science_machine_keeps_both_semantic_and_real_prefab_ids_for_both_models(self):
+        actual=self.observed()
+        actual["nearby"].append({"prefab":"sciencemachine","game_prefab":"researchlab","guid":42,"distance":2})
+        actual["crafting"]={"sciencemachine":True}
+        facts=self.assert_same_facts(actual)
+        science=next(e for e in facts["nearby"] if e["guid"]==42)
+        self.assertEqual(science["prefab"],"sciencemachine")
+        self.assertEqual(science["game_prefab"],"researchlab")
+        self.assertTrue(facts["crafting"]["sciencemachine"])
 
     def test_missing_fuel_and_fire_tags_remain_unknown_for_both(self):
         actual = self.observed()
@@ -110,13 +125,18 @@ class SharedStateTests(unittest.TestCase):
         planner["inventory_details"]["equipped"][0]["durability_percent"] = 0
         planner["world"]["phase"] = "day"
         planner["nearby"][0]["collect_path"]["waypoint"]["x"] = 999
+        planner["construction"]["campfire"]["status"] = "ready"
         self.assertEqual(actual, before)
         self.assertEqual(decider["inventory_details"]["equipped"][0]["durability_percent"], 0.04)
         self.assertEqual(decider["world"]["phase"], "night")
+        self.assertEqual(decider["construction"]["campfire"]["status"], "blocked")
 
 
     def test_actual_api_payloads_share_facts_but_not_model_specific_roles(self):
         actual = self.observed()
+        actual["navigation"] = {"graph": {"current": {"id": "A:BGGrass"}}}
+        actual["bridge"] = {"enabled": True, "protocol": 4, "board_revision": 2,
+                            "available_actions": {"wait": {"kind": "wait"}}}
         planning = daily_planner.planning_context(actual, [{"action": "collect_grass"}])
         planning["dst_knowledge"] = "strategic reference"
         response = Response({"choices": [{"finish_reason": "stop", "message": {
@@ -124,7 +144,9 @@ class SharedStateTests(unittest.TestCase):
         }}]})
         with patch.object(daily_planner.urllib.request, "urlopen", return_value=response) as send:
             daily_planner.request_plan("https://example.invalid/plan", "secret", "planner", 1, planning)
-        deepseek_state = json.loads(json.loads(send.call_args.args[0].data)["messages"][-1]["content"])
+        messages = json.loads(send.call_args.args[0].data)["messages"]
+        deepseek_state = json.loads(messages[-1]["content"])
+        reference = json.loads(messages[0]["content"].split(daily_planner.STATIC_REFERENCE_MARKER)[1])
         response = Response({"answers": {"next_action": {"choice": "wait", "confidence": 1}}})
         with patch.object(jev_agent.urllib.request, "urlopen", return_value=response) as send:
             jev_agent.call_jev("https://example.invalid/decide", "secret", "decider", actual,
@@ -132,7 +154,16 @@ class SharedStateTests(unittest.TestCase):
         jev_payload = json.loads(send.call_args.args[0].data)
         jev_state = json.loads(jev_payload["state"])
         for key in model_game_state(actual):
-            self.assertEqual(deepseek_state[key], jev_state[key], key)
+            if key == "region_resource_priors":
+                for room, prefabs in jev_state[key].items():
+                    self.assertEqual(reference[key].get(room, []), prefabs)
+            elif key == "control":
+                self.assertEqual({**reference["control_contract"], **deepseek_state[key]}, jev_state[key])
+            else:
+                self.assertEqual(deepseek_state[key], jev_state[key], key)
+        self.assertNotIn("region_resource_priors", deepseek_state)
+        self.assertNotIn("dst_knowledge", deepseek_state)
+        self.assertEqual(reference["dst_knowledge"], "strategic reference")
         self.assertIn("recent_actions", deepseek_state)
         self.assertNotIn("recent_actions", jev_state)
         self.assertNotIn("dst_knowledge", jev_state)

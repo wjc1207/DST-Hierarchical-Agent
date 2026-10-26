@@ -2,7 +2,7 @@
 
 [English](README.EN.md) · [技术说明](docs/TECHNICAL.md)
 
-《饥荒联机版》智能体实验项目。DeepSeek 维护有优先级的多目标看板，执行器优先完成眼前任务，并结合 Klei 区域资源配置与探索记忆寻找所需物资。Lua Mod 原生执行并验证动作，JEV 处理紧急变化和计划外机会，不必逐次决定计划内采集。长期目标是制作炼金引擎，当前已支持科学机器。
+《饥荒联机版》智能体实验项目。DeepSeek 维护有优先级的多目标看板，执行器优先完成眼前任务，并结合 Klei 区域资源配置与探索记忆寻找所需物资。Lua Mod 原生执行并验证动作，JEV 处理危险，并在 DeepSeek 规划空窗期临时接手。长期目标是制作炼金引擎，当前已支持科学机器。
 
 已完成的阶段：[活过第一晚](https://bilibili.com/video/BV1aehE6DEji) · [制作科学机器](https://www.bilibili.com/video/BV1mFaV6aEQ2)
 

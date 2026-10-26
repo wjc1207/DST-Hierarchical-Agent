@@ -33,6 +33,12 @@ from another directory; preserve it alongside the installed token file.
 The updated autonomous host requires protocol 4 and rejects older Mod snapshots.
 Update both sides together; measurement version remains 1.
 
+Science Machine mapping updates require `modmain.lua` and
+`mcp_agent/daily_planner.py`, followed by a world reload and Python-host restart.
+Public goals/actions keep `sciencemachine` / `build_sciencemachine`; the Mod uses
+`researchlab` for native recipes/entities and retains it in `game_prefab` on the
+normalized observation. No task-board or action-name migration is required.
+
 ## Autonomous DeepSeek/JEV host
 
 Stop bridge-only instances, probes and other same-port clients.
@@ -60,7 +66,11 @@ the Mod and existing token configuration are unchanged.
 
 - DeepSeek maintains persistent priority goals, dependencies and search budgets,
   using the existing knowledge and conversation history.
-- JEV handles safety, new off-board opportunities and gaps without a plan, not each planned pickup.
+- JEV handles safety and temporary gaps when no board
+  task can advance, not each planned pickup. The host requests DeepSeek evaluation
+  immediately for an empty/completed/unexecutable board; one request runs at a time.
+  Off-board opportunity arbitration is disabled. Safety includes targeted enemies,
+  damage, lighting and known health/hunger/sanity below 30%, even without a carried remedy.
 - Python owns visible-first scheduling, latched completion, search budgets and DFS/BFS
   intent selection. It selects only offered actions; Lua owns game movement.
 - Lua owns approach, continuous movement, native actions, effect verification
@@ -69,8 +79,10 @@ the Mod and existing token configuration are unchanged.
   not model calls. Both models use the same game-fact projection and capability facts.
 
 The host waits for Lua acknowledgement before issuing work after a board pause.
-Damage, inventory, phase, threat and plan changes no longer discard pending model
-requests in Python. Submit the original offered choice/observation; Lua validates
+Damage, inventory, phase and threat changes do not discard regular model requests
+in Python. Temporary planning-gap choices yield back to automatic execution if
+the latest board can advance before dispatch. For dispatched choices, submit the
+original offered choice/observation; Lua validates
 live feasibility. Death or a changed game/player session stops the host; disconnected
 or expired observations cannot issue commands.
 Ctrl+C requests cancellation and waits for acknowledgement; if unconfirmed,
@@ -179,7 +191,14 @@ connecting an MCP host. Disabling the bridge does not enable another control tra
 
 - `get_state(refresh=false)`: latest event snapshot and actual age; true requests new facts, waiting up to three seconds. Disconnected games error.
 - `get_available_actions(refresh=false)`: cached facts/options plus latest control status, snapshot version/age, observation ID and board progress; true requests a fresh snapshot.
-- `start_action(choice, observation_id)`: queue one offered action; returns an ID, not success.
+- `start_action(choice, observation_id, navigation_targets=None)`: queue one offered action;
+  returns an ID, not success. For navigation, an optional list of at most six local
+  targets (`inventory {prefab,count}`, `structure {prefab}`, `hunger_ratio {at_least}`)
+  replaces resource-set interruption with live offered-action matching. The host
+  sends all ready local board goals, excluding completed/blocked/dependent work.
+  `[]` ignores ordinary resource changes; omission preserves unfiltered resource
+  events for DS gaps and existing clients. This cannot alter coordinates, choose
+  an unoffered action or suppress safety/region/path interruptions.
 - `get_action_status(action_id)`: state, reason and connectivity.
 - `cancel_action(action_id)`: request cancellation; wait for Lua acknowledgement.
 - `submit_task_board(board, observation_id, auto_execute=false)`: validated board;
@@ -204,9 +223,32 @@ Implemented: verified native collection with path approach; tools/torch crafting
 torch equipment and daylight cleanup; cooking/eating; campfire/Science Machine
 placement; whole work targets and nearby reachable new drops; event-driven local
 exploration, unknown exits and reported known-region routes; bounded escape via
-reported passable routes; opt-in visible local board actions. Resource-set changes
-yield after four units of displacement; safety events do not wait for that floor.
+reported passable routes; opt-in visible local board actions. Board navigation
+yields after four units only for a live offered action advancing a watched goal,
+with reason `goal_action_available`; unrelated resources do not stop movement.
+Unfiltered DS-gap navigation retains resource-set changes after four units.
+Safety events do not wait for that floor. The host still reviews changed board
+targets and existing search budgets during native movement, cancelling with
+acknowledgement before rescheduling; this does not ask JEV for ordinary opportunities.
 No visible targeted hostile is not proof of permanently cleared aggro.
+
+A blocked escape changes heading inside the current action after about 0.8
+seconds without movement progress. Only that heading near the failure position
+is temporarily avoided (eight seconds / two units). Failed flee actions do not
+disable the entire flee option for 15 seconds. If all live passable headings were
+tried, retry the oldest; never invent a route when the passability scan offers
+none. Native reports/events expose `escape_reroutes` for diagnosis.
+
+Region travel checks the complete entrance approach and keeps the active trip's
+valid first hop and physical entrance across incidental room crossings during
+a detour, instead of switching whenever a shorter route reappears. Lua
+reports `graph.route_pause` and interrupts with `route_no_progress` or
+`route_gateway_unavailable` when an entrance is temporarily rejected. A fixed
+crossing endpoint waits at most three seconds for topology confirmation, then
+reports `region_confirmation_timeout` without repeated zero-distance walks. The pause
+is entrance-specific; other routes to the same region remain eligible. Progress
+persists across resource-event yields and excludes model/local-work waits; see
+[navigation recovery](GOAL_NAVIGATION.md#search-bounds-and-recovery).
 
 The full DFS/BFS selector and failed-source memory have not moved into Lua: the
 host uses `mcp_agent/navigation_intents.py` for destination scheduling, not keyboard control. Attacking/weapon equipment, automatic tool prerequisite solving
@@ -226,8 +268,12 @@ separately querying an older status and then observing again.
 After three seconds without a valid reply, it stops work
 and pauses the board. Late callbacks, duplicate commands and old worlds cannot
 restart work. Building callbacks respect cancellation generations. Ordinary actions
-yield on danger; recovery actions have appropriate exceptions. No automatic torch
-decision is introduced. Completion requires observed effects, not a sent command.
+yield on danger; recovery actions have appropriate exceptions. During daytime,
+Lua automatically unequips a held torch while the control connection is live,
+including while idle or fleeing, without replacing the active action/report.
+Unconfirmed unequip is retried at one-second intervals. Dusk and nighttime
+lighting retain their existing rules. Completion requires observed effects,
+not a sent command.
 
 Keep the internal HTTP port private. Its token is in request bodies (for the game
 HTTP API), never in diagnostics. The network bridge is not a public MCP endpoint.
@@ -378,6 +424,15 @@ authorization, emergency model preemption, predictive buffering or local sensing
 
 ### Pickup handoff after work
 
+Work approach hands over to the target-based native CHOP/MINE action once the
+target is inside the six-unit action-button selection radius and its observed
+path is directly safe. Native locomotion handles the final collision-aware
+arrival distance; the bridge does not WALKTO a boulder's centre or require a
+1.2-unit centre distance. Verified detours continue before handoff. This is a
+dispatch radius, not a remote-work range. Tool/durability checks, safety,
+completion verification and loot cleanup still apply; collection keeps its
+existing approach logic.
+
 After chopping or mining, animation recovery or native interaction cooldown may
 temporarily leave the action picker empty. The executor retains the exact drop
 GUID and retries every 0.2 seconds for up to 3 seconds, rather than raising a
@@ -387,9 +442,42 @@ cancellation still interrupt it. An exhausted retry window reports
 `collection_action_unavailable` explicitly.
 
 After dispatch, inventory gain is still required before collecting the next
-drop or reporting completion. Chopping, mining and ordinary collection share
-this recovery handling. Update `modmain.lua` and `scripts/jev_native_executor.lua`
-and re-enter the world; Python and bridge configuration are unchanged.
+drop. Each approach starts its own movement-progress clock, so a long chop is
+not counted as a stalled walk toward loot. Accepted pickups without an inventory
+effect are retried at one-second intervals while idle and fail after four seconds
+with `loot_inventory_not_increased`, rather than waiting for the whole action timeout.
+
+Work cleanup uses an uncapped scan within 6 units of the original tree/rock,
+independent of the normal nearest-40 snapshot and the player's later movement.
+Existing drops and partial/merged stacks remain eligible. It waits at least one
+second for initial drop replication and 0.6 seconds of empty ground after the
+last verified pickup. A blocked remaining drop interrupts with a path error;
+an unavailable scan fails explicitly. Safety checks still use the full ordinary
+snapshot before the private loot view, so the loot scan cannot hide enemies.
+
+`scripts/jev_tree_work.lua` reads standard growth stages from replicated tree
+animations, with server growable/work-left components when present. Unknown stages
+reserve 15 axe uses. The offered chop target prefers a reachable tall tree with
+enough durability, then normal, then short; distance breaks size ties. It can
+approach an observed tree beyond 6 units before starting work; mining keeps its
+existing proximity rule. Update `modmain.lua`, the complete `scripts/` directory
+(including the new helper), and `data/DSTKnowledge.txt`; re-enter the world.
+
+### Juicy berry harvest
+
+`collect_berrybush_juicy` is one native operation: approach and pick the requested
+bush, then collect fallen `berries_juicy` within 6 units of that bush using the
+same uncapped loot scan, recovery retries and inventory verification as work
+cleanup. The collection deadline is 30 seconds. A dispatched pick followed by
+the bush becoming unpickable starts cleanup; it does not prove completion.
+Existing carried fruit cannot satisfy verification of this harvest. After a
+stable empty scan, at least one new fruit must have entered inventory, otherwise
+the action reports `harvest_loot_not_received` after a short replication grace.
+Remaining fruit keeps cleanup active even after the first inventory gain.
+Safety changes and cancellation can interrupt any stage. Ordinary berry bushes
+and standalone loose-fruit pickups retain direct inventory-gain verification.
+Update `scripts/jev_native_executor.lua` and the knowledge file, then re-enter
+the world; no new MCP tool or separate model decision is required per fruit.
 
 ## Tests
 

@@ -10,7 +10,7 @@ from pathlib import Path
 LUA_STAGES = {"camera_ms", "entities_ms", "navigation_ms", "collection_paths_ms", "vitals_ms",
               "inventory_ms", "execution_read_ms", "crafting_ms", "control_status_ms",
               "board_ready_ms", "available_actions_ms", "state_total_ms", "native_tick_ms",
-              "board_step_ms", "total_ms"}
+              "board_step_ms", "resource_memory_ms", "campfire_siting_ms", "total_ms"}
 RECEIPT_FIELDS = {"encode_ms", "request_bytes", "response_bytes", "http_status", "query_call_ms",
                   "query_to_callback_ms", "decode_ms", "callback_dispatch_ms"}
 

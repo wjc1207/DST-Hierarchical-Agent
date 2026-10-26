@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from common.task_board import validate_board, board_view
+from common.task_board import validate_board, board_view, validate_navigation_targets
 from .transport_metrics import TransportRecorder, lua_measurements
 
 TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
@@ -166,7 +166,12 @@ class GameBridge:
                 status = report.get("status")
                 if (record["session_id"] == session and record["status"] not in TERMINAL
                         and status in TERMINAL | {"running"}):
-                    record.update(status=status, reason=str(report.get("reason", ""))[:240])
+                    # A still-running heartbeat precedes delivery/ack of our stop.
+                    # Keep cancellation pending so this exchange returns cancel,
+                    # rather than erasing it and waiting for natural completion.
+                    cancelling = record["status"] == "cancel_requested" and status == "running"
+                    if not cancelling:
+                        record.update(status=status, reason=str(report.get("reason", ""))[:240])
                     if status == "running":
                         record.setdefault("_running_at", self.received)
                     else:
@@ -259,7 +264,7 @@ class GameBridge:
                         self.state["bridge"].get("executor_busy") or (self.board and self.board.get("auto_execute"))),
                     "task_board": board_view(self.board, self.state) if self.board else None}
 
-    def start_action(self, choice: str, observation_id: str):
+    def start_action(self, choice: str, observation_id: str, navigation_targets: list | None = None):
         with self.lock:
             self._fresh()
             if self.active or (self.board and self.board.get("auto_execute")) \
@@ -273,9 +278,14 @@ class GameBridge:
             old = observation[3].get(choice)
             if not old:
                 raise BridgeError("Action was not offered by this observation")
+            action = copy.deepcopy(old)
+            if navigation_targets is not None:
+                if old.get("kind") != "explore":
+                    raise BridgeError("Navigation targets apply only to offered navigation actions")
+                action["navigation_targets"] = validate_navigation_targets(navigation_targets)
             action_id = secrets.token_hex(12)
             record = {"action_id": action_id, "session_id": self.session, "choice": choice,
-                      "action": copy.deepcopy(old), "status": "queued", "reason": "",
+                      "action": action, "status": "queued", "reason": "",
                       "expires": self.clock() + 5, "_queued_at": self.clock()}
             self.actions[action_id] = record
             self.active = action_id

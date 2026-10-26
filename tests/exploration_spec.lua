@@ -212,6 +212,59 @@ test("recorded destinations include a former region and multi-hop regions", func
     assert(#E.destinations(m,"A",{}) == 0)
 end)
 
+test("committed destination keeps a valid first hop when a shorter route reappears",function()
+    local m=memory()
+    for _,id in ipairs({"A","B","C","D","E","F","T"}) do node(m,id) end
+    for _,edge in ipairs({{"A","B"},{"B","D"},{"D","T"},
+        {"A","C"},{"C","E"},{"E","F"},{"F","T"}}) do
+        m.graph_edges[edge[1]..edge[2]]={{a_id=edge[1],b_id=edge[2]}}
+    end
+    local long={gateway_id="AC",distance=20,remaining_distance=30,target={x=20,z=0},leg={x=4,z=0}}
+    local short={gateway_id="AB",distance=5,remaining_distance=15,target={x=-20,z=0},leg={x=-4,z=0}}
+    E.commit_route(m,"A","T","AC","C",0,0,0,30)
+    local routes=E.destinations(m,"A",{B=short,C=long}); local found
+    for _,route in ipairs(routes) do
+        if route.node_id=="T" then found=route end
+        if route.node_id=="D" then assert(route.next_node_id=="B","unrelated destinations still use BFS") end
+    end
+    assert(found.next_node_id=="C" and found.hops==4 and found.gateway_id=="AC")
+    routes=E.destinations(m,"A",{B=short})
+    for _,route in ipairs(routes) do
+        if route.node_id=="T" then assert(route.next_node_id=="B" and route.hops==3) end
+    end
+end)
+
+test("route loop guard survives resource yields but excludes thinking and genuine detour progress",function()
+    local m=memory(); local first={gateway_id="AB",remaining_distance=40,leg={}}
+    E.commit_route(m,"A","B","AB","B",0,0,0,40)
+    local reason,now
+    for i=1,20 do
+        now=i*3; local x=i%2*4
+        first.remaining_distance=40-x
+        reason=E.route_progress(m,first,now,x,0)
+        if reason then break end
+        E.pause_route(m)
+        -- Model time never counts; resuming the same route preserves its progress window.
+        E.route_progress(m,first,now+1,x,0)
+        E.commit_route(m,"A","B","AB","B",now+2,x,0,first.remaining_distance)
+    end
+    assert(reason=="route_no_progress")
+    E.pause_gateway(m,"AB",now,reason)
+    assert(not m.route_intent and m.route_pauses.AB.until_time==now+30)
+    assert(m.last_route_pause.reason==reason)
+    E.commit_route(m,"A","B","AB","B",100,0,0,100)
+    for i=1,30 do
+        first.remaining_distance=100-i
+        assert(not E.route_progress(m,first,100+i,-i,i),"safe detours may move away in Euclidean distance")
+    end
+    E.pause_route(m)
+    assert(not E.route_progress(m,first,1000,100,100),"local work and thinking are not route stalls")
+    E.commit_route(m,"A","B","AB","B",1001,100,100,80)
+    assert(m.route_intent.progress_anchor==80 and m.route_intent.elapsed==0)
+    first.leg.awaiting_region=true
+    assert(not E.route_progress(m,first,1100,100,100),"topology confirmation has its own lifecycle")
+end)
+
 test("unknown topology on passable neighboring land prevents completeness", function()
     local m=memory(); node(m,"A"); cell(m,0,0,"A","forest")
     for _,offset in ipairs(neighbors) do cell(m,offset[1],offset[2],nil,nil,false) end
@@ -274,7 +327,7 @@ local function simulated_mod(passable, topology, terrain, entities, bridge_confi
         assert(captured,table.concat(errors,"\n"))
         return captured
     end
-    return sample, G.TheWorld, G, handlers, function() sim_init(); return captured end, function() return captured end
+    return sample, G.TheWorld, G, handlers, function() sim_init(); return captured end, function() return captured end, native
 end
 
 test("real Mod keeps escape routes for observed targeted hostiles beyond twelve units",function()
@@ -316,6 +369,24 @@ test("juicy berry telemetry respects replicated tags and CanBePicked", function(
     ripe=true
     bush.components={pickable={CanBePicked=function() return false end}}
     assert(sample(0,0).nearby[1].pickable==false,"server component must also permit picking")
+end)
+
+test("planted carrot telemetry enables native food pickup and rejects depleted targets", function()
+    local tagged,allowed=true,true
+    local carrot={prefab="carrot_planted",GUID=22,IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="pickable" and tagged end,
+        Transform={GetWorldPosition=function() return 13.05,0,0 end}}
+    local sample=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{carrot})
+    local native=require("jev_native_executor")
+    local s=sample(0,0)
+    assert(s.nearby[1].pickable==true and s.nearby[1].collect_path.status=="ready")
+    local action=native.available(s).collect_carrot_planted
+    assert(action and action.guid==22 and action.product=="carrot")
+    tagged=false; assert(not native.available(sample(0,0)).collect_carrot_planted)
+    tagged=true; carrot.components={pickable={CanBePicked=function() return allowed end}}
+    allowed=false; assert(not native.available(sample(0,0)).collect_carrot_planted)
+    allowed=true; assert(native.available(sample(0,0)).collect_carrot_planted)
 end)
 
 test("execution telemetry exposes doing, exact buffered target and recipe", function()
@@ -538,6 +609,47 @@ test("known-region travel detours around a hazard instead of discarding a valid 
         "first leg should move safely away around the hazard")
 end)
 
+test("real Mod rejects the logged unsafe entrance before its first short step looks dangerous",function()
+    local sample,world=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    sample(-35.64,-169.4); local m=world._jev_dst_navigation
+    for _,id in ipairs({"B","C","D","E","F","T"}) do node(m,id) end
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=-56,az=-148,bx=-52,bz=-144}},
+        AC={{a_id="A",b_id="C",ax=-16,az=-184,bx=-12,bz=-180}},
+        BD={{a_id="B",b_id="D"}},DT={{a_id="D",b_id="T"}},
+        CE={{a_id="C",b_id="E"}},EF={{a_id="E",b_id="F"}},FT={{a_id="F",b_id="T"}}}
+    m.hazards[77]={guid=77,prefab="frog",x=-54.21,z=-160.68,last_seen=1}
+    for _,p in ipairs({{-35.64,-169.4},{-32.31,-171.88},{-35.23,-168.93},{-32.24,-171.26}}) do
+        local result=sample(p[1],p[2]); local found
+        for _,route in ipairs(result.navigation.graph.routes) do
+            assert(route.next_node_id~="B","an entrance inside the danger zone must not reappear")
+            if route.node_id=="T" then found=route end
+        end
+        assert(found and found.next_node_id=="C" and found.hops==4)
+        assert(result.navigation.diagnostics.graph_paths.unsafe_gateway_entrance>0)
+    end
+    -- Both entrance endpoints may be clear while their full approach crosses a hazard.
+    local sample2,world2=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    sample2(-12,0); local other=world2._jev_dst_navigation; node(other,"B")
+    other.graph_edges={AB={{a_id="A",b_id="B",ax=40,az=0,bx=44,bz=0}}}
+    other.hazards[77]={guid=77,prefab="frog",x=20,z=0,last_seen=1}
+    assert(#sample2(-12,0).navigation.graph.routes==0,"safe short steps cannot prove a full safe approach")
+end)
+
+test("real Mod pauses a stuck active gateway and keeps another entrance available",function()
+    local sample,world,G=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    sample(0,0); local m=world._jev_dst_navigation; node(m,"B")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=40,az=0,bx=44,bz=0},
+        {a_id="A",b_id="B",ax=40,az=16,bx=44,bz=16}}}
+    local route=sample(0,0).navigation.graph.routes[1]
+    E.commit_route(m,"A","B",route.gateway_id,"B",G.GetTime(),0,0,route.remaining_distance)
+    local result
+    for _=1,14 do result=sample(0,0) end
+    assert(result.navigation.graph.route_pause.reason=="route_no_progress")
+    local replacement=result.navigation.graph.routes[1]
+    assert(replacement and replacement.gateway_id~=route.gateway_id,"only the stuck entrance is paused")
+    assert(replacement.target.z==16)
+end)
+
 test("safe observed detour may cross another topology room instead of treating labels as walls", function()
     local function region(x,z) if x>=24 then return "C" end; return z>=8 and "B" or "A" end
     local function land(x,z) return not (x>=2 and x<=6 and z<6) end
@@ -566,6 +678,43 @@ test("safe observed detour may cross another topology room instead of treating l
         if route.node_id == "C" then forward=route.leg.z>5.8 end
     end
     assert(forward,"recomputed BFS root at z=4 must not pull the player backwards")
+end)
+
+test("committed entrance detour survives crossing back into the previous room",function()
+    local function land(x,z) return not (x>-232 and x<-224 and z>508 and z<520) end
+    local function region(x,z)
+        if z>=528 then return "T" end
+        return (x>=-224 or z>=520) and "B" or "START"
+    end
+    local sample,world,G=simulated_mod(land,region,function() return 2 end)
+    sample(-222,504); local m=world._jev_dst_navigation; node(m,"T"); node(m,"START")
+    for gx=-63,-54 do for gz=124,134 do
+        cell(m,gx,gz,region(gx*4,gz*4),"grassland",land(gx*4,gz*4))
+        m.cells[gx..":"..gz].node=region(gx*4,gz*4)
+    end end
+    m.graph_edges={BT={{a_id="B",b_id="T",ax=-236,az=524,bx=-236,bz=528}},
+        AB={{a_id="START",b_id="B",ax=-228,az=504,bx=-224,bz=504}}}
+    local function destination(s)
+        for _,r in ipairs(s.navigation.graph.routes) do if r.node_id=="T" then return r end end
+    end
+    local r=assert(destination(sample(-222,504)))
+    assert(r.leg.detour)
+    E.commit_route(m,r.source_node_id,"T",r.gateway_id,r.next_node_id,G.GetTime(),-222,504,r.remaining_distance,r.entrance)
+    local intent=m.route_intent
+    sample(-226,507); local s=sample(-226,507)
+    assert(s.navigation.graph.current_node=="START")
+    local next=assert(destination(s))
+    assert(next.gateway_id==r.gateway_id and next.source_node_id=="B" and next.next_node_id=="T")
+    assert(next.leg.z>507,"continue the physical detour rather than returning to the START entrance")
+    assert(m.route_intent==intent,"incidental region labels must not reset progress")
+    for i=1,24 do
+        local x,z=i%4<2 and -222 or -226,i%4<2 and 504 or 507
+        s=sample(x,z)
+        if s.navigation.graph.route_pause then break end
+    end
+    assert(s.navigation.graph.route_pause and s.navigation.graph.route_pause.reason=="route_no_progress",
+        "repeated border crossings with no distance gain must time out")
+    assert(s.navigation.graph.route_pause.gateway_id==r.gateway_id)
 end)
 
 test("reobserved empty positions clear obsolete hazard memory but remote positions do not", function()
@@ -618,6 +767,55 @@ test("local board work gets passable-ground paths and cancellation capability", 
     local blocked=simulated_mod(function(x) return x<1 end,function() return "A" end,
         function() return 2 end,entities)(0,0)
     for _,entity in ipairs(blocked.nearby) do assert(entity.collect_path.status=="blocked") end
+end)
+
+test("real Mod prefers larger reachable trees only when the axe can finish them",function()
+    local function tree(id,x,animation)
+        return {GUID=id,prefab="evergreen",IsValid=function() return true end,
+            HasTag=function(_,tag) return tag=="CHOP_workable" end,
+            AnimState={IsCurrentAnimation=function(_,name) return name==animation end},
+            Transform={GetWorldPosition=function() return x,0,0 end}}
+    end
+    local blocked=false
+    local entities={tree(1,1,"idle_short"),tree(2,3,"sway1_loop_normal"),
+                    tree(3,10,"idle_tall"),tree(4,8,"chop_tall")}
+    local sample=simulated_mod(function(x) return not blocked or x<3.5 end,function() return "A" end,
+                               function() return 2 end,entities)
+    local s=sample(0,0); local stages={}
+    for _,e in ipairs(s.nearby) do stages[e.guid]=e end
+    assert(stages[1].tree_stage=="short" and stages[1].work_required==5)
+    assert(stages[2].tree_stage=="normal" and stages[2].work_required==10)
+    assert(stages[3].tree_stage=="tall" and stages[3].work_required==15)
+    s.player.inventory.items={{prefab="axe",durability_percent=.15}}
+    assert(require("jev_native_executor").available(s).chop_nearest_tree.guid==4)
+    s.player.inventory.items[1].durability_percent=.10
+    assert(require("jev_native_executor").available(s).chop_nearest_tree.guid==2)
+    s.player.inventory.items[1].durability_percent=.05
+    assert(require("jev_native_executor").available(s).chop_nearest_tree.guid==1)
+    blocked=true; s=sample(0,0); s.player.inventory.items={{prefab="axe",durability_percent=1}}
+    assert(require("jev_native_executor").available(s).chop_nearest_tree.guid==2)
+    local W=require("jev_tree_work")
+    entities[1].AnimState=nil
+    assert(W.read(entities[1]).work_required==15 and W.read(entities[1]).tree_stage=="unknown")
+    entities[1].components={growable={GetCurrentStageData=function() return {name="tall"} end},
+                            workable={GetWorkLeft=function() return 4 end}}
+    assert(W.read(entities[1]).tree_stage=="tall" and W.read(entities[1]).work_required==4)
+end)
+
+test("real Mod loot scan is uncapped and anchored to the work site",function()
+    local entities={}
+    for id=1,72 do
+        local x=id<=70 and id*.05 or 7
+        entities[id]={GUID=id,prefab=id==70 and "twiggy_nut" or "log",IsValid=function() return true end,
+            HasTag=function(_,tag) return tag=="_inventoryitem" or id==72 and tag=="INLIMBO" end,
+            Transform={GetWorldPosition=function() return x,0,0 end}}
+    end
+    local sample,_,G,_,_,_,native=simulated_mod(function() return true end,function() return "A" end,
+                                               function() return 2 end,entities)
+    assert(#sample(0,0).nearby==40,"exercise the normal perception cap")
+    local loot=native.scan_work_loot(G.ThePlayer,{x=0,z=0})
+    assert(#loot==70,"all ground drops inside the work radius must remain visible")
+    assert(loot[70].prefab=="twiggy_nut" and loot[70].collect_path.status=="ready")
 end)
 
 test("F4 cancels queued work and stops controls before handing back to JEV", function()
@@ -729,6 +927,22 @@ test("gateway stays present while awaiting topology confirmation at fixed contin
     end
 end)
 
+test("active gateway confirmation times out locally and keeps another entrance usable",function()
+    local sample,world,G=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    sample(0,0); local m=world._jev_dst_navigation; node(m,"B")
+    m.graph_edges={AB={{a_id="A",b_id="B",ax=16,az=0,bx=20,bz=0},
+        {a_id="A",b_id="B",ax=16,az=16,bx=20,bz=16}}}
+    local r=sample(15.3,0).navigation.graph.routes[1]
+    E.commit_route(m,"A","B",r.gateway_id,"B",G.GetTime(),15.3,0,r.remaining_distance,r.entrance)
+    local s=sample(22,0)
+    assert(s.navigation.graph.routes[1].leg.awaiting_region)
+    for i=1,3 do s=sample(22,0) end
+    local pause=s.navigation.graph.route_pause
+    assert(pause and pause.reason=="region_confirmation_timeout" and pause.gateway_id==r.gateway_id)
+    local alternate=s.navigation.graph.routes[1]
+    assert(alternate and alternate.gateway_id~=r.gateway_id,"do not ban the destination region")
+end)
+
 test("unsafe gateway overshoot falls back to the passable endpoint without crossing sea", function()
     local sample,world=simulated_mod(function(x) return x<=20.1 end,
         function(x) return x<20 and "A" or "B" end,function() return 2 end)
@@ -753,6 +967,72 @@ local function native_test()
         stop=function() stops=stops+1 end})
     return executor,calls,function() return stops end
 end
+
+test("native region actions carry the committed first hop and report entrance-level interruption",function()
+    local s=bridge_state(); s.navigation.graph={current_node="A",routes={{status="ready",node_id="B",
+        gateway_id="AC",next_node_id="C",remaining_distance=20,leg={x=4,z=0,distance=4}}}}
+    local executor,calls=native_test()
+    assert(executor:start({action_id="route",choice="travel_region_B"},s,0))
+    assert(calls[1].action.gateway_id=="AC" and calls[1].action.next_node_id=="C")
+    assert(calls[1].action.remaining_distance==20)
+    s.navigation.graph.route_pause={gateway_id="AC",reason="route_no_progress",remaining_seconds=30}
+    executor:tick(s,1)
+    assert(executor.report.status=="interrupted" and executor.report.reason=="route_no_progress")
+    s.navigation.graph.route_pause=nil
+    s.navigation.graph.routes[1].gateway_id="AD"
+    s.navigation.graph.routes[1].next_node_id="D"
+    assert(executor:available(s,1).travel_region_B,"do not pause every route to the destination")
+end)
+
+test("native navigation completes a detour through another room without returning to its entrance",function()
+    local function land(x,z) return not (x>-232 and x<-224 and z>508 and z<520) end
+    local function region(x,z)
+        if z>=528 then return "T" end
+        return (x>=-224 or z>=520) and "B" or "START"
+    end
+    local sample,world,G=simulated_mod(land,region,function() return 2 end)
+    sample(-222,504); local m=world._jev_dst_navigation; node(m,"T"); node(m,"START")
+    for gx=-63,-54 do for gz=124,134 do
+        cell(m,gx,gz,region(gx*4,gz*4),"grassland",land(gx*4,gz*4))
+        m.cells[gx..":"..gz].node=region(gx*4,gz*4)
+    end end
+    m.graph_edges={BT={{a_id="B",b_id="T",ax=-236,az=524,bx=-236,bz=528}},
+        AB={{a_id="START",b_id="B",ax=-228,az=504,bx=-224,bz=504}}}
+    local x,z,point=-222,504,nil
+    local executor=N.new({stop=function() E.pause_route(m) end,issue=function(_,a)
+        assert(a.mode=="graph" and a.entrance and a.source_node_id)
+        E.commit_route(m,a.source_node_id,a.node_id,a.gateway_id,a.next_node_id,G.GetTime(),x,z,a.remaining_distance,a.entrance)
+        point=a.awaiting_region and nil or {x=a.x,z=a.z}
+    end})
+    assert(executor:start({action_id="transit",choice="travel_region_T",navigation_targets={}},sample(x,z),G.GetTime()))
+    local visited_transit=false
+    for i=1,100 do
+        if point then
+            local dx,dz=point.x-x,point.z-z; local d=math.sqrt(dx*dx+dz*dz)
+            if d>0 then local step=math.min(d,1); x,z=x+dx/d*step,z+dz/d*step end
+        end
+        local s=sample(x,z)
+        visited_transit=visited_transit or s.navigation.graph.current_node=="START"
+        executor:tick(s,G.GetTime())
+        if not executor.active then break end
+    end
+    assert(visited_transit,"exercise a real boundary crossing during the detour")
+    assert(executor.report.status=="completed" and executor.report.reason=="region_changed",
+        tostring(executor.report.status)..":"..tostring(executor.report.reason).." at "..x..","..z.." room "..tostring(m.current_node))
+    assert(m.current_node=="T","physical destination, not a changed label, proves navigation success")
+end)
+
+test("native topology confirmation waits without repeated zero-length walks or movement stalls",function()
+    local s=bridge_state(); s.navigation.graph={current_node="A",routes={{status="ready",node_id="B",
+        gateway_id="AB",next_node_id="B",remaining_distance=0,leg={x=0,z=0,awaiting_region=true}}}}
+    local executor,calls=native_test()
+    assert(executor:start({action_id="confirm",choice="travel_region_B"},s,0))
+    for i=1,4 do executor:tick(s,i) end
+    assert(executor.active and #calls==1,"confirmation is not a generic movement stall or a walk loop")
+    s.navigation.graph.route_pause={gateway_id="AB",reason="region_confirmation_timeout",remaining_seconds=30}
+    executor:tick(s,4.2)
+    assert(executor.report.status=="interrupted" and executor.report.reason=="region_confirmation_timeout")
+end)
 test("real Mod HTTP callback contains native dispatch exceptions instead of crashing",function()
     local cfg={enabled=true,url="http://127.0.0.1:8765/v1/exchange",token=string.rep("x",32)}
     local plant={GUID=22,prefab="grass",IsValid=function() return true end,
@@ -859,6 +1139,85 @@ test("Lua accepts flee after damage and uses the latest route rather than reques
     assert(executor.active and executor.report.status=="running","damage must not invalidate an ongoing escape")
 end)
 
+local function escape_state()
+    local s=bridge_state()
+    s.nearby={{guid=99,prefab="tallbird",activeThreat=true,distance=2,dx=2,dz=0}}
+    s.navigation.escape_routes={{dx=-1,dz=0,distance=6},{dx=0,dz=1,distance=6},{dx=0,dz=-1,distance=6}}
+    return s
+end
+
+test("blocked flee changes direction inside the same action without a global cooldown",function()
+    local s=escape_state(); local executor,calls,stops=native_test()
+    assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile"},s,0))
+    assert(calls[1].action.x==-6)
+    executor:tick(s,.7); assert(#calls==1)
+    executor:tick(s,.81)
+    assert(#calls==2 and calls[2].action.z==6 and stops()==1)
+    assert(executor.active.id=="escape" and executor.report.status=="running" and #executor.events==0)
+    assert(executor.report.escape_reroutes==1)
+    assert(executor.paused["flee_from_nearest_hostile:"]==nil)
+    executor:tick(s,1.62)
+    assert(#calls==3 and calls[3].action.z==-6,"try another direction instead of repeating the blocked one")
+    assert(executor:available(s,1.7).flee_from_nearest_hostile)
+    local moving=escape_state(); moving.player.position.z=-2
+    executor:tick(moving,2)
+    assert(#calls==3 and executor.active,"real movement must not cause another reroute")
+    moving.nearby={}; executor:tick(moving,2.1)
+    assert(executor.report.status=="completed" and executor.report.reason=="no_visible_targeted_hostile")
+    assert(executor.report.escape_reroutes==2 and executor.events[1].escape_reroutes==2)
+end)
+
+test("failed flee directions are local to position and expire independently",function()
+    local s=escape_state(); local executor=native_test()
+    assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile"},s,0))
+    executor:tick(s,.81)
+    assert(executor:available(s,1).flee_from_nearest_hostile.dz==1)
+    local moved=escape_state(); moved.player.position.x=3
+    assert(executor:available(moved,1).flee_from_nearest_hostile.dx==-1,"a different position may use the same compass direction")
+    assert(executor:available(s,8.82).flee_from_nearest_hostile.dx==-1,"direction cooldown must expire")
+end)
+
+test("trying every passable flee direction never hides the entire escape action",function()
+    local s=escape_state(); local executor,calls=native_test()
+    assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile"},s,0))
+    for i=1,5 do
+        executor:tick(s,i*.81)
+        assert(executor.active and executor:available(s,i*.81).flee_from_nearest_hostile)
+    end
+    assert(#calls==6 and calls[4].action.dx==-1,"after all three routes fail, retry the oldest")
+    s.navigation.escape_routes={}
+    executor:tick(s,5)
+    assert(not executor.active and executor.report.reason=="no_safe_escape_route")
+    s.navigation.escape_routes={{dx=0,dz=1,distance=6}}
+    assert(executor:available(s,5.1).flee_from_nearest_hostile,"restored passable routes must be available immediately")
+end)
+
+test("flee timeout and interruption do not apply the ordinary fifteen-second failure pause",function()
+    for _,reason in ipairs({"verification_timeout","movement_stalled","native_exception"}) do
+        local s=escape_state(); local executor=native_test()
+        assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile"},s,0))
+        if reason=="verification_timeout" then executor:tick(s,12)
+        else executor:finish("failed",reason) end
+        assert(not executor.active and executor.report.reason==reason)
+        assert(executor:available(s,12.1).flee_from_nearest_hostile,"a failed flee must remain retryable")
+    end
+end)
+
+test("flee waypoint arrival refreshes progress and validates the current route set",function()
+    local s=escape_state(); local executor,calls=native_test()
+    assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile"},s,0))
+    local fresh=escape_state(); fresh.player.position.x=-6
+    fresh.navigation.escape_routes={{dx=0,dz=1,distance=6}}
+    executor:tick(fresh,.7)
+    assert(#calls==2 and calls[2].action.x==-6 and calls[2].action.z==6)
+    executor:tick(fresh,1.2)
+    assert(#calls==2,"new leg must get its own stall window")
+    executor:tick(fresh,1.51)
+    assert(#calls==3 and executor.active,"a sole live passable route remains retryable")
+    fresh.navigation.escape_routes={{dx=0,dz=0,distance=6},{dx=1,dz=0,distance=-1}}
+    assert(not executor:available(fresh,1.6).flee_from_nearest_hostile,"invalid routes cannot be used as fallback")
+end)
+
 test("Lua rejects changed targets without switching to the new nearest plant",function()
     local s=bridge_state(); local executor,calls=native_test()
     s.nearby={{prefab="grass",guid=21,distance=1,pickable=true,collect_path={status="ready"}}}
@@ -957,6 +1316,73 @@ test("Lua work is interrupted by night without choosing or equipping light",func
     night.player.inventory.equipped={{prefab="torch"}}
     executor:tick(night,3); assert(executor.report.status=="completed")
 end)
+test("daylight torch maintenance runs idle, retries replication and leaves other phases alone",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.inventory.equipped={{prefab="torch"}}
+    for _,phase in ipairs({"night","dusk"}) do
+        s.world.phase=phase; executor:tick(s,0)
+        assert(#calls==0,"only daytime owns automatic unequip")
+    end
+    s.world.phase="day"; executor:tick(s,1,false)
+    assert(#calls==0,"disconnected maintenance must not issue game input")
+    executor:tick(s,2,true)
+    assert(#calls==1 and calls[1].id=="unequip_torch")
+    assert(calls[1].action.automatic_reason=="daylight" and not executor.active and not executor.report)
+    executor:tick(s,2.2,true); assert(#calls==1,"wait for inventory replication before retrying")
+    executor:tick(s,3,true); assert(#calls==2,"retry if torch remains equipped")
+    s.player.inventory.equipped={}; executor:tick(s,4,true); assert(#calls==2)
+    s.player.inventory.equipped={{prefab="axe"}}; executor:tick(s,5,true); assert(#calls==2)
+    s.player.inventory.equipped={{prefab="torch"}}; s.player.vitals.dead=true
+    executor:tick(s,6,true); assert(#calls==2,"dead players cannot unequip")
+end)
+
+test("dawn torch maintenance preserves a running escape and explicit unequip ownership",function()
+    local s=escape_state(); local executor,calls,stops=native_test()
+    s.world.phase="night"; s.player.inventory.equipped={{prefab="torch"}}
+    assert(executor:start({action_id="escape",choice="flee_from_nearest_hostile"},s,0))
+    local day=escape_state(); day.world.phase="day"; day.player.inventory=s.player.inventory
+    day.player.position.x=1
+    executor:tick(day,0.5,true)
+    assert(#calls==2 and calls[2].id=="unequip_torch" and stops()==0)
+    assert(executor.active.id=="escape" and executor.report.status=="running")
+    local explicit,issued=native_test(); local clean=bridge_state()
+    clean.player.inventory.equipped={{prefab="torch"}}
+    assert(explicit:start({action_id="manual",choice="unequip_torch"},clean,0))
+    explicit:tick(clean,1,true); assert(#issued==1,"explicit action already waits for replication")
+    clean.player.inventory.equipped={}; clean.player.inventory.items={{prefab="torch"}}
+    explicit:tick(clean,2,true)
+    assert(explicit.report.action_id=="manual" and explicit.report.status=="completed")
+end)
+
+test("bridge enables idle daylight maintenance only while control is connected",function()
+    local s=bridge_state(); s.player.inventory.equipped={{prefab="torch"}}
+    local executor,calls=native_test(); local clock=0
+    local bridge=B.new({}, {session_id="test",now=function() return clock end,
+        state=function() return s end,request=function() end},executor)
+    bridge:tick(); assert(#calls==0)
+    bridge.connected=true; clock=0.2; bridge:tick(); assert(#calls==1)
+    clock=4; bridge:tick(); assert(#calls==1 and not bridge.connected,"lease expiry stops maintenance too")
+end)
+
+test("Lua low vital crossings interrupt work without requiring a carried remedy",function()
+    for _,name in ipairs({"health","hunger","sanity"}) do
+        local s=bridge_state(); s.player.vitals[name]=100; s.player.vitals[name.."_max"]=100
+        s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+        local executor,calls,stops=native_test()
+        assert(executor:start({action_id=name,choice="collect_grass"},s,0))
+        local next=bridge_state(); next.nearby=s.nearby
+        next.player.vitals[name]=29; next.player.vitals[name.."_max"]=100
+        executor:tick(next,1)
+        assert(executor.report.status=="interrupted")
+        assert(executor.report.reason==(name=="health" and "health_lost" or "critical_"..name))
+        assert(#calls==1 and stops()==1,"interrupt must stop work without choosing a remedy")
+        local resume=native_test()
+        assert(resume:start({action_id="resume",choice="collect_grass"},next,2))
+        resume:tick(next,2.5)
+        assert(resume.active,"a previously acknowledged low vital must not interrupt every resumed action")
+    end
+end)
+
 test("Lua torch craft cleanup waits through inventory replication gaps",function()
     local s=bridge_state(); local executor,calls=native_test()
     s.crafting.torch=true
@@ -969,6 +1395,78 @@ test("Lua torch craft cleanup waits through inventory replication gaps",function
     assert(executor.report.status=="completed")
     next.crafting.torch=true; assert(not N.available(next).craft_torch)
 end)
+test("boulder collision distance hands off to native mining without walking to its centre",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
+    s.nearby={{prefab="rock1",guid=2,distance=2.1,work_required=6,tags={"MINE_workable"},
+        collect_path={status="ready",reason="direct",waypoint={x=2.1,z=0}}}}
+    assert(executor:start({action_id="boulder",choice="mine_nearest_rock",action={guid=2}},s,0))
+    assert(#calls==1 and calls[1].id=="mine_nearest_rock" and calls[1].action.guid==2)
+    assert(executor.active.stage~="approach","a target outside 1.2 is still native-work reachable")
+    s.work={sequence=1,target_guid=2,status="completed"}; s.nearby={}
+    executor:tick(s,2); executor:tick(s,3)
+    assert(executor.report.reason=="work_and_drops_verified")
+end)
+
+test("distant tree approach switches to native work before entering target collision",function()
+    local s=bridge_state(); local executor,calls,stops=native_test()
+    s.player.inventory.items={{prefab="axe",durability_percent=1}}
+    s.nearby={{prefab="evergreen",guid=2,distance=10,work_required=15,tags={"CHOP_workable"},
+        collect_path={status="ready",reason="direct",waypoint={x=10,z=0}}}}
+    assert(executor:start({action_id="tree",choice="chop_nearest_tree",action={guid=2}},s,0))
+    assert(calls[1].id=="walk")
+    local fresh=bridge_state(); fresh.player.position.x=4.2
+    fresh.player.inventory=s.player.inventory
+    fresh.nearby={{prefab="evergreen",guid=2,distance=5.8,work_required=15,tags={"CHOP_workable"},
+        collect_path={status="ready",reason="direct",waypoint={x=10,z=0}}}}
+    executor:tick(fresh,1)
+    assert(#calls==2 and calls[2].id=="chop_nearest_tree" and stops()==1)
+    assert(executor.active.stage~="approach")
+end)
+
+test("near work targets retain verified detours rather than taking unsafe native shortcuts",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
+    s.nearby={{prefab="rock1",guid=2,distance=4,work_required=6,tags={"MINE_workable"},
+        collect_path={status="ready",reason="detour",waypoint={x=0,z=4}}}}
+    assert(executor:start({action_id="detour",choice="mine_nearest_rock",action={guid=2}},s,0))
+    assert(calls[1].id=="walk","within six units is not enough when a detour is required")
+    local fresh=bridge_state(); fresh.player.position.z=2; fresh.player.inventory=s.player.inventory
+    fresh.nearby={{prefab="rock1",guid=2,distance=4.5,work_required=6,tags={"MINE_workable"},
+        collect_path={status="ready",reason="direct",waypoint={x=4,z=0}}}}
+    executor:tick(fresh,1)
+    assert(#calls==2 and calls[2].id=="mine_nearest_rock")
+end)
+
+test("native mining at collision distance reaches the real Mod target-action dispatcher",function()
+    local target={GUID=22,prefab="rock1",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="MINE_workable" end,
+        Transform={GetWorldPosition=function() return 2.1,0,0 end}}
+    local _,_,G,_,_,_,mod=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{target})
+    local tool={prefab="pickaxe",IsValid=function() return true end,
+        components={finiteuses={GetPercent=function() return 1 end}}}
+    G.EQUIPSLOTS={HANDS="hands"}; G.ACTIONS={MINE={id="MINE"}}
+    G.ThePlayer.replica.inventory={GetEquippedItem=function() return tool end,GetItems=function() return {} end}
+    G.ThePlayer.GetDistanceSqToInst=function() return 2.1*2.1 end
+    G.ThePlayer.DoTaskInTime=function() return {Cancel=function() end} end
+    local issued=0
+    G.ThePlayer.components={playercontroller={ismastersim=true,IsBusy=function() return false end,
+        GetActionButtonAction=function(_,requested)
+            assert(requested==target); return {action=G.ACTIONS.MINE,target=target,invobject=tool}
+        end,
+        DoAction=function(_,a) assert(a.target==target and a.action==G.ACTIONS.MINE); issued=issued+1 end}}
+    local executor=N.new({stop=function() end,issue=function(_,a)
+        assert(a.kind=="mine_nearest_rock","do not issue a WALKTO to the boulder centre")
+        mod.mine()
+    end})
+    local s=bridge_state(); s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
+    s.nearby={{prefab="rock1",guid=22,distance=2.1,work_required=6,tags={"MINE_workable"},
+        collect_path={status="ready",reason="direct",waypoint={x=2.1,z=0}}}}
+    assert(executor:start({action_id="real-mine",choice="mine_nearest_rock",action={guid=22}},s,0))
+    assert(issued==1 and G.ThePlayer._jev_dst_work.target_guid==22)
+end)
+
 test("Lua mining collects different observed drops before reporting completion",function()
     local s=bridge_state(); local executor,calls=native_test()
     s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
@@ -979,9 +1477,11 @@ test("Lua mining collects different observed drops before reporting completion",
         {prefab="flint",guid=4,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}}}
     executor:tick(s,2); assert(calls[2].id=="collect_nitre")
     s.player.inventory.items[#s.player.inventory.items+1]={prefab="nitre"}
+    table.remove(s.nearby,1)
     executor:tick(s,3); assert(calls[3].id=="collect_flint" and executor.active)
     s.player.inventory.items[#s.player.inventory.items+1]={prefab="flint"}
-    executor:tick(s,4); assert(executor.report.status=="completed")
+    s.nearby={}; executor:tick(s,4); assert(executor.active,"wait for a stable empty ground scan")
+    executor:tick(s,4.7); assert(executor.report.status=="completed")
 end)
 
 test("Lua chopping retries busy loot dispatch and waits for each inventory effect",function()
@@ -1004,13 +1504,154 @@ test("Lua chopping retries busy loot dispatch and waits for each inventory effec
     assert(calls[#calls].action.guid==3 and executor.active.stage=="loot")
     n=#calls; executor:tick(s,1.8); assert(#calls==n and executor.active,"dispatch alone is not pickup")
     s.player.inventory.items[#s.player.inventory.items+1]={prefab="log"}; ready=false
+    table.remove(s.nearby,1)
     executor:tick(s,2)
     assert(executor.active.stage=="collection_retry" and calls[#calls].action.guid==4)
     ready=true; executor:tick(s,2.3)
     assert(executor.active.stage=="loot" and calls[#calls].action.guid==4)
     s.player.inventory.items[#s.player.inventory.items+1]={prefab="pinecone"}
-    executor:tick(s,2.5)
+    s.nearby={}; executor:tick(s,2.5); assert(executor.active)
+    executor:tick(s,3.2)
     assert(executor.report.status=="completed" and executor.report.reason=="work_and_drops_verified")
+end)
+
+test("long chopping resets each loot approach clock and drains existing partial stacks",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.inventory.items={{prefab="axe",durability_percent=1}}
+    local log={prefab="log",guid=3,distance=2,dx=2,dz=0,stack_count=1,tags={"_inventoryitem"},
+               collect_path={status="ready",waypoint={x=2,z=0}}}
+    s.nearby={{prefab="evergreen",guid=2,distance=1,dx=0,dz=0,work_required=15,
+               tags={"CHOP_workable"},collect_path={status="ready"}},log}
+    assert(executor:start({action_id="long-chop",choice="chop_nearest_tree",action={guid=2}},s,0))
+    s.work={sequence=1,target_guid=2,status="completed",x=0,z=0}; executor:tick(s,20)
+    log.stack_count=3; s.nearby={log}; executor:tick(s,20.2)
+    assert(calls[#calls].id=="walk","do not ignore a preexisting GUID that received the new drops")
+    executor:tick(s,20.4)
+    assert(executor.active and executor.active.stage=="approach","work time is not approach-stall time")
+    s.player.position.x=1; log.distance=1; log.dx=1; executor:tick(s,20.6)
+    assert(calls[#calls].action.guid==3)
+    s.player.inventory.items[2]={prefab="log",count=1}; log.stack_count=2
+    executor:tick(s,20.8); executor:tick(s,21.5)
+    assert(calls[#calls].action.guid==3,"the same GUID can still contain a partial stack")
+    s.player.inventory.items[2].count=3; s.nearby={}; executor:tick(s,21.8)
+    assert(executor.active); executor:tick(s,22.5)
+    assert(executor.report.status=="completed")
+end)
+
+test("loot waits for late drops and collects secondary twiggy seeds",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.player.inventory.items={{prefab="axe",durability_percent=1}}
+    s.nearby={{prefab="twiggytree",guid=2,distance=1,work_required=15,
+        tags={"CHOP_workable"},collect_path={status="ready"}}}
+    executor:start({action_id="late-loot",choice="chop_nearest_tree",action={guid=2}},s,0)
+    s.work={sequence=1,target_guid=2,status="completed"}; s.nearby={}; executor:tick(s,1)
+    executor:tick(s,1.2); assert(executor.active,"a single empty replication frame is not completion")
+    s.nearby={{prefab="twiggy_nut",guid=3,distance=1,tags={"_inventoryitem"},collect_path={status="ready"}}}
+    executor:tick(s,1.5); assert(calls[#calls].id=="collect_twiggy_nut")
+    s.player.inventory.items[2]={prefab="twiggy_nut"}; s.nearby={}; executor:tick(s,1.8)
+    executor:tick(s,2.5); assert(executor.report.status=="completed")
+end)
+
+test("accepted loot requests retry without inventory effects and fail with a bounded reason",function()
+    for _,mode in ipairs({"timeout","danger","scan_failure"}) do
+        local s=bridge_state(); local calls={}; local ground={}
+        local executor=N.new({stop=function() end,issue=function(id,a) calls[#calls+1]=id end,
+            loot=function(origin) assert(origin.x==10); if mode=="scan_failure" then return nil end; return ground end})
+        s.player.inventory.items={{prefab="pickaxe",durability_percent=1}}
+        s.nearby={{prefab="rock1",guid=2,distance=1,work_required=6,
+                   tags={"MINE_workable"},collect_path={status="ready"}}}
+        executor:start({action_id=mode,choice="mine_nearest_rock",action={guid=2}},s,0)
+        s.work={sequence=1,target_guid=2,status="completed",x=10,z=0}; executor:tick(s,1)
+        s.player.position.x=10
+        ground[1]={prefab="flint",guid=3,distance=1,dx=1,dz=0,tags={"_inventoryitem"},collect_path={status="ready"}}
+        executor:tick(s,1.1)
+        if mode=="scan_failure" then assert(executor.report.reason=="loot_scan_unavailable")
+        elseif mode=="danger" then
+            s.nearby={{guid=9,activeThreat=true}}; executor:tick(s,1.2)
+            assert(executor.report.reason=="targeted_by_hostile","uncapped loot view must not hide danger")
+        else
+            assert(#s.nearby==1 and s.nearby[1].guid==2,"do not mutate the uploaded snapshot")
+            executor:tick(s,2.2); assert(calls[#calls]=="collect_flint" and #calls==3)
+            executor:tick(s,5.2)
+            assert(executor.report.status=="failed" and executor.report.reason=="loot_inventory_not_increased")
+        end
+    end
+end)
+
+test("juicy berry harvest picks once and gathers all fallen fruit through busy recovery",function()
+    local s=bridge_state(); local calls,ground={},{}
+    local ready=false
+    local executor=N.new({stop=function() end,loot=function(origin) assert(origin.x==1); return ground end,
+        issue=function(id,a)
+            calls[#calls+1]={id=id,action=a}
+            return a.prefab~="berries_juicy" or ready
+        end})
+    s.player.inventory.items={{prefab="berries_juicy",count=2}}
+    s.nearby={{prefab="berrybush_juicy",guid=2,distance=1,dx=1,dz=0,pickable=true,
+        collect_path={status="ready"}}}
+    assert(executor:start({action_id="harvest",choice="collect_berrybush_juicy",action={guid=2}},s,0))
+    assert(calls[1].id=="collect_berrybush_juicy")
+    s.nearby[1].pickable=false; executor:tick(s,1)
+    assert(executor.active and executor.active.loot_phase,"depleting the bush is not inventory success")
+    executor:tick(s,1.2); assert(executor.active,"allow delayed ground-item replication")
+    for id=3,5 do ground[#ground+1]={prefab="berries_juicy",guid=id,distance=.2*id,dx=.2*id,dz=0,
+        tags={"_inventoryitem"},collect_path={status="ready"}} end
+    executor:tick(s,1.4); assert(executor.active.stage=="collection_retry")
+    ready=true; executor:tick(s,1.8)
+    assert(calls[#calls].id=="collect_berries_juicy" and calls[#calls].action.guid==3)
+    for id=3,5 do
+        s.player.inventory.items[1].count=id; table.remove(ground,1)
+        executor:tick(s,2+(id-3)*.2)
+        assert(executor.active,"one fruit or a request alone must not finish the whole harvest")
+        if id<5 then assert(calls[#calls].action.guid==id+1) end
+    end
+    executor:tick(s,3.2)
+    assert(executor.report.status=="completed" and executor.report.reason=="harvest_and_drops_verified")
+    local picks=0; for _,call in ipairs(calls) do if call.id=="collect_berrybush_juicy" then picks=picks+1 end end
+    assert(picks==1 and s.player.inventory.items[1].count==5)
+end)
+
+test("juicy harvest requires dispatch and new inventory evidence and remains interruptible",function()
+    for _,mode in ipairs({"no_loot","not_issued","rejected","danger","cancel"}) do
+        local s=bridge_state(); local calls={}
+        local executor=N.new({stop=function() end,issue=function(id) calls[#calls+1]=id; return mode~="rejected" end})
+        s.player.inventory.items={{prefab="berries_juicy",count=2}}
+        s.nearby={{prefab="berrybush_juicy",guid=2,distance=mode=="not_issued" and 3 or 1,
+            pickable=true,collect_path={status="ready",waypoint={x=3,z=0}}}}
+        executor:start({action_id=mode,choice="collect_berrybush_juicy",action={guid=2}},s,0)
+        s.nearby[1].pickable=false; executor:tick(s,1)
+        if mode=="not_issued" or mode=="rejected" then
+            assert(executor.report.reason=="target_changed" and not executor.active)
+        else
+            assert(executor.active and executor.active.loot_phase)
+            if mode=="no_loot" then
+                executor:tick(s,2.5); assert(executor.active,"old carried fruit cannot prove a new harvest")
+                executor:tick(s,4.1)
+                assert(executor.report.status=="failed" and executor.report.reason=="harvest_loot_not_received")
+            elseif mode=="danger" then
+                s.nearby[2]={guid=8,activeThreat=true}; executor:tick(s,1.2)
+                assert(executor.report.reason=="targeted_by_hostile")
+            else
+                executor:cancel(mode); executor:tick(s,2)
+                assert(executor.report.status=="cancelled" and #calls==1)
+            end
+        end
+    end
+end)
+
+test("ordinary berries and loose juicy fruit keep direct inventory verification",function()
+    for _,prefab in ipairs({"berrybush","berries_juicy"}) do
+        local s=bridge_state(); local executor,calls=native_test()
+        s.nearby={{prefab=prefab,guid=2,distance=1,pickable=prefab=="berrybush" and true or nil,
+            tags={"_inventoryitem"},collect_path={status="ready"}}}
+        executor:start({action_id=prefab,choice="collect_"..prefab,action={guid=2}},s,0)
+        s.nearby[1].pickable=false; executor:tick(s,1)
+        assert(executor.active and not executor.active.loot_phase)
+        local next_state=bridge_state(); next_state.nearby=s.nearby; s=next_state
+        s.player.inventory.items={{prefab=prefab=="berrybush" and "berries" or "berries_juicy"}}
+        executor:tick(s,2)
+        assert(executor.report.status=="completed" and executor.report.reason=="observed_effect" and #calls==1)
+    end
 end)
 
 test("Lua collection retry is bounded and never retargets or survives cancellation",function()
@@ -1056,6 +1697,104 @@ test("Lua exploration uses type sets, the displacement floor and immediate disco
     fresh.player.position.x=1; fresh.navigation={graph={known_nodes=2,current_node="A"}}
     executor:tick(fresh,4); assert(executor.report.reason=="region_discovered")
 end)
+test("board navigation ignores unrelated appearances and disappearances but yields for a ready goal",function()
+    local s=bridge_state(); local executor,calls=native_test()
+    s.navigation={status="ready",leg={x=4,z=0},graph={known_nodes=1,current_node="A"}}
+    local targets={{type="inventory",prefab="rocks",count=2},{type="inventory",prefab="cutgrass",count=3}}
+    assert(executor:start({action_id="board",choice="explore_current_region",action={navigation_targets=targets}},s,0))
+    local fresh=bridge_state(); fresh.navigation={status="ready",leg={x=8,z=0},graph=s.navigation.graph}
+    fresh.player.position.x=4
+    fresh.nearby={{prefab="sapling",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:tick(fresh,1); assert(executor.active,"unrelated twigs must not end navigation")
+    fresh.player.position.x=5; fresh.nearby={}
+    executor:tick(fresh,1.2); assert(executor.active,"resource disappearance must not end navigation")
+    fresh.nearby={{prefab="grass",guid=3,distance=1,pickable=false,collect_path={status="ready"}}}
+    executor:tick(fresh,1.4); assert(executor.active,"depleted grass is not an actionable goal")
+    fresh.nearby[1].pickable=true; fresh.nearby[1].collect_path.status="blocked"
+    executor:tick(fresh,1.6); assert(executor.active,"unreachable grass is not an actionable goal")
+    fresh.nearby[1].collect_path.status="ready"; fresh.player.inventory.items={{prefab="cutgrass",count=3}}
+    executor:tick(fresh,1.8); assert(executor.active,"already sufficient stock must not stop travel")
+    fresh.player.inventory.items={}
+    executor:tick(fresh,2)
+    assert(not executor.active and executor.report.reason=="goal_action_available")
+    assert(#calls==2,"only movement was issued; the host must choose the next board action")
+end)
+
+test("board navigation catches tree and gold work without a collectible type-set change",function()
+    for _,case in ipairs({{product="log",tool="axe",prefab="evergreen",tag="CHOP_workable"},
+                          {product="goldnugget",tool="pickaxe",prefab="rock2",tag="MINE_workable"}}) do
+        local s=bridge_state(); local executor=native_test()
+        s.navigation={status="ready",leg={x=20,z=0},graph={known_nodes=1,current_node="A"}}
+        assert(executor:start({action_id="work",choice="explore_current_region",
+            action={navigation_targets={{type="inventory",prefab=case.product,count=2}}}},s,0))
+        local fresh=bridge_state(); fresh.navigation=s.navigation; fresh.player.position.x=4
+        fresh.nearby={{prefab=case.prefab,guid=20,distance=2,work_required=15,tags={case.tag},
+            collect_path={status="ready"}}}
+        executor:tick(fresh,1); assert(executor.active,"missing tool must not cause a yield")
+        fresh.player.inventory.items={{prefab=case.tool,durability_percent=.01}}
+        executor:tick(fresh,1.2); assert(executor.active,"insufficient durability must not cause a yield")
+        fresh.player.inventory.items[1].durability_percent=1
+        if case.product=="goldnugget" then
+            fresh.nearby[1].prefab="rock1"; executor:tick(fresh,1.4)
+            assert(executor.active,"a boulder without gold cannot satisfy a gold goal")
+            fresh.nearby[1].prefab=case.prefab
+        end
+        executor:tick(fresh,1.6)
+        assert(executor.report.reason=="goal_action_available")
+    end
+end)
+
+test("navigation targets support hunger, crafting and construction as live local work",function()
+    for _,case in ipairs({{target={type="hunger_ratio",at_least=.8},
+                            apply=function(s) s.nearby={{prefab="carrot_planted",guid=2,distance=1,
+                                pickable=true,collect_path={status="ready"}}} end},
+                          {target={type="inventory",prefab="axe",count=1},
+                            apply=function(s) s.crafting.axe=true end},
+                          {target={type="structure",prefab="sciencemachine"},
+                            apply=function(s) s.crafting.sciencemachine=true end}}) do
+        local s=bridge_state(); local executor=native_test()
+        s.navigation={status="ready",leg={x=20,z=0},graph={known_nodes=1,current_node="A"}}
+        assert(executor:start({action_id="local",choice="explore_current_region",action={navigation_targets={case.target}}},s,0))
+        local fresh=bridge_state(); fresh.navigation=s.navigation; case.apply(fresh)
+        fresh.player.position.x=2; executor:tick(fresh,1)
+        assert(executor.active,"ordinary work still respects the four-unit floor")
+        fresh.player.position.x=4; executor:tick(fresh,2)
+        assert(executor.report.reason=="goal_action_available")
+    end
+end)
+
+test("empty navigation targets keep resource events off while safety remains immediate",function()
+    for _,danger in ipairs({"none","enemy","damage","light","hunger","sanity"}) do
+        local s=bridge_state(); local executor=native_test()
+        s.player.vitals.sanity=200; s.player.vitals.sanity_max=200
+        s.navigation={status="ready",leg={x=20,z=0},graph={known_nodes=1,current_node="A"}}
+        assert(executor:start({action_id="safe",choice="explore_current_region",action={navigation_targets={}}},s,0))
+        local fresh=bridge_state(); fresh.navigation=s.navigation
+        fresh.player.vitals.sanity=200; fresh.player.vitals.sanity_max=200
+        fresh.player.position.x=danger=="none" and 4 or .1
+        fresh.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+        if danger=="enemy" then fresh.nearby[2]={guid=9,activeThreat=true}
+        elseif danger=="damage" then fresh.player.vitals.health=100
+        elseif danger=="light" then fresh.world.phase="night"
+        elseif danger=="hunger" then fresh.player.vitals.hunger=40
+        elseif danger=="sanity" then fresh.player.vitals.sanity=50 end
+        executor:tick(fresh,1)
+        if danger=="none" then assert(executor.active,"empty goals must ignore all ordinary resources")
+        else assert(not executor.active and executor.report.reason~="resource_types_changed"
+            and executor.report.reason~="goal_action_available","safety cannot wait for goal/displacement checks") end
+    end
+end)
+
+test("native navigation rejects malformed target policy before issuing movement",function()
+    for _,targets in ipairs({"bad",{x=true},{{type="visit_region",node_id="B"}},
+                            {{type="inventory",prefab="log",count=0}}}) do
+        local s=bridge_state(); local executor,calls=native_test()
+        s.navigation={status="ready",leg={x=4,z=0}}
+        assert(not executor:start({action_id="bad",choice="explore_current_region",action={navigation_targets=targets}},s,0))
+        assert(executor.report.reason=="invalid_navigation_targets" and #calls==0)
+    end
+end)
+
 test("Lua bounded flee survives damage and night changes until observed threat clears",function()
     local s=bridge_state(); local executor,calls=native_test()
     s.nearby={{prefab="hound",guid=8,distance=2,dx=2,dz=0,activeThreat=true}}
@@ -1119,6 +1858,73 @@ test("Lua failed target pauses expire and do not suppress a different GUID",func
     assert(executor.report.status=="failed" and not executor:available(s,13).collect_grass)
     s.nearby[1].guid=3; assert(executor:available(s,13).collect_grass)
     s.nearby[1].guid=2; assert(executor:available(s,28).collect_grass)
+end)
+
+test("real researchlab entities and recipe IDs map through native construction and verification",function()
+    for _,mode in ipairs({"fresh","buffered"}) do
+        local entities={}
+        local sample,_,G,_,_,_,mod=simulated_mod(function() return true end,function() return "A" end,
+            function() return 2 end,entities)
+        local buffered=mode=="buffered"
+        local calls={buffer=0,place=0,queries={}}
+        G.DEGREES=math.pi/180
+        G.Vector3=function(x,y,z) return {x=x,y=y,z=z} end
+        G.GetValidRecipe=function(name)
+            assert(name=="researchlab","fictional sciencemachine recipe must never reach the game")
+            return {name="researchlab",placer="researchlab_placer"}
+        end
+        G.ThePlayer.replica.builder={
+            CanBuild=function(_,name) calls.queries[name]=true; return name=="researchlab" and mode=="fresh" end,
+            IsBusy=function() return false end,
+            IsBuildBuffered=function(_,name) return name=="researchlab" and buffered end,
+            BufferBuild=function(_,name)
+                assert(name=="researchlab"); buffered=true; calls.buffer=calls.buffer+1
+            end,
+            CanBuildAtPoint=function(_,point,recipe)
+                assert(recipe.name=="researchlab"); return true
+            end,
+            MakeRecipeAtPoint=function(_,recipe,point)
+                assert(recipe.name=="researchlab"); calls.place=calls.place+1; buffered=false
+            end,
+        }
+        G.ThePlayer.components={playercontroller={
+            StartBuildPlacementMode=function(_,recipe) assert(recipe.name=="researchlab") end,
+            CancelPlacement=function() end}}
+        G.ThePlayer.DoTaskInTime=function(_,delay,callback) assert(delay==.35); calls.callback=callback end
+        local executor=N.new({stop=function() end,issue=function(_,a)
+            assert(a.kind=="build_sciencemachine"); mod.build_sciencemachine()
+        end})
+        local s=sample(0,0)
+        assert(s.crafting.sciencemachine and N.available(s).build_sciencemachine)
+        assert(calls.queries.researchlab and not calls.queries.sciencemachine)
+        assert(executor:start({action_id=mode,choice="build_sciencemachine"},s,1))
+        assert(calls.callback and calls.buffer==(mode=="fresh" and 1 or 0))
+        executor:tick(sample(0,0),2); assert(executor.active,"buffered recipe alone is not construction success")
+        calls.callback(); assert(calls.place==1)
+        executor:tick(sample(0,0),3); assert(executor.active,"placement request still needs entity replication")
+        entities[1]={GUID=42,prefab="researchlab",IsValid=function() return true end,
+            HasTag=function() return false end,Transform={GetWorldPosition=function() return 1.25,0,0 end}}
+        local built=sample(0,0)
+        assert(#built.nearby==1 and built.nearby[1].prefab=="sciencemachine")
+        assert(built.nearby[1].game_prefab=="researchlab","retain the real observed ID for diagnostics")
+        executor:tick(built,4); assert(executor.report.status=="completed")
+        executor:set_board({kind="task_board",tasks={{id="science",priority=1,depends_on={},
+            target={type="structure",prefab="sciencemachine"}}}},1)
+        entities[1]=nil
+        assert(not executor:board_choice(sample(0,0),5),"completed real researchlab must not be rebuilt")
+    end
+end)
+
+test("Lua board recognizes a manually built researchlab through normalized observation",function()
+    local entity={GUID=42,prefab="researchlab",IsValid=function() return true end,
+        HasTag=function() return false end,Transform={GetWorldPosition=function() return 1,0,0 end}}
+    local sample=simulated_mod(function() return true end,function() return "A" end,function() return 2 end,{entity})
+    local s=sample(0,0); local executor=native_test()
+    s.crafting.sciencemachine=true
+    executor:set_board({kind="task_board",tasks={{id="science",priority=1,depends_on={},
+        target={type="structure",prefab="sciencemachine"}}}},1)
+    assert(not executor:board_choice(s,1),"a real observed machine already satisfies the board")
+    s.nearby={}; assert(not executor:board_choice(s,2),"manual observation also latches the milestone")
 end)
 
 test("Lua board retains verified Science Machine progress after leaving visibility",function()
@@ -1396,5 +2202,118 @@ test("native navigation offers only ready remembered resource paths and keeps id
     assert(a.navigate_resource_12.prefab=="grass" and not a.navigate_resource_13)
     s.world.phase="night"
     assert(not N.available(s).navigate_resource_12,"memory never bypasses light gating")
+end)
+local C=require("jev_campfire_siting")
+local function combustible(id,x,z,tags,component)
+    return {GUID=id,prefab="test_combustible",IsValid=function() return true end,
+        HasTag=function(_,tag) return tags[tag]==true end,
+        Transform={GetWorldPosition=function() return x,0,z end},components=component and {burnable=component}}
+end
+test("campfire siting recognizes replicated combustibles including dropped items and nonclickable structures",function()
+    for _,tags in ipairs({{canlight=true,_inventoryitem=true},{canlight=true,CHOP_workable=true},
+                          {canlight=true,pickable=true},{canlight=true,NOCLICK=true},{fire=true},{smolder=true},{player=true}}) do
+        assert(C.combustible(combustible(1,0,0,tags)))
+    end
+    assert(C.combustible(combustible(1,0,0,{},{})),"server component is a fallback")
+    assert(not C.combustible(combustible(1,0,0,{}, {canlight=false})))
+    assert(not C.combustible(combustible(1,0,0,{burnt=true,canlight=true})))
+    assert(not C.combustible(combustible(1,0,0,{INLIMBO=true,canlight=true})))
+    assert(not C.combustible(combustible(1,0,0,{MINE_workable=true})))
+end)
+test("campfire clearance covers full fuel and never shrinks for seasonal tuning",function()
+    assert(C.clearance()==5 and C.clearance({SPRING_FIRE_RANGE_MOD=.5})==5)
+    assert(C.clearance({SPRING_FIRE_RANGE_MOD=1.5})==7)
+end)
+test("campfire selection avoids combustibles rather than accepting the first buildable spot",function()
+    local hazards={{x=4,z=0},{x=0,z=4}}
+    local site=C.select({x=0,z=0},hazards,5,function() return true end,function() return true end)
+    assert(site and math.sqrt(site.x^2+site.z^2)>=2.999)
+    for _,h in ipairs(hazards) do assert(math.sqrt((site.x-h.x)^2+(site.z-h.z)^2)>=5) end
+    assert(site.x<0 and site.z<0,"prefer the larger gap at the same build distance")
+end)
+test("campfire selection never falls back to dense combustibles or an unsafe path",function()
+    local hazards={{x=0,z=0},{x=6,z=0},{x=-6,z=0},{x=0,z=6},{x=0,z=-6}}
+    assert(not C.select({x=0,z=0},hazards,5,function() return true end,function() return true end))
+    assert(not C.select({x=0,z=0},{},5,function() return true end,function() return false end))
+    assert(not C.select({x=0,z=0},{},5,function() return false end,function() return true end))
+end)
+local function campfire_fixture(entities)
+    local sample,world,G,actions=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,entities)
+    local buffered=false
+    local record={buffered=0,placed=0,cancelled=0}
+    G.Vector3=function(x,y,z) return {x=x,y=y,z=z} end
+    G.GetValidRecipe=function() return {name="campfire"} end
+    world.state={phase="night",isnight=true}
+    G.ThePlayer.replica.builder={CanBuild=function() return true end,IsBusy=function() return false end,
+        IsBuildBuffered=function() return buffered end,
+        BufferBuild=function() buffered=true; record.buffered=record.buffered+1 end,
+        CanBuildAtPoint=function() return true end,
+        MakeRecipeAtPoint=function(_,recipe,point) record.placed=record.placed+1; record.point=point; buffered=false end}
+    G.ThePlayer.components={playercontroller={StartBuildPlacementMode=function() end,
+        CancelPlacement=function() record.cancelled=record.cancelled+1 end}}
+    G.ThePlayer.DoTaskInTime=function(_,delay,callback) record.callback=callback end
+    return sample,world,G,actions,record
+end
+test("real Mod checks all combustible entities before spending campfire ingredients",function()
+    local entities={}
+    for i,p in ipairs({{0,0},{6,0},{-6,0},{0,6},{0,-6}}) do
+        entities[i]=combustible(i,p[1],p[2],{canlight=true,NOCLICK=true})
+    end
+    local sample,_,_,actions,record=campfire_fixture(entities)
+    local s=sample(0,0)
+    assert(s.construction.campfire.status=="blocked")
+    assert(s.construction.campfire.reason=="no_safe_campfire_position")
+    assert(not require("jev_native_executor").available(s).build_campfire)
+    actions.KEY_F6()
+    assert(record.buffered==0 and record.placed==0 and not record.callback)
+end)
+test("real Mod places the campfire clear of a dropped combustible and outside the player footprint",function()
+    local item=combustible(90,3,0,{canlight=true,_inventoryitem=true})
+    local sample,_,_,actions,record=campfire_fixture({item})
+    local s=sample(0,0)
+    assert(s.construction.campfire.status=="ready")
+    assert(require("jev_native_executor").available(s).build_campfire)
+    actions.KEY_F6(); assert(record.callback and record.buffered==1)
+    record.callback()
+    assert(record.placed==1)
+    assert(math.sqrt((record.point.x-3)^2+record.point.z^2)>=5)
+    assert(math.sqrt(record.point.x^2+record.point.z^2)>=2.999)
+end)
+test("real Mod rescans combustibles after the build delay and reports a precise failure",function()
+    local entities={}
+    local _,_,_,actions,record=campfire_fixture(entities)
+    local failure
+    actions.KEY_F6(function(reason) failure=reason end)
+    assert(record.buffered==1 and record.callback)
+    for i,p in ipairs({{0,0},{6,0},{-6,0},{0,6},{0,-6}}) do
+        entities[i]=combustible(i,p[1],p[2],{canlight=true})
+    end
+    record.callback()
+    assert(record.placed==0 and record.cancelled==1)
+    assert(failure=="no_safe_campfire_position")
+end)
+test("real Mod cancels placement when phase changes during the build delay",function()
+    local _,world,_,actions,record=campfire_fixture({})
+    local reason
+    actions.KEY_F6(function(r) reason=r end)
+    world.state={phase="day",isnight=false}; record.callback()
+    assert(record.placed==0 and reason=="campfire_conditions_changed")
+end)
+test("real Mod retains a buffered campfire option after ingredients are consumed",function()
+    local sample,_,G,actions,record=campfire_fixture({})
+    actions.KEY_F6()
+    G.ThePlayer.replica.builder.CanBuild=function() return false end
+    local s=sample(0,0)
+    assert(s.crafting.campfire and s.construction.campfire.status=="ready")
+    assert(require("jev_native_executor").available(s).build_campfire)
+    record.callback(); assert(record.placed==1 and record.buffered==1)
+end)
+test("native executor rejects a now-unsafe campfire site without issuing construction",function()
+    local s={world={phase="night"},player={guid=1,position={x=0,z=0},vitals={hunger=100,hunger_max=150},inventory={items={},equipped={}}},
+        nearby={},crafting={campfire=true},construction={campfire={status="blocked",reason="no_safe_campfire_position"}}}
+    local executor=require("jev_native_executor").new({issue=function() error("unsafe construction sent") end,stop=function() end})
+    assert(not executor:start({action_id="unsafe-fire",choice="build_campfire",action={kind="build_campfire"}},s,0))
+    assert(executor.report.status=="failed" and executor.report.reason=="no_safe_campfire_position")
 end)
 print("PASS: " .. passed .. " Lua exploration/bridge checks")

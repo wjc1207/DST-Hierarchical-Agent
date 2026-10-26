@@ -101,6 +101,27 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(packet["state"]["player"]["vitals"]["health"], 50)
         self.assertEqual(packet["state_version"], self.seq)
 
+    def test_running_reports_cannot_erase_a_pending_cancel_before_lua_acknowledges(self):
+        for initial in ("queued", "running"):
+            for terminal in ("cancelled", "completed", "interrupted"):
+                with self.subTest(initial=initial, terminal=terminal):
+                    self.setUp()
+                    aid = self.start()["action_id"]
+                    self.heartbeat()  # Deliver start; its running report may still be in flight.
+                    if initial == "running":
+                        self.heartbeat(report={"action_id":aid,"status":"running","started_at":1})
+                    self.bridge.cancel_action(aid)
+                    for _ in range(3):
+                        result = self.heartbeat(report={"action_id":aid,"status":"running","started_at":1})
+                        self.assertEqual(result["command"]["operation"], "cancel")
+                        self.assertEqual(result["command"]["action_id"], aid)
+                        self.assertEqual(self.bridge.get_action_status(aid)["status"], "cancel_requested")
+                        self.assertTrue(self.bridge.get_available_actions()["busy"])
+                    self.heartbeat(report={"action_id":aid,"status":terminal,"finished_at":2})
+                    self.assertEqual(self.bridge.get_action_status(aid)["status"], terminal)
+                    self.assertIsNone(self.bridge.active)
+                    self.assertIsNone(self.heartbeat()["command"])
+
     def test_refresh_timeout_does_not_pass_cached_state_off_as_new(self):
         with self.assertRaisesRegex(BridgeError, "fresh Lua snapshot"):
             self.bridge.get_available_actions(refresh=True, timeout=0.01)
@@ -140,6 +161,27 @@ class BridgeTests(unittest.TestCase):
         # A delayed start acknowledgement cannot revive a terminal action.
         self.exchange({"action_id": aid, "status": "running"})
         self.assertEqual(self.bridge.get_action_status(aid)["status"], "cancelled")
+
+    def test_navigation_targets_are_validated_and_delivered_without_changing_offered_action(self):
+        self.current["bridge"]["available_actions"]["explore_current_region"] = {"kind":"explore","x":4,"z":0}
+        self.exchange()
+        packet = self.bridge.get_available_actions()
+        for targets in ({}, ["log"], [{"type":"inventory","prefab":"log","count":0}],
+                        [{"type":"visit_region","node_id":"unknown"}],
+                        [{"type":"inventory","prefab":"log","count":1}]*7):
+            with self.subTest(targets=targets), self.assertRaises(ValueError):
+                self.bridge.start_action("explore_current_region",packet["observation_id"],targets)
+            self.assertIsNone(self.bridge.active)
+        with self.assertRaises(BridgeError):
+            self.bridge.start_action("collect_grass",packet["observation_id"],[])
+        targets = [{"type":"inventory","prefab":"logs","count":2}]
+        result = self.bridge.start_action("explore_current_region",packet["observation_id"],targets)
+        targets[0]["count"] = 99
+        command = self.exchange()["command"]
+        self.assertEqual(command["action"]["navigation_targets"], [{"type":"inventory","prefab":"log","count":2}])
+        self.assertEqual(result["action"]["x"],4)
+        self.assertNotIn("navigation_targets",packet["actions"]["explore_current_region"])
+        self.assertNotIn("navigation_targets",self.bridge.observations[packet["observation_id"]][3]["explore_current_region"])
 
     def test_game_changes_queue_original_intent_for_lua_validation(self):
         for change in ("phase", "health", "target", "unavailable"):
@@ -351,6 +393,21 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result = await client.call_tool("start_action", {"choice": "wait", "observation_id": data["observation_id"]})
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["status"], "queued")
+
+    async def test_real_protocol_delivers_optional_navigation_targets(self):
+        from mcp import Client
+        from mcp_server.mcp_server import create_server
+        bridge = GameBridge(TOKEN)
+        snapshot = state()
+        snapshot["bridge"]["available_actions"]["explore_current_region"] = {"kind":"explore","x":4,"z":0}
+        bridge.exchange({"token":TOKEN,"session_id":"offline","sequence":1,"state":snapshot})
+        async with Client(create_server(bridge), read_timeout_seconds=3) as client:
+            data = (await client.call_tool("get_available_actions",{})).structured_content
+            result = await client.call_tool("start_action", {"choice":"explore_current_region",
+                "observation_id":data["observation_id"], "navigation_targets":[]})
+            self.assertFalse(result.is_error)
+            command = bridge.exchange({"token":TOKEN,"session_id":"offline","sequence":2,"state":snapshot})["command"]
+            self.assertEqual(command["action"]["navigation_targets"], [])
 
     async def test_autonomous_host_uses_real_sdk_with_simulated_native_completion(self):
         from mcp import Client
