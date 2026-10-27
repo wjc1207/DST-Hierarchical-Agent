@@ -6,6 +6,9 @@ semantic actions from the local JEV controller.
 author = "Local JEV Agent"
 version = "1.8.8"
 
+icon_atlas = "modicon.xml"
+icon = "modicon.tex"
+
 api_version = 10
 dst_compatible = true
 client_only_mod = true
