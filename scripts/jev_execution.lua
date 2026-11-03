@@ -25,7 +25,8 @@ end
 
 function M.request(player, action, now)
     local id = identity(action)
-    if id.action ~= "PICK" and id.action ~= "PICKUP" and id.action ~= "BUILD" then return false end
+    if id.action ~= "PICK" and id.action ~= "PICKUP" and id.action ~= "BUILD"
+        and id.action ~= "ADDFUEL" and id.action ~= "ADDWETFUEL" then return false end
     id.issued_at, id.saw_idle = now, not M.doing(player)
     player._jev_execution_request = id
     return true
@@ -85,6 +86,13 @@ function M.attach(player, now, on_start)
         controller.RemoteActionButton = function(self, action, ...)
             if action then request(action) end
             return remote(self, action, ...)
+        end
+    end
+    local use_item = controller.RemoteControllerUseItemOnSceneFromInvTile
+    if use_item then
+        controller.RemoteControllerUseItemOnSceneFromInvTile = function(self, action, ...)
+            if action then request(action) end
+            return use_item(self, action, ...)
         end
     end
     local build = controller.RemoteMakeRecipeFromMenu

@@ -5,13 +5,45 @@ import copy
 import math
 import re
 import unicodedata
+from common.places import PLACE_TARGETS, target_progress
+from common.refueling import validate_target as validate_refuel, target_error as refuel_error, maintenance_state as fire_maintenance_state
+from common.placement import validate as validate_placement, progress as placement_progress
+from common.task_timing import validate_timing, reached, TERMINAL_TASKS, number
+from common.coordinates import validate_point, arrived as coordinate_arrived
+from common.exploration_metrics import survey_cells, observed_cells
 
 MAX_TASKS = 6
+MAX_FOCUS_TASKS = 2
+
+
+def focus_scope(board):
+    """Unfinished focused goals and their unfinished prerequisite closure.
+
+    None means ordinary scheduling; an empty ready subset must not release focus.
+    """
+    tasks = {t["id"]: t for t in board.get("tasks", [])}
+    roots = [t["id"] for t in tasks.values() if t.get("focus") and t.get("status") not in TERMINAL_TASKS | {"scheduled", "maintaining"}]
+    if not roots:
+        return None
+    scope = set()
+
+    def include(identity):
+        if identity in scope or identity not in tasks or tasks[identity].get("status") == "done":
+            return
+        scope.add(identity)
+        for dependency in tasks[identity].get("depends_on", []):
+            include(dependency)
+
+    for identity in roots:
+        include(identity)
+    return scope
+
+
 # Inventory products understood by the shipped collection/crafting/food bridge.
 # This is deliberately not a list of world entities (grass, sapling, rock1, ...).
 INVENTORY_TARGET_PREFABS = frozenset({
     "cutgrass", "twigs", "flint", "log", "rocks", "goldnugget", "nitre",
-    "pinecone", "acorn", "charcoal", "marble", "moonrocknugget", "livinglog",
+    "pinecone", "acorn", "twiggy_nut", "charcoal", "marble", "moonrocknugget", "livinglog",
     "ice", "redgem", "bluegem", "purplegem", "thulecite", "thulecite_pieces",
     "petals", "berries", "berries_cooked", "berries_juicy", "berries_juicy_cooked",
     "carrot", "carrot_cooked", "seeds", "seeds_cooked", "meat", "smallmeat",
@@ -63,24 +95,53 @@ def validate_board(raw: dict, day: int) -> dict:
         priority = task.get("priority", 3)
         if type(priority) is not int or not 1 <= priority <= 5:
             raise ValueError("Task priority must be 1-5 (1 highest)")
+        focus = task.get("focus", False)
+        if type(focus) is not bool:
+            raise ValueError("Task focus must be a boolean")
         target = task.get("target")
         if not isinstance(target, dict):
             raise ValueError("Task requires a machine-checkable target")
         kind = target.get("type")
         cleaned = {"type": kind}
+        if "placement" in target:
+            if kind != "structure":
+                raise ValueError("Placement applies only to structure targets")
+            cleaned["placement"] = validate_placement(target["placement"])
         if kind in {"inventory", "known_regions"}:
             count = target.get("count")
             if type(count) is not int or not 1 <= count <= 1000:
                 raise ValueError("Task count must be 1-1000")
             cleaned["count"] = count
         if kind in {"inventory", "structure"}:
-            prefab = (normalize_inventory_prefab(target.get("prefab")) if kind == "inventory"
+            recipe_id = target.get("recipe_id")
+            if recipe_id is not None:
+                if not isinstance(recipe_id, str) or not re.fullmatch(r"[a-z0-9_]{1,100}", recipe_id):
+                    raise ValueError("Invalid recipe ID")
+                cleaned["recipe_id"] = recipe_id
+            prefab = (normalize_inventory_prefab(target.get("prefab")) if kind == "inventory" and recipe_id is None
                       else text(target.get("prefab"), 60))
             if not re.fullmatch(r"[a-z0-9_]{1,60}", prefab):
                 raise ValueError("Invalid task prefab")
-            if kind == "structure" and prefab not in {"campfire", "firepit", "sciencemachine"}:
+            if kind == "structure" and recipe_id is None and prefab not in {"campfire", "firepit", "sciencemachine"}:
                 raise ValueError("Unsupported structure task")
             cleaned["prefab"] = prefab
+        elif kind == "refuel":
+            cleaned.update(validate_refuel(target))
+        elif kind == "move_to":
+            cleaned.update(validate_point(target))
+        elif kind in PLACE_TARGETS:
+            field = {"visit_building": "building_id", "set_home": "anchor_id", "return_home": "home_id", "stay_home": "home_id"}[kind]
+            value = target.get(field)
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_:.-]{1,100}", value):
+                raise ValueError("Place target requires an observed " + field)
+            if kind == "set_home" and not re.fullmatch(r"building:[0-9]+", value):
+                raise ValueError("Set home requires a building:<GUID> anchor")
+            cleaned[field] = value
+            if kind == "stay_home":
+                radius = target.get("radius", 12)
+                if type(radius) not in {int, float} or not math.isfinite(radius) or not 6 <= radius <= 30:
+                    raise ValueError("stay_home radius must be 6-30 world units")
+                cleaned["radius"] = radius
         elif kind == "hunger_ratio":
             ratio = target.get("at_least")
             if type(ratio) not in {int, float} or not math.isfinite(ratio) or not 0 < ratio <= 1:
@@ -91,10 +152,7 @@ def validate_board(raw: dict, day: int) -> dict:
             if not cleaned["node_id"]:
                 raise ValueError("Visit task requires a known node ID")
             if kind == "survey_region":
-                area = target.get("area", 256)
-                if type(area) is not int or not 16 <= area <= 4096:
-                    raise ValueError("Invalid additional survey area")
-                cleaned["area"] = area
+                cleaned["cells"] = survey_cells(target)
         elif kind != "known_regions":
             raise ValueError("Unsupported task target type")
         dependencies = task.get("depends_on", [])
@@ -104,11 +162,17 @@ def validate_board(raw: dict, day: int) -> dict:
         hints = task.get("action_hints", [])
         if not isinstance(hints, list):
             raise ValueError("Invalid task action hints")
-        result.append({"id": identity, "title": title, "priority": priority,
+        result.append({"id": identity, "title": title, "priority": priority, "focus": focus,
                        "target": cleaned, "depends_on": list(dict.fromkeys(dependencies)),
                        "action_hints": [text(h, 60) for h in hints[:4] if isinstance(h, str)],
                        "reason": text(task.get("reason"), 120)})
+        timing, error = validate_timing(task, day)
+        result[-1].update(timing)
+        if error:
+            result[-1]["timing_error"] = error
     by_id = {task["id"]: task for task in result}
+    if sum(t["focus"] for t in result if not t.get("timing_error")) > MAX_FOCUS_TASKS:
+        raise ValueError("Task board supports at most two focused tasks")
     if len(by_id) != len(result):
         raise ValueError("Duplicate task IDs")
     visited, active = set(), set()
@@ -128,7 +192,9 @@ def validate_board(raw: dict, day: int) -> dict:
     goal = text(raw.get("goal"), 160)
     if not goal:
         raise ValueError("Task board has no goal")
+    errors = [{"task_id": t["id"], "reason": t["timing_error"]} for t in result if t.get("timing_error")]
     return {"kind": "task_board", "schema": 1, "day": day, "goal": goal,
+            **({"task_errors": errors} if errors else {}),
             "tasks": result, "replan_if": [text(v, 100) for v in raw.get("replan_if", [])[:3]
                                           if isinstance(v, str)] if isinstance(raw.get("replan_if", []), list) else []}
 
@@ -155,16 +221,44 @@ def board_view(board: dict, state: dict, *, verified_structures=None) -> dict:
     result["state_basis"] = "predicted_success" if state.get("_jev_execution_context", {}).get("predicted_success") else "observed"
     result["observed_at"] = state.get("observed_at")
     for task in result["tasks"]:
+        if task.get("timing_error"):
+            task.update(status="failed", blocked_reason=task["timing_error"], progress={"current":0,"required":1})
+            continue
+        if task.get("start_at"):
+            started = reached(task["start_at"], state)
+            if started is not True:
+                task.update(status="scheduled",
+                            blocked_reason="waiting for start_at" if started is False else "game time unavailable",
+                            progress={"current":0,"required":1})
+                continue
         target, current, needed, known = task["target"], 0, 1, True
         kind = target["type"]
+        missing_reason = "required telemetry missing"
         if kind == "inventory":
             current, needed = counts.get(target["prefab"], 0), target["count"]
+            if target.get("recipe_id"):
+                current = state.get("recipe_inventory", {}).get(target["prefab"], current)
+        elif kind == "refuel":
+            needed = target.get("at_least",target.get("count"))
+            missing_reason = (refuel_error(target, state.get("places")) or
+                              ("refueling telemetry unavailable; update Mod" if not state.get("refueling", {}).get("available") else ""))
+            known = not bool(missing_reason)
+        elif kind == "move_to":
+            done, reason = coordinate_arrived(target, state)
+            current, known = int(done), not bool(reason)
+            if reason:
+                missing_reason = reason
+        elif kind in PLACE_TARGETS:
+            done, reason = target_progress(target, state.get("places"))
+            current, known = (0 if kind == "stay_home" else int(done)), not bool(reason)
+            if reason:
+                missing_reason = reason
         elif kind == "known_regions":
             known = graph.get("known_nodes") is not None
             current, needed = int(graph.get("known_nodes") or 0), target["count"]
         elif kind == "hunger_ratio":
-            known = vitals.get("hunger") is not None and float(vitals.get("hunger_max") or 0) > 0
-            current = float(vitals.get("hunger") or 0) / max(1, float(vitals.get("hunger_max") or 1))
+            known = number(vitals.get("hunger")) and number(vitals.get("hunger_max")) and vitals["hunger_max"] > 0
+            current = vitals["hunger"] / vitals["hunger_max"] if known else 0
             needed = target["at_least"]
         elif kind == "visit_region":
             known = (graph.get("current_node") == target["node_id"] or any(
@@ -173,28 +267,46 @@ def board_view(board: dict, state: dict, *, verified_structures=None) -> dict:
                 r.get("node_id") == target["node_id"] and r.get("entered") for r in graph.get("routes", [])))
             )
         elif kind == "structure":
-            current = int(target["prefab"] in structures or any(
-                e.get("prefab") == target["prefab"] for e in state.get("nearby", [])))
+            if target.get("placement"):
+                done, missing_reason = placement_progress(target,state)
+                current, known = int(done), not bool(missing_reason)
+                if not state.get("telemetry", {}).get("placement_constraints"):
+                    known, missing_reason = False, "Placement constraints require updated Mod"
+            else:
+                current = int(target["prefab"] in structures or any(
+                    e.get("prefab") == target["prefab"] for e in state.get("nearby", []) + state.get("recipe_entities", [])))
         elif kind == "survey_region":
             area = (graph.get("current") or {}) if graph.get("current_node") == target["node_id"] else next(
                 (r for r in graph.get("routes", []) if r.get("node_id") == target["node_id"]), {})
-            known = area.get("explored_area") is not None
-            current, needed = area.get("explored_area", 0), target["area"]
+            cells = observed_cells(area,state.get("navigation",{}).get("cell_size",4))
+            known = cells is not None
+            current, needed = cells or 0, survey_cells(target)
         task["progress"] = {"current": round(current, 3), "required": needed}
         task["status"] = "done" if known and current >= needed else "in_progress" if known and current > 0 else "ready"
-        task["blocked_reason"] = "" if known else "required telemetry missing"
+        if kind == "hunger_ratio" and "duration" in task and task["status"] == "done":
+            task["status"] = "maintaining"
+        task["blocked_reason"] = "" if known else missing_reason
+        if kind == "refuel" and "at_least" in target:
+            fire = fire_maintenance_state(target,state)
+            bounds=fire["bounds"]
+            task["fuel_interval"]=bounds
+            task["progress"]={"current":bounds["min"] if bounds else 0,"required":target["at_least"]}
+            if fire["available"] and fire["satisfied"]:
+                task.update(status="maintaining" if "duration" in task else "done",blocked_reason="")
+            elif fire["reason"] not in {"", "fuel_settling"}:
+                task.update(status="blocked",blocked_reason=fire["reason"])
         if not known:
             task["status"] = "blocked"
     by_id = {task["id"]: task for task in result["tasks"]}
     for _ in result["tasks"]:
         for task in result["tasks"]:
             waiting = [d for d in task["depends_on"] if by_id[d]["status"] != "done"]
-            if task["status"] != "done" and waiting:
+            if task["status"] not in TERMINAL_TASKS | {"scheduled"} and waiting:
                 task["status"], task["blocked_reason"] = "blocked", "dependencies: " + ",".join(waiting)
     for task in result["tasks"]:
         if expired:
             task["status"] = "expired"
-        elif vitals.get("dead") and task["status"] != "done":
+        elif vitals.get("dead") and task["status"] not in TERMINAL_TASKS:
             task["status"], task["blocked_reason"] = "blocked", "player dead"
     result["tasks"].sort(key=lambda t: (t["priority"], t["id"]))
     result["ready_task_ids"] = [t["id"] for t in result["tasks"] if t["status"] in {"ready", "in_progress"}]
@@ -233,13 +345,33 @@ def format_board(board: dict, width: int = 100) -> str:
              f"[{clean(board.get('status', 'active'))}] id={clean(board.get('board_id', '-'))}",
              "Goal: " + fit(board.get("goal", ""), width - 6).rstrip(), border,
              row(["ID", "Pri", "Status", "Progress", "Task"]), border]
+    site = board.get("camp_site")
+    if site:
+        lines.insert(2,"Camp site: " + fit(f"({site['x']}, {site['z']}) {site.get('reason','')}",width-11).rstrip())
+        if site.get("backup"):
+            backup=site["backup"]
+            lines.insert(3,"Backup: " + fit(f"({backup['x']}, {backup['z']}) {backup.get('reason','')}",width-8).rstrip())
     for task in board.get("tasks", []):
         progress = task.get("progress", {})
         current, required = progress.get("current", "?"), progress.get("required", "?")
-        if task.get("target", {}).get("type") == "hunger_ratio":
+        if task.get("target", {}).get("type") == "hunger_ratio" or (task.get("target",{}).get("type")=="refuel" and "at_least" in task["target"]):
             current, required = f"{current:.0%}", f"{required:.0%}"
         lines.append(row([task["id"], task["priority"], task["status"],
-                          f"{current}/{required}", task["title"]]))
+                          f"{current}/{required}", ("[FOCUS] " if task.get("focus") else "") + task["title"]]))
+        if task.get("target", {}).get("placement"):
+            placement = task["target"]["placement"]
+            lines.append("  " + fit(f"{task['id']}: near {placement['anchor_id']} radius={placement['radius']}", width-2).rstrip())
+        if task.get("fuel_interval"):
+            interval=task["fuel_interval"]
+            label="fuel" if interval["exact"] else "fuel estimate"
+            start="[" if interval["lower_inclusive"] else "("
+            end="]" if interval["upper_inclusive"] else ")"
+            lines.append("  " + fit(f"{task['id']}: {label} {start}{interval['min']:.0%}, {interval['max']:.0%}{end}",width-2).rstrip())
+        if task.get("maintenance"):
+            timer=task["maintenance"]
+            remaining=timer.get("remaining_days")
+            if remaining is not None:
+                lines.append("  " + fit(f"{task['id']}: maintain remaining={remaining:g}d",width-2).rstrip())
         if task.get("blocked_reason"):
             lines.append("  " + fit(f"{task['id']}: {task['blocked_reason']}", width - 2).rstrip())
     lines.append(border)

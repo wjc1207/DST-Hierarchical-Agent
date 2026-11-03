@@ -1,12 +1,16 @@
 """Facts derived from a supplied snapshot. No game inputs, clocks or OS APIs."""
 import math
 
+# Fixed legacy actions reserved for strategic planning, including older peers
+# that do not yet attach the native planner_only marker.
+PLANNER_ONLY_ACTIONS = frozenset({"build_sciencemachine", "move_to", "add_fuel", "cool_down"})
+
 COLLECT_PRODUCTS = {"flower": "petals", "grass": "cutgrass", "sapling": "twigs", "sapling_moon": "twigs",
                     "berrybush": "berries", "berrybush2": "berries", "berrybush_juicy": "berries_juicy",
                     "carrot_planted": "carrot"}
 PICKABLE_SOURCE_PREFABS = frozenset(COLLECT_PRODUCTS)
 EXPLORATION_RESOURCE_PREFABS = set(COLLECT_PRODUCTS) | {
-    "twigs", "cutgrass", "flint", "log", "rocks", "goldnugget", "nitre", "pinecone", "acorn",
+    "twigs", "cutgrass", "flint", "log", "rocks", "goldnugget", "nitre", "pinecone", "acorn", "twiggy_nut",
     "charcoal", "marble", "moonrocknugget", "berries", "berries_juicy", "berries_juicy_cooked",
     "carrot", "carrot_planted", "seeds", "petals",
 }
@@ -21,7 +25,7 @@ WORK_PRODUCTS = {
        for product in ("rocks", "flint", "nitre", "goldnugget")},
 }
 SAFETY_INTERRUPTS = {"targeted_by_hostile", "health_lost", "light_changed", "critical_hunger",
-                     "critical_sanity", "critical_health", "night_light_requires_decision"}
+                     "critical_sanity", "critical_health", "night_light_requires_decision", "thermal_warning"}
 
 
 def survival_dangers(state):

@@ -4,3 +4,4 @@ __pycache__/
 logs/
 .venv-mcp/
 scripts/jev_bridge_config.lua
+.vscode/

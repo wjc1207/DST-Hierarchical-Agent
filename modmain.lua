@@ -4,11 +4,18 @@ local resource_memory = require("jev_resource_memory")
 local campfire_siting = require("jev_campfire_siting")
 local tree_work = require("jev_tree_work")
 local execution_observer = require("jev_execution")
+local recipes = require("jev_recipes")
+local refueling = require("jev_refueling")
+local placement = require("jev_placement")
+local thermal = require("jev_thermal")
+local places = require("jev_places")
+local coordinates = require("jev_coordinates")
+local performance = require("jev_performance")
 local G = GLOBAL
 local protected_call = G.pcall
 local measurement = require("jev_timing")
 -- GetTime() is simulation ticks and cannot measure work inside one frame.
-local measurement_clock = G.GetTimeRealSeconds
+local measurement_clock = G.walltime or G.GetTimeRealSeconds
 if not measurement_clock and G.GetTimeReal then
     measurement_clock = function() return G.GetTimeReal()/1000 end
 end
@@ -17,7 +24,7 @@ local LOG_PREFIX = "[JEV_DST_STATE]"
 local CHUNK_PREFIX = "[JEV_DST_CHUNK]"
 local MAX_LOG_PAYLOAD_BYTES = 3000
 local telemetry_sequence = 0
-local SAMPLE_INTERVAL = GetModConfigData("sample_interval") or 1.0
+local PERFORMANCE_INTERVAL = GetModConfigData("performance_interval") or 5.0
 local SCAN_RADIUS = GetModConfigData("scan_radius") or 12
 local MAX_NEARBY = 40
 local PLAYER_WAIT_INTERVAL = 0.5
@@ -197,6 +204,7 @@ local function read_vitals(player)
         vitals.sanity_max = round(safe_call(function() return replica.sanity:Max() end, 0), 1)
     end
 
+    thermal.read_vitals(G,player,vitals)
     return vitals
 end
 
@@ -341,6 +349,9 @@ local function read_nearby(player)
                 dz = round(dz, 2),
                 tags = entity_tags(entity),
             }
+            if entity.prefab=="campfire" or entity.prefab=="firepit" then
+                for key,value in pairs(thermal.fire(G,entity)) do record[key]=value end
+            end
             if PREFAB_ALIASES[entity.prefab] then
                 record.game_prefab = entity.prefab
             end
@@ -468,6 +479,10 @@ local function observe_navigation_cells(player, world, memory)
     local pgz = nav_grid_coordinate(pz)
     local radius_cells = math.ceil(NAV_OBSERVE_RADIUS / NAV_CELL_SIZE)
     local now = G.GetTime()
+    local road_budget={remaining=coordinates.ROAD_SAMPLE_BUDGET}
+    local road_probe=G.RoadManager and function(x,z)
+        return safe_call(function() return G.RoadManager:IsOnRoad(x,0,z) end,nil)
+    end or nil
 
     for gx = pgx - radius_cells, pgx + radius_cells do
         for gz = pgz - radius_cells, pgz + radius_cells do
@@ -489,6 +504,8 @@ local function observe_navigation_cells(player, world, memory)
                 end, nil)]
                 cell.last_seen = now
                 memory.cells[key] = cell
+                local road_mask=coordinates.sample_road(cell,NAV_CELL_SIZE,road_probe,now,road_budget)
+                coordinates.observe(memory,cell,road_probe and road_probe(x,z) or false,road_mask)
             end
         end
     end
@@ -922,6 +939,7 @@ local function read_navigation(player, nearby)
     return
     {
         mode = "topology_regions",
+        exploration_unit = "cells",
         diagnostics = memory.diagnostics,
         search = search,
         current_region = memory.current_region,
@@ -1321,7 +1339,7 @@ read_area_graph = function(player, map, memory)
     graph.current = { id = node.id, biome = node.biome, topology = node.region,
         observed_cells = node.observed_cells, entries = node.entries,
         resources_seen = graph_resources(node), name = node.name,
-        explored_area = node.explored_area, terrain = node.terrain,
+        terrain = node.terrain,
         unknown_boundary_cells = node.unknown_boundary_cells,
         boundary_complete = node.boundary_complete }
     local px, py, pz = player.Transform:GetWorldPosition()
@@ -1419,7 +1437,7 @@ read_area_graph = function(player, map, memory)
     return graph
 end
 
-local function read_collection_paths(player, nearby)
+local function read_collection_paths(player, nearby, path_cache, observed_only)
     local world = G.TheWorld
     local map = world ~= nil and world.Map or nil
     if map == nil then
@@ -1427,10 +1445,11 @@ local function read_collection_paths(player, nearby)
     end
     local memory = get_navigation_memory(world)
     local px, py, pz = player.Transform:GetWorldPosition()
-    local parents, costs = nil, nil
+    local parents, costs = path_cache and path_cache.parents, path_cache and path_cache.costs
     local function safe_segment(ax, az, bx, bz)
         return graph_segment_passable(map, ax, az, bx, bz)
             and not hazard_segment_unsafe(memory, ax, az, bx, bz)
+            and (not observed_only or coordinates.segment(memory,NAV_CELL_SIZE,ax,az,bx,bz))
     end
     for _, record in ipairs(nearby) do
         local collectible = record.pickable == true
@@ -1455,6 +1474,7 @@ local function read_collection_paths(player, nearby)
                     local start
                     parents, start, costs = observed_detour_paths(player, map, memory, true)
                     costs = costs or {}
+                    if path_cache then path_cache.parents,path_cache.costs=parents,costs end
                 end
                 local best, best_cost = nil, math.huge
                 for key in pairs(parents) do
@@ -1512,7 +1532,7 @@ local function read_work_loot(player,origin)
     return result
 end
 
-local function campfire_site(player)
+local function campfire_site(player,build_area)
     local world = G.TheWorld
     local builder = player and player.replica and player.replica.builder
     local recipe = G.GetValidRecipe and G.GetValidRecipe("campfire")
@@ -1544,7 +1564,7 @@ local function campfire_site(player)
     local memory=get_navigation_memory(world)
     local point,gap=campfire_siting.select({x=px,z=pz},hazards,clearance,function(candidate)
         return safe_call(function()
-            return builder:CanBuildAtPoint(G.Vector3(candidate.x,0,candidate.z),recipe,0)
+            return placement.live(G,player,build_area,candidate) and builder:CanBuildAtPoint(G.Vector3(candidate.x,0,candidate.z),recipe,0)
         end,false)
     end,function(candidate)
         return graph_segment_passable(world.Map,px,pz,candidate.x,candidate.z)
@@ -1563,8 +1583,136 @@ local bridge_client
 local start_bridge
 
 local function read_execution(player)
-    execution_observer.attach(player, G.GetTime, function() emit_state(player) end)
+    execution_observer.attach(player, G.GetTime, function()
+        if bridge_client then bridge_client.force_snapshot=true end
+    end)
     return execution_observer.read(player, G.GetTime())
+end
+
+local function recipe_site(player, recipe, previous, build_area)
+    local builder=player.replica and player.replica.builder
+    local px,_,pz=player.Transform:GetWorldPosition()
+    local memory=get_navigation_memory(G.TheWorld)
+    if previous and type(previous.x)=="number" and type(previous.z)=="number"
+        and (previous.x-px)^2+(previous.z-pz)^2<=36 then
+        local point=G.Vector3(previous.x,0,previous.z)
+        if graph_segment_passable(G.TheWorld.Map,px,pz,point.x,point.z)
+            and not hazard_segment_unsafe(memory,px,pz,point.x,point.z)
+            and placement.live(G,player,build_area,point) and builder:CanBuildAtPoint(point,recipe,0) then return previous end
+    end
+    for _,radius in ipairs({2,3,4,5}) do
+        for angle=0,315,45 do
+            local point=G.Vector3(px+math.cos(angle*G.DEGREES)*radius,0,pz+math.sin(angle*G.DEGREES)*radius)
+            if graph_segment_passable(G.TheWorld.Map,px,pz,point.x,point.z)
+                and not hazard_segment_unsafe(memory,px,pz,point.x,point.z)
+                and placement.live(G,player,build_area,point) and builder:CanBuildAtPoint(point,recipe,0) then
+                return {x=point.x,z=point.z}
+            end
+        end
+    end
+end
+
+local function make_place_router(player, navigation, observed_only)
+    local world=G.TheWorld
+    local memory=places.memory(world,player.GUID)
+    local px,_,pz=player.Transform:GetWorldPosition()
+    local position={x=px,z=pz}
+    local graph=navigation.graph or {}
+    local nav_memory=get_navigation_memory(world)
+    local function safe_segment(ax,az,bx,bz)
+        return graph_segment_passable(world.Map,ax,az,bx,bz)
+            and not hazard_segment_unsafe(nav_memory,ax,az,bx,bz)
+            and (not observed_only or coordinates.segment(nav_memory,NAV_CELL_SIZE,ax,az,bx,bz))
+    end
+    local path_cache={}
+    local function route(target,home)
+        if target.node_id and target.node_id~=graph.current_node then
+            for _,r in ipairs(graph.routes or {}) do
+                if r.node_id==target.node_id and r.status=="ready" and r.leg then
+                    return {status="ready",distance=r.remaining_distance,action={mode="graph",node_id=r.node_id,
+                        x=r.leg.x,z=r.leg.z,arrival=r.leg.arrival_distance or 0.2,
+                        gateway_id=r.gateway_id,next_node_id=r.next_node_id,source_node_id=r.source_node_id,
+                        entrance=r.entrance,awaiting_region=r.leg.awaiting_region,remaining_distance=r.remaining_distance}}
+                end
+            end
+            return {status="blocked",reason="no_known_region_route"}
+        end
+        local candidates={}
+        local function candidate(x,z)
+            local clear=true
+            for _,building in pairs(memory.buildings) do
+                if building.status~="missing" and (x-building.x)^2+(z-building.z)^2<((building.radius or 0)+0.4)^2 then
+                    clear=false; break
+                end
+            end
+            if clear and safe_segment(x,z,target.x,target.z) then
+                candidates[#candidates+1]={dx=x-px,dz=z-pz,distance=math.sqrt((x-px)^2+(z-pz)^2),tags={"_inventoryitem"}}
+            end
+        end
+        if home then candidate(target.x,target.z) else
+            -- Never use the solid building centre as a walking destination.
+            local clearance=math.max(2.5,(target.radius or 0)+1.25)
+            for angle=0,315,45 do
+                candidate(target.x+math.cos(angle*(G.DEGREES or math.pi/180))*clearance,
+                    target.z+math.sin(angle*(G.DEGREES or math.pi/180))*clearance)
+            end
+        end
+        read_collection_paths(player,candidates,path_cache,observed_only)
+        local best
+        for _,c in ipairs(candidates) do
+            if c.collect_path and c.collect_path.status=="ready" and c.collect_path.waypoint
+                and (not best or c.collect_path.distance<best.collect_path.distance) then best=c end
+        end
+        if not best then return {status="blocked",reason="no_safe_approach_path"} end
+        local fire_approach=not home and (target.prefab=="campfire" or target.prefab=="firepit")
+        local arrival_radius=fire_approach and 0.25 or (target.arrival_radius or (home and 1.5 or 1))
+        if best.collect_path.distance<=arrival_radius then return {status="arrived"} end
+        local waypoint=best.collect_path.waypoint
+        local length=math.sqrt((waypoint.x-px)^2+(waypoint.z-pz)^2)
+        local scale=length>0 and math.min(1,NAV_LEG_DISTANCE/length) or 0
+        return {status="ready",distance=best.collect_path.distance,action={mode="place",node_id=target.node_id,
+            x=px+(waypoint.x-px)*scale,z=pz+(waypoint.z-pz)*scale,arrival=fire_approach and 0.2 or 0.4}}
+    end
+    return route
+end
+
+local function read_places(player,navigation,entities)
+    local world=G.TheWorld
+    local memory=places.memory(world,player.GUID)
+    local px,_,pz=player.Transform:GetWorldPosition()
+    places.observe(memory,{x=px,z=pz},entities,function(x,z)
+        return observed_region_at(world.Map,x,z)
+    end,G.GetTime(),SCAN_RADIUS,true)
+    return places.snapshot(memory,{x=px,z=pz},(navigation.graph or {}).current_node,
+        make_place_router(player,navigation),function(p)
+            return graph_segment_passable(world.Map,px,pz,p.x,p.z)
+                and not hazard_segment_unsafe(get_navigation_memory(world),px,pz,p.x,p.z)
+        end,G.GetTime())
+end
+
+local function coordinate_destination(player,target,state)
+    local world=G.TheWorld
+    local p,err=coordinates.validate(target,get_navigation_memory(world),NAV_CELL_SIZE)
+    if not p then return nil,err end
+    if not safe_call(function() return world.Map:IsPassableAtPoint(p.x,0,p.z,false,false) end,false) then
+        return nil,"coordinate_not_passable"
+    end
+    local route=make_place_router(player,state.navigation or {},true)(p,true)
+    local position=state.player.position
+    if route.action and not coordinates.segment(get_navigation_memory(world),NAV_CELL_SIZE,
+        position.x,position.z,route.action.x,route.action.z) then return nil,"coordinate_route_not_observed" end
+    if route.status~="blocked" and (position.x-p.x)^2+(position.z-p.z)^2<=p.arrival_radius^2 then
+        route={status="arrived"}
+    end
+    return {route=route,arrived=route.status=="arrived",target=p}
+end
+
+local function refuel_safe(player,target)
+    local px,_,pz=player.Transform:GetWorldPosition()
+    local x,_,z=target.Transform:GetWorldPosition()
+    return (x-px)^2+(z-pz)^2<=9
+        and graph_segment_passable(G.TheWorld.Map,px,pz,x,z)
+        and not hazard_segment_unsafe(get_navigation_memory(G.TheWorld),px,pz,x,z)
 end
 
 local function make_state(player, timings)
@@ -1604,7 +1752,7 @@ local function make_state(player, timings)
     {
         schema = 10,
         observed_at = round(G.GetTime(), 3),
-        telemetry = { on_demand = true, sample_interval = SAMPLE_INTERVAL, cancel_work = true },
+        telemetry = { on_demand = true, native_tick_interval = 0.2, cancel_work = true, placement_constraints = true },
         player =
         {
             guid = player.GUID,
@@ -1635,9 +1783,90 @@ local function make_state(player, timings)
     if state.crafting.campfire and not has_nearby_lit_fire(player,8) then
         state.construction.campfire = sample("campfire_siting_ms",function() return campfire_site(player) end)
     end
-    if bridge_client then
-        state.bridge = sample("control_status_ms",function() return bridge_client:status(state,timings) end)
+    local recipe_version
+    state.recipes = sample("recipes_ms",function()
+        local catalog,version=recipes.cached_scan(G,player,function(recipe,previous) return recipe and recipe_site(player,recipe,previous) end,G.GetTime())
+        recipe_version=version
+        return catalog
+    end)
+    state.recipe_version=recipe_version
+    local cache=player._jev_recipe_cache
+    if cache then
+        state.recipe_epoch=cache.epoch
+        local loaded,fresh,indexed=0,0,0
+        for _ in pairs(cache.catalog) do loaded=loaded+1 end
+        for _,id in ipairs(cache.ids) do
+            if cache.checked[id] then
+                indexed=indexed+1
+                if cache.checked[id].epoch==cache.epoch then fresh=fresh+1 end
+            end
+        end
+        state.recipe_index={loaded=loaded,indexed=indexed,total=#cache.ids,complete=indexed==#cache.ids,
+            fresh=fresh,processed=cache.processed}
     end
+    state._recipe_wire=recipes.wire_catalog(player,state.recipes,recipe_version)
+    state.performance=player._jev_performance and player._jev_performance:read() or {available=false}
+    state.thermal=sample("thermal_ms",function()
+        local memory=get_navigation_memory(G.TheWorld)
+        return thermal.sample(G,player,state.player.vitals,nearby,function(ax,az,bx,bz)
+            return graph_segment_passable(G.TheWorld.Map,ax,az,bx,bz)
+                and not hazard_segment_unsafe(memory,ax,az,bx,bz)
+        end)
+    end)
+    state.recipe_inventory=recipes.inventory(player)
+    state.recipe_entities={}
+    local products={}
+    for _,recipe in pairs(state.recipes) do if recipe.placement then products[recipe.product]=true end end
+    local buildings={}
+    local nearby_entities,seen_entities={},{}
+    for _,entity in ipairs(G.TheSim:FindEntities(x,0,z,SCAN_RADIUS,nil,EXCLUDE_TAGS)) do
+        nearby_entities[#nearby_entities+1]=entity;seen_entities[entity.GUID]=true
+    end
+    local building_memory=places.memory(G.TheWorld,player.GUID)
+    -- Recheck only already-observed GUIDs, never enumerate undiscovered entities.
+    -- Query filters/transient tag changes must not erase a still-live building.
+    for _,record in pairs(building_memory.buildings) do
+        local entity=G.Ents and G.Ents[record.guid]
+        if not seen_entities[record.guid] and entity and entity:IsValid() and entity.Transform
+            and not entity:HasTag("INLIMBO") then
+            local ex,_,ez=entity.Transform:GetWorldPosition()
+            if (ex-x)^2+(ez-z)^2<=SCAN_RADIUS^2 then
+                nearby_entities[#nearby_entities+1]=entity;seen_entities[record.guid]=true
+            end
+        end
+    end
+    for _,entity in ipairs(nearby_entities) do
+        if products[entity.prefab] and entity:IsValid() then
+            local ex,_,ez=entity.Transform:GetWorldPosition()
+            state.recipe_entities[#state.recipe_entities+1]={guid=entity.GUID,prefab=entity.prefab,x=ex,z=ez}
+        end
+    end
+    for _,entity in ipairs(nearby_entities) do
+        if entity~=player and entity:IsValid() and entity.Transform
+            and (places.id_for_guid(building_memory,entity.GUID)
+                or entity:HasTag("structure") or entity:HasTag("prototyper")
+                or entity.prefab=="campfire" or entity.prefab=="firepit"
+                or (products[entity.prefab] and not entity:HasTag("_inventoryitem"))) then
+            local ex,_,ez=entity.Transform:GetWorldPosition()
+            local capabilities={}
+            if entity:HasTag("prototyper") or entity.prefab=="researchlab" or entity.prefab=="researchlab2" then
+                capabilities[#capabilities+1]="technology"
+            end
+            if entity:HasTag("cooker") then capabilities[#capabilities+1]="cooking" end
+            if entity:HasTag("_container") then capabilities[#capabilities+1]="storage" end
+            if entity.prefab=="campfire" or entity.prefab=="firepit" then capabilities[#capabilities+1]="lighting" end
+            buildings[#buildings+1]={guid=entity.GUID,prefab=entity.prefab,x=ex,z=ez,capabilities=capabilities,
+                semantic_prefab=PREFAB_ALIASES[entity.prefab],
+                radius=safe_call(function() return entity:GetPhysicsRadius(0) end,0),
+                name=G.STRINGS and G.STRINGS.NAMES and G.STRINGS.NAMES[string.upper(entity.prefab)] or entity.prefab}
+        end
+    end
+    state.places=sample("places_ms",function() return read_places(player,navigation,buildings) end)
+    state.refueling=sample("refueling_ms",function()
+        return refueling.scan(G,player,nearby,function(target) return refuel_safe(player,target) end)
+    end)
+
+    state.world_map=coordinates.snapshot(get_navigation_memory(G.TheWorld),NAV_CELL_SIZE)
     return state
 end
 
@@ -1646,7 +1875,13 @@ emit_state = function(player)
         return
     end
 
-    local ok, encoded = protected_call(function() return json.encode(make_state(player)) end)
+    local ok, encoded = protected_call(function()
+        local state=make_state(player)
+        if bridge_client then state.bridge=bridge_client:status(state) end
+        state._recipe_wire=nil
+        state.recipes=nil -- full catalogue is available through MCP query_recipes
+        return json.encode(state)
+    end)
     if ok then
         if #encoded <= MAX_LOG_PAYLOAD_BYTES then
             print(LOG_PREFIX .. encoded)
@@ -1701,13 +1936,32 @@ local function start_telemetry(player)
         return
     end
 
-    print("[JEV_DST]telemetry_started interval=" .. tostring(SAMPLE_INTERVAL)
+    print("[JEV_DST]telemetry_started mode=mcp_event perf_interval=" .. tostring(PERFORMANCE_INTERVAL)
         .. " radius=" .. tostring(SCAN_RADIUS))
-    emit_state(player)
-    player._jev_dst_telemetry_task = player:DoPeriodicTask(SAMPLE_INTERVAL, emit_state)
+    -- Full JSON dumps were duplicating the MCP sampling/encoding path and
+    -- producing hundreds of log lines per second. Only small FPS summaries are
+    -- automatic; explicit diagnostic emit_state remains available.
+    player._jev_dst_telemetry_task={Cancel=function() end}
+    player._jev_performance=performance.new(G.walltime,PERFORMANCE_INTERVAL)
+    local frontend=G.TheFrontEnd
+    if frontend and frontend.StartUpdatingWidget then
+        local probe={enabled=true}
+        probe.OnUpdate=function(_,dt)
+            if player~=G.ThePlayer or not player:IsValid() then return end
+            local stats=player._jev_performance:frame(dt)
+            if stats then print("[JEV_DST_PERF]"..json.encode(stats)) end
+        end
+        player._jev_frame_probe=probe
+        frontend:StartUpdatingWidget(probe)
+    end
     if start_bridge then start_bridge(player) end
 
     player:ListenForEvent("onremove", function()
+        if player._jev_frame_probe and G.TheFrontEnd then
+            player._jev_frame_probe.enabled=false
+            G.TheFrontEnd:StopUpdatingWidget(player._jev_frame_probe)
+            player._jev_frame_probe=nil
+        end
         if bridge_client then bridge_client:stop(); bridge_client = nil end
         if player._jev_bridge_tick then player._jev_bridge_tick:Cancel(); player._jev_bridge_tick = nil end
         if player._jev_dst_telemetry_task ~= nil then
@@ -2116,7 +2370,7 @@ local function attack_nearest_hostile()
     print("[JEV_DST_ACTION]attack_nearest_hostile:left_click target=" .. tostring(target.GUID))
 end
 
-local function build_campfire(on_failure)
+local function build_campfire(on_failure,build_area)
     local function fail(reason)
         print("[JEV_DST_ACTION_ERROR]build_campfire:"..reason)
         if on_failure then on_failure(reason) end
@@ -2145,7 +2399,7 @@ local function build_campfire(on_failure)
     end
 
     -- Reject unsafe surroundings BEFORE buffering/spending ingredients.
-    local site=campfire_site(player)
+    local site=campfire_site(player,build_area)
     if site.status~="ready" then return fail(site.reason) end
 
     -- Match DoRecipeClick for recipes with placers: first buffer/craft the
@@ -2174,7 +2428,7 @@ local function build_campfire(on_failure)
 
         -- Re-scan after the asynchronous build delay. Items/players may have
         -- moved since the command was accepted; never fall back to an unsafe spot.
-        site=campfire_site(player)
+        site=campfire_site(player,build_area)
         if site.status~="ready" then controller:CancelPlacement(); return fail(site.reason) end
         local point=G.Vector3(site.point.x,0,site.point.z)
 
@@ -2189,10 +2443,11 @@ local function build_campfire(on_failure)
     end)
 end
 
-local function build_science_machine()
+local function build_science_machine(build_area)
     local player = G.ThePlayer
     local builder = player ~= nil and player.replica ~= nil and player.replica.builder or nil
     local recipe = G.GetValidRecipe(SCIENCE_MACHINE_GAME_ID)
+    if build_area and not placement.live(G,player,build_area) then return false end
     if player == nil or not player:IsValid() or builder == nil or recipe == nil then
         print("[JEV_DST_ACTION_ERROR]build_science_machine:builder_unavailable")
         return
@@ -2234,7 +2489,7 @@ local function build_science_machine()
             for angle = 0, 315, 45 do
                 local radians = angle * G.DEGREES
                 local candidate = G.Vector3(px + math.cos(radians) * radius, 0, pz + math.sin(radians) * radius)
-                if builder:CanBuildAtPoint(candidate, recipe, 0) then
+                if placement.live(G,player,build_area,candidate) and builder:CanBuildAtPoint(candidate, recipe, 0) then
                     point = candidate
                     break
                 end
@@ -2270,7 +2525,8 @@ local function equip_torch()
         print("[JEV_DST_ACTION_ERROR]equip_torch:not_night")
         return
     end
-    if has_nearby_lit_fire(player, 8) then
+    local v={};thermal.read_vitals(G,player,v)
+    if has_nearby_lit_fire(player, 8) and not (thermal.hot(v) or player._jev_cooling_active) then
         print("[JEV_DST_ACTION_ERROR]equip_torch:lit_fire_nearby")
         return
     end
@@ -2458,7 +2714,18 @@ start_bridge = function(player)
         eat_safe_food=eat_safe_food,cook_food=cook_one_food,build_campfire=build_campfire,
         build_sciencemachine=build_science_machine,equip_weapon=equip_best_weapon}
     local executor
-    executor = native.new({now=G.GetTime,loot=function(origin) return read_work_loot(player,origin) end,stop=function()
+    executor = native.new({now=G.GetTime,cooling_safe=function(action)
+        local memory=get_navigation_memory(G.TheWorld)
+        return thermal.route_safe(G,player,action,function(ax,az,bx,bz)
+            return graph_segment_passable(G.TheWorld.Map,ax,az,bx,bz)
+                and not hazard_segment_unsafe(memory,ax,az,bx,bz)
+        end)
+    end,cooling_failed=function(action) thermal.failed(player,action,G.GetTime()) end,placement_site=function(action,area)
+        local recipe=G.GetValidRecipe(action.recipe_id)
+        return recipe and recipe_site(player,recipe,nil,area)
+    end,coordinate_destination=function(target,s)
+        return coordinate_destination(player,target,s)
+    end,loot=function(origin) return read_work_loot(player,origin) end,stop=function()
         if G.TheWorld then exploration.pause_route(get_navigation_memory(G.TheWorld)) end
         if player == G.ThePlayer then cancel_native_work() end
     end,safe=function(action)
@@ -2467,24 +2734,47 @@ start_bridge = function(player)
             and not hazard_segment_unsafe(get_navigation_memory(G.TheWorld), px, pz, action.x, action.z)
     end,issue=function(_,action)
         if action.kind == "collect" then return collect_native(action)
-        elseif action.kind == "explore" or action.kind == "flee_from_nearest_hostile" then walk(action)
+        elseif action.kind == "explore" or action.kind == "flee_from_nearest_hostile" or action.kind == "cool_down" then walk(action)
         elseif action.kind == "chop_nearest_tree" then
             perform_work_action(G.ACTIONS.CHOP,"CHOP_workable","axe",action.guid)
         elseif action.kind == "mine_nearest_rock" then
             perform_work_action(G.ACTIONS.MINE,"MINE_workable","pickaxe",action.guid)
+        elseif action.kind == "set_home" then
+            local px,_,pz=player.Transform:GetWorldPosition()
+            local memory=get_navigation_memory(G.TheWorld)
+            local success=places.set_home(places.memory(G.TheWorld,player.GUID),action,{x=px,z=pz},memory.current_node,
+                function(point)
+                    return graph_segment_passable(G.TheWorld.Map,px,pz,point.x,point.z)
+                        and not hazard_segment_unsafe(memory,px,pz,point.x,point.z)
+                end,G.GetTime())
+            if not success then executor:finish("failed","home_anchor_changed") end
+            return success
+        elseif action.kind == "add_fuel" then
+            local ok,reason=refueling.issue(G,player,action,function(target) return refuel_safe(player,target) end)
+            if not ok then executor:finish("failed",reason) end
+            return ok
+        elseif action.kind == "craft" or action.kind == "place" then
+            local id=executor.active and executor.active.id
+            return recipes.issue(G,player,action,function(reason)
+                if executor.active and executor.active.id==id then executor:finish("failed",reason) end
+            end)
+        elseif action.kind == "build_sciencemachine" then return build_science_machine(action.placement)
         elseif action.kind == "craft_axe" then craft_item("axe")
         elseif action.kind == "craft_pickaxe" then craft_item("pickaxe")
         elseif action.kind == "build_campfire" then
             local id=executor.active and executor.active.id
             return build_campfire(function(reason)
                 if executor.active and executor.active.id==id then executor:finish("failed",reason) end
-            end)
+            end,action.placement)
         elseif actions[action.kind] then actions[action.kind]()
         else G.error("unsupported_native_action") end
     end})
     bridge_client = transport.new(config,{
         session_id=tostring(player.GUID)..":"..tostring(G.GetTime())..":"..tostring({}),
-        now=G.GetTime,wall_now=measurement_clock,available=native.available,
+        now=G.GetTime,wall_now=measurement_clock,
+        wall_clock_name=G.walltime and "lua_walltime_seconds" or "lua_real_seconds",
+        performance=function() return player._jev_performance and player._jev_performance:read() end,
+        available=native.available,
         state=function(timings) return make_state(player,timings) end,
         alive=function() return player:IsValid() and player == G.ThePlayer end,
         request=function(url,payload,callback,receipt)
@@ -2571,6 +2861,7 @@ end)
 -- handlers. DST's Mod loader ignores this value; runtime commands arrive via MCP.
 return {
     scan_work_loot = read_work_loot,
+    coordinate_route = function(target,state) return coordinate_destination(G.ThePlayer,target,state) end,
     emit_state = function() emit_state(G.ThePlayer) end,
     cancel = cancel_native_work,
     craft_torch = craft_torch, equip_torch = equip_torch, unequip_torch = unequip_torch,

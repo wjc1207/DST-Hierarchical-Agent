@@ -82,7 +82,7 @@ def state(nearby: list[dict], cutgrass: int = 0) -> dict:
 
 def route(node="B", name="grassland 2"):
     return {"node_id": node, "name": name, "biome": "grassland", "status": "ready",
-            "explored_area": 240, "boundary_complete": False, "entered": True,
+            "observed_cells": 15, "boundary_complete": False, "entered": True,
             "hops": 2, "distance": 8,
             "target": {"x": 8, "z": 0}, "leg": {"x": 4, "z": 0, "distance": 4}}
 
@@ -92,7 +92,7 @@ def observed():
     value["navigation"].update({
         "current_region": "A", "current_biome": "forest",
         "graph": {"current_node": "A", "current": {
-            "id": "A", "name": "mixed 1", "explored_area": 640,
+            "id": "A", "name": "mixed 1", "observed_cells": 40,
             "boundary_complete": False}, "routes": [route()]},
         "search": {"status": "ready", "strategy": "directional", "boundary_complete": False,
                    "target": {"x": 0, "z": 20, "distance": 20},

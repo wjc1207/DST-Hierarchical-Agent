@@ -278,7 +278,8 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(first["max_tokens"], daily_planner.PLAN_MAX_TOKENS)
         self.assertEqual(first["reasoning_effort"], "medium")
         self.assertEqual(second["reasoning_effort"], "none")
-        self.assertEqual(first["messages"], second["messages"])
+        self.assertEqual(first["messages"], second["messages"][:-1])
+        self.assertIn("finish_reason=length", second["messages"][-1]["content"])
         self.assertIn("finish_reason=length", printed.call_args.args[0])
 
     def test_nonretryable_finish_reason_is_reported(self) -> None:
@@ -357,9 +358,9 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("dst_knowledge", context)
         self.assertNotIn("supported_capabilities", context)
         self.assertIn("Science Machine", reference["dst_knowledge"])
-        self.assertIn("gold nugget + 4 logs + 4 rocks", reference["dst_knowledge"])
+        self.assertIn("query_recipes", reference["dst_knowledge"])
         self.assertIn("remaining fuel in [0,1]", reference["dst_knowledge"])
-        self.assertIn("travel_region_<observed index>", reference["dst_knowledge"])
+        self.assertIn("topology identity", reference["dst_knowledge"])
         self.assertLess(len(reference["dst_knowledge"]), daily_planner.MAX_KNOWLEDGE_CHARS)
         self.assertNotIn("explore_adjacent_", reference["dst_knowledge"])
         self.assertNotIn("return_previous_region", reference["dst_knowledge"])

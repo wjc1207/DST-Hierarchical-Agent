@@ -85,7 +85,7 @@ test("unknown corridor frontiers agree with boundary completeness", function()
     assert(gains["0:0"]==nil and gains["2:0"]==1)
     E.summarize(m,4,neighbors)
     assert(m.graph_nodes.A.unknown_boundary_cells==1)
-    assert(m.graph_nodes.A.explored_area==16,"unlabelled cells must not inflate region area")
+    assert(m.graph_nodes.A.observed_cells==1,"unlabelled cells must not inflate region cell count")
     cell(m,3,0,nil,nil,false)
     assert(next(E.frontier_gains(m,"A",neighbors))==nil)
     E.summarize(m,4,neighbors)
@@ -102,14 +102,14 @@ test("unlabelled frontier flood never crosses sea or another known room", functi
     assert(next(E.frontier_gains(m,"A",neighbors))==nil)
 end)
 
-test("mixed terrain remains one topology region with deduplicated area", function()
+test("mixed terrain remains one topology region with deduplicated cells", function()
     local m=memory(); node(m,"A")
     cell(m,0,0,"A","forest"); cell(m,1,0,"A","grassland")
     E.summarize(m,4,neighbors)
     assert(m.graph_nodes.A.name == "mixed 1")
-    assert(m.graph_nodes.A.explored_area == 32)
+    assert(m.graph_nodes.A.observed_cells == 2)
     E.summarize(m,4,neighbors)
-    assert(m.graph_nodes.A.explored_area == 32)
+    assert(m.graph_nodes.A.observed_cells == 2)
     assert(m.graph_nodes.A.name == "mixed 1")
 end)
 
@@ -523,7 +523,7 @@ test("real Mod telemetry keeps mixed terrain together and unifies round-trip rou
     assert(#other.navigation.graph.routes == 1)
     assert(other.navigation.graph.routes[1].node_id == "A")
     assert(other.navigation.graph.routes[1].entered)
-    assert(other.navigation.graph.current.explored_area>0)
+    assert(other.navigation.graph.current.observed_cells>0 and not other.navigation.graph.current.explored_area)
 end)
 
 test("real Mod does not connect visually adjacent land across a narrow sea gap", function()
@@ -550,7 +550,7 @@ test("real Mod offers exploration along an observed unlabelled land corridor", f
     assert(result.navigation.search.status=="ready")
     assert(not result.navigation.graph.current.boundary_complete)
     assert(result.navigation.target.x>0)
-    assert(result.navigation.graph.current.explored_area>0)
+    assert(result.navigation.graph.current.observed_cells>0 and not result.navigation.graph.current.explored_area)
 end)
 
 test("real Mod crossing keeps destination-side legs until topology settles", function()
@@ -1038,7 +1038,7 @@ test("real Mod HTTP callback contains native dispatch exceptions instead of cras
     local plant={GUID=22,prefab="grass",IsValid=function() return true end,
         HasTag=function(_,tag) return tag=="pickable" end,
         Transform={GetWorldPosition=function() return 1,0,0 end}}
-    local _,world,G,_,start,captured=simulated_mod(function() return true end,function() return "A" end,
+    local _,world,G,handlers,start,captured=simulated_mod(function() return true end,function() return "A" end,
         function() return 2 end,{plant},cfg)
     local ticks,callback={},nil
     world.IsValid=function() return true end
@@ -1057,7 +1057,7 @@ test("real Mod HTTP callback contains native dispatch exceptions instead of cras
     cfg.reply={server_id="s",session_id=sent.session_id,sequence=sent.sequence,board_revision=0,
         command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_grass",action={guid=22}}}
     assert(pcall(function() callback("{}",true,200) end),"asynchronous native errors escaped into the game")
-    ticks[1](G.ThePlayer)
+    handlers.KEY_F2()
     assert(captured().bridge.action_report.status=="failed")
     assert(captured().bridge.action_report.reason=="native_exception")
 end)
@@ -1106,7 +1106,7 @@ test("real Mod defers busy or cooling-down pickup and preserves native client RP
         assert(issued==0 and picker_calls==1,"missing native action is a retry, not success")
         ready=true; clock=0.6; ticks[0.2]()
         assert(issued==1 and rpcs==(mode=="master" and 0 or 1))
-        ticks[1](G.ThePlayer)
+        handlers.KEY_F2()
         assert(captured().bridge.action_report.status=="running","pickup still needs inventory verification")
         handlers.KEY_F4(); clock=1; ticks[0.2](); assert(issued==1,"cancelled pickup must not retry")
     end
@@ -1671,6 +1671,15 @@ test("Lua collection retry is bounded and never retargets or survives cancellati
         assert(executor.report.reason==reason,executor.report.reason)
     end
 end)
+test("science machine is planner-only but native construction remains executable",function()
+    local s=bridge_state();s.crafting.sciencemachine=true
+    local action=assert(N.available(s).build_sciencemachine)
+    assert(action.planner_only)
+    local executor,calls=native_test()
+    assert(executor:start({action_id="ds-science",choice="build_sciencemachine",action=action},s,0))
+    assert(#calls==1 and calls[1].id=="build_sciencemachine")
+end)
+
 test("Lua local board execution is opt-in and never silently explores for missing goals",function()
     local s=bridge_state(); local executor,calls=native_test()
     s.nearby={{prefab="grass",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
@@ -1718,6 +1727,41 @@ test("board navigation ignores unrelated appearances and disappearances but yiel
     executor:tick(fresh,2)
     assert(not executor.active and executor.report.reason=="goal_action_available")
     assert(#calls==2,"only movement was issued; the host must choose the next board action")
+end)
+
+test("focused navigation ignores unrelated goals and new room discovery",function()
+    local s=bridge_state(); local executor=native_test()
+    s.navigation={status="ready",leg={x=20,z=0},graph={known_nodes=1,current_node="A"}}
+    local targets={{type="inventory",prefab="cutgrass",count=2}}
+    assert(executor:start({action_id="focus",choice="explore_current_region",action={navigation_targets=targets}},s,0))
+    local fresh=bridge_state()
+    fresh.navigation={status="ready",leg={x=20,z=0},graph={known_nodes=2,current_node="A"}}
+    fresh.player.position.x=4
+    fresh.nearby={{prefab="sapling",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:tick(fresh,1)
+    assert(executor.active,"a room discovery or ordinary twigs cannot interrupt focused grass navigation")
+    fresh.nearby={{prefab="grass",guid=3,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:tick(fresh,2)
+    assert(not executor.active and executor.report.reason=="goal_action_available")
+end)
+
+test("native board focus includes prerequisites and supports promotion and demotion",function()
+    local s=bridge_state(); local executor=native_test()
+    local board={auto_execute=true,tasks={
+        {id="torch",title="Torch",priority=1,focus=true,depends_on={"grass"},target={type="inventory",prefab="torch",count=1}},
+        {id="grass",title="Grass",priority=5,target={type="inventory",prefab="cutgrass",count=2}},
+        {id="twigs",title="Twigs",priority=1,target={type="inventory",prefab="twigs",count=4}}}}
+    s.nearby={{prefab="sapling",guid=2,distance=1,pickable=true,collect_path={status="ready"}}}
+    executor:set_board(board,1)
+    assert(not executor:board_choice(s,0),"blocked focus must not perform ordinary work")
+    s.nearby[2]={prefab="grass",guid=3,distance=1,pickable=true,collect_path={status="ready"}}
+    local _,_,task=executor:board_choice(s,0)
+    assert(task=="grass","non-focus prerequisite advances focused torch")
+    board.tasks[1].focus=false; board.tasks[3].focus=true
+    executor:set_board(board,2)
+    _,_,task=executor:board_choice(s,0); assert(task=="twigs")
+    s.player.inventory.items={{prefab="twigs",count=4}}
+    _,_,task=executor:board_choice(s,0); assert(task=="grass","completed focus releases ordinary work")
 end)
 
 test("board navigation catches tree and gold work without a collectible type-set change",function()
@@ -2315,5 +2359,225 @@ test("native executor rejects a now-unsafe campfire site without issuing constru
     local executor=require("jev_native_executor").new({issue=function() error("unsafe construction sent") end,stop=function() end})
     assert(not executor:start({action_id="unsafe-fire",choice="build_campfire",action={kind="build_campfire"}},s,0))
     assert(executor.report.status=="failed" and executor.report.reason=="no_safe_campfire_position")
+end)
+test("real Mod remembers buildings beyond the ordinary entity cap and verifies standing-point arrival",function()
+    local entities={}
+    for i=1,45 do
+        entities[#entities+1]={GUID=100+i,prefab="researchlab",IsValid=function() return true end,
+            HasTag=function(_,tag) return tag=="structure" end,
+            Transform={GetWorldPosition=function() return 8,0,0 end}}
+    end
+    local sample=simulated_mod(function() return true end, function() return "A" end,function() return 2 end,entities)
+    local s=sample(0,0)
+    assert(#s.places.buildings==45 and not s.places.buildings[1].arrived)
+    assert(N.available(s)["visit_building:101"].planner_only)
+    s=sample(5.5,0)
+    assert(s.places.buildings[1].arrived and not N.available(s)["visit_building:101"])
+    s=sample(50,0)
+    assert(s.places.buildings[1].status=="unconfirmed" and not s.places.buildings[1].arrived)
+    for i=#entities,1,-1 do entities[i]=nil end
+    s=sample(0,0)
+    assert(s.places.buildings[1].status=="unconfirmed")
+    s=sample(0,0);s=sample(0,0)
+    assert(s.places.buildings[1].status=="unconfirmed")
+    for _=1,9 do s=sample(0,0) end
+    assert(s.places.buildings[1].status=="missing")
+end)
+
+test("real Mod rebinds returning science and fire replicas before publishing places",function()
+    local function entity(guid,prefab,x)
+        return {GUID=guid,prefab=prefab,IsValid=function() return true end,
+            HasTag=function(_,tag) return tag=="structure" end,
+            Transform={GetWorldPosition=function() return x,0,0 end}}
+    end
+    local entities={entity(501,"researchlab",8),entity(551,"firepit",12)}
+    local sample=simulated_mod(function() return true end,function() return "A" end,function() return 2 end,entities)
+    sample(0,0);sample(50,0)
+    entities[1]=entity(801,"researchlab",8);entities[2]=entity(851,"firepit",12)
+    local s=sample(0,0);local ids={}
+    for _,b in ipairs(s.places.buildings) do ids[b.id]=b end
+    assert(#s.places.buildings==2)
+    assert(ids["building:501"].guid==801 and ids["building:551"].guid==851)
+    assert(ids["building:501"].status=="observed" and ids["building:551"].binding_revision==1)
+end)
+
+test("real Mod fire visits finish within refueling distance instead of ordinary arrival tolerance",function()
+    local building={GUID=551,prefab="firepit",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="structure" end,
+        Transform={GetWorldPosition=function() return 8,0,0 end}}
+    local sample=simulated_mod(function() return true end,function() return "A" end,function() return 2 end,{building})
+    local s=sample(4.6,0)
+    assert(not s.places.buildings[1].arrived)
+    local route=assert(N.available(s)["visit_building:551"])
+    assert(route.refuel_approach and route.arrival==0.2)
+    s=sample(5.3,0)
+    assert(s.places.buildings[1].arrived)
+    assert(not N.available(s)["visit_building:551"])
+end)
+
+test("real Mod rechecks known live building GUIDs without revealing unknown entities",function()
+    local building={GUID=501,prefab="researchlab",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="structure" end,
+        Transform={GetWorldPosition=function() return 8,0,0 end}}
+    local entities={building}
+    local sample,_,G=simulated_mod(function() return true end,function() return "A" end,function() return 2 end,entities)
+    sample(0,0)
+    G.Ents={[501]=building,[502]={GUID=502}}
+    entities[1]=nil
+    for _=1,4 do
+        local s=sample(5.5,0)
+        assert(#s.places.buildings==1 and s.places.buildings[1].status=="observed")
+        assert(s.places.buildings[1].arrived)
+    end
+end)
+
+test("real Mod keeps a valid recipe placement site while the player drifts",function()
+    local sample,_,G=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    local recipe={name="firepit",product="firepit",placer="firepit_placer",ingredients={},level={}}
+    G.AllRecipes={firepit=recipe};G.GetValidRecipe=function(id) return G.AllRecipes[id] end
+    G.STRINGS={NAMES={}};G.DEGREES=math.pi/180
+    G.Vector3=function(x,y,z) return {x=x,y=y,z=z} end
+    G.RoundBiasedUp=function(n) return math.floor(n+.5) end;G.CanPrototypeRecipe=function() return true end
+    G.ThePlayer.replica.inventory={GetItems=function() return {} end,GetEquips=function() return {} end,
+        GetOverflowContainer=function() end}
+    local invalid_x
+    G.ThePlayer.replica.builder={KnowsRecipe=function() return true end,HasIngredients=function() return true end,
+        IsBusy=function() return false end,IsBuildBuffered=function() return false end,
+        CanLearn=function() return true end,GetTechTrees=function() return {} end,
+        CanBuildAtPoint=function(_,point) return point.x~=invalid_x end}
+    local s=sample(0,0);s.recipes=G.ThePlayer._jev_recipe_cache.catalog
+    local first=assert(N.available(s).recipe_firepit)
+    s=sample(.1,0);s.recipes=G.ThePlayer._jev_recipe_cache.catalog
+    local second=assert(N.available(s).recipe_firepit)
+    assert(first.x==second.x and first.z==second.z,"walking must not move a still-legal offered site")
+    invalid_x=first.x
+    s=sample(.1,0);s.recipes=G.ThePlayer._jev_recipe_cache.catalog
+    local replacement=assert(N.available(s).recipe_firepit)
+    assert(replacement.x~=first.x,"blocked placement must be reselected")
+    local x=N.new({issue=function() error("stale site issued") end,stop=function() end})
+    assert(not x:start({action_id="stale-site",choice="recipe_firepit",action=first},s,0))
+    assert(x.report.reason=="target_changed")
+end)
+
+test("real Mod does not count a nearby building across water as reached",function()
+    local building={GUID=501,prefab="researchlab",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="structure" end,
+        Transform={GetWorldPosition=function() return 8,0,0 end}}
+    local sample=simulated_mod(function(x) return x<6 or x>7 end,function() return "A" end,
+        function() return 2 end,{building})
+    local s=sample(5.5,0)
+    assert(not s.places.buildings[1].arrived)
+    assert(s.places.buildings[1].route.status=="blocked")
+    assert(not N.available(s)["visit_building:501"])
+end)
+
+test("real Mod returns to a home point without requiring its source building",function()
+    local entities={{GUID=501,prefab="researchlab",IsValid=function() return true end,
+        HasTag=function(_,tag) return tag=="structure" end,
+        Transform={GetWorldPosition=function() return 8,0,0 end}}}
+    local sample,world=simulated_mod(function() return true end,function() return "A" end,function() return 2 end,entities)
+    local s=sample(5.5,0)
+    local P=require("jev_places")
+    local action=assert(N.available(s)["set_home_building:501"])
+    assert(P.set_home(P.memory(world,1),action,{x=5.5,z=0},s.navigation.graph.current_node,function() return true end,1))
+    entities[1]=nil
+    s=sample(20,0)
+    assert(s.places.home.id=="home:1" and not s.places.home.arrived)
+    assert(N.available(s).return_home.home_id=="home:1")
+    s=sample(5.5,0)
+    assert(s.places.home.arrived and not N.available(s).return_home)
+end)
+test("recipe catalogue is sent once per version and resends on request",function()
+    local s=bridge_state(); s.recipe_version=1; s.recipes={boards={recipe_id="boards"}}
+    s._recipe_wire=s.recipes
+    local _,requests,tick,reply=event_peer(s)
+    local packet=tick(0)
+    assert(packet.state.recipes.boards and not packet.state._recipe_wire)
+    reply({recipe_catalog_deltas=true})
+    s.player.vitals.health=140
+    packet=tick(.2); assert(packet.kind=="snapshot" and packet.state.recipes==nil)
+    assert(s.recipes.boards,"wire compaction must not remove executor facts")
+    reply({recipe_catalog_deltas=true,need_recipe_catalog=true})
+    packet=tick(.4); assert(packet.state.recipes.boards)
+    reply({recipe_catalog_deltas=true})
+    s.recipe_version=2
+    packet=tick(.6); assert(packet.state.recipes.boards)
+end)
+
+test("old servers keep full catalogue compatibility and restart forces resync",function()
+    local s=bridge_state(); s.recipe_version=1; s.recipes={boards={recipe_id="boards"}}
+    local _,_,tick,reply=event_peer(s)
+    tick(0); reply()
+    s.player.vitals.health=140
+    assert(tick(.2).state.recipes.boards)
+    reply({recipe_catalog_deltas=true})
+    assert(tick(.8).kind=="heartbeat"); reply({server_id="new",recipe_catalog_deltas=true})
+    assert(tick(1).state.recipes.boards)
+end)
+
+test("automatic telemetry registers a small frame probe rather than full periodic JSON dumps",function()
+    local cfg={enabled=true,url="http://127.0.0.1:8765/v1/exchange",token=string.rep("x",32)}
+    local _,world,G,_,start,captured=simulated_mod(function() return true end,function() return "A" end,
+        function() return 2 end,{},cfg)
+    local now,probe,removed=0,nil,false
+    local timers,events={},{}
+    world.IsValid=function() return true end
+    world.DoTaskInTime=function(_,_,fn) fn() end
+    G.ThePlayer.ListenForEvent=function(_,name,fn) events[name]=fn end
+    G.ThePlayer.DoPeriodicTask=function(_,interval,fn) timers[interval]=fn; return {Cancel=function() end} end
+    G.TheSim.QueryServer=function() end
+    G.walltime=function() return now end
+    G.TheFrontEnd={StartUpdatingWidget=function(_,p) probe=p end,StopUpdatingWidget=function(_,p) removed=p==probe end}
+    start()
+    assert(probe and timers[.2] and not timers[1] and not captured())
+    for i=1,252 do now=i*.02; probe:OnUpdate(.02) end
+    local stats=captured()
+    assert(stats.source=="frontend_wall_update" and math.abs(stats.fps-50)<.001)
+    assert(not stats.recipes and not stats.player)
+    events.onremove(); assert(removed and not probe.enabled)
+end)
+test("recipe patches send only changed immutable rows and recover after a lost base",function()
+    local s=bridge_state(); s.recipe_version=1
+    local unchanged={recipe_id="boards"};s._recipe_wire={boards=unchanged,rope={recipe_id="rope"}};s.recipes=s._recipe_wire
+    local _,_,tick,reply=event_peer(s)
+    assert(tick(0).state.recipes)
+    reply({recipe_catalog_deltas=true,recipe_catalog_patches=true})
+    s.recipe_version=2;s._recipe_wire={boards=unchanged,rope={recipe_id="rope",product="rope",ready=true}};s.recipes=s._recipe_wire
+    local packet=tick(.2)
+    assert(not packet.state.recipes and packet.state.recipe_patch.base_version==1)
+    assert(packet.state.recipe_patch.updates.rope and not packet.state.recipe_patch.updates.boards)
+    reply({recipe_catalog_deltas=true,recipe_catalog_patches=true,need_recipe_catalog=true})
+    packet=tick(.4)
+    assert(packet.state.recipes and not packet.state.recipe_patch)
+end)
+test("map patches omit unchanged cells and request full resync after a lost base",function()
+    local s=bridge_state();local row={0,0,1,'grassland','A',0}
+    s.world_map={version=1,cell_size=4,cells={['0:0']=row}}
+    local _,_,tick,reply=event_peer(s)
+    assert(tick(0).state.world_map.cells['0:0'])
+    reply({world_map_patches=true})
+    s.player.vitals.health=140
+    local packet=tick(.2);assert(not packet.state.world_map.cells and not packet.state.world_map.patch)
+    reply({world_map_patches=true})
+    s.world_map={version=2,cell_size=4,cells={['0:0']=row,['1:0']={1,0,1,'grassland','A',1}}}
+    s.player.vitals.health=130
+    packet=tick(.4);assert(packet.state.world_map.patch.base_version==1)
+    assert(packet.state.world_map.patch.updates['1:0'] and not packet.state.world_map.patch.updates['0:0'])
+    reply({world_map_patches=true,need_world_map=true})
+    packet=tick(.6);assert(packet.state.world_map.cells['0:0'] and not packet.state.world_map.patch)
+    reply({world_map_patches=true})
+    packet=tick(1.2);reply({server_id='new',world_map_patches=true})
+    packet=tick(1.4);assert(packet.state.world_map.cells['1:0'])
+end)
+
+test("real Mod exports observed map cells and routes only to inspected ground",function()
+    local sample,world,G,_,_,_,mod=simulated_mod(function() return true end,function() return 'A' end,function() return 2 end)
+    G.RoadManager={IsOnRoad=function(_,x,y,z) return x==0 and z==0 end}
+    local s=sample(0,0)
+    assert(s.world_map.cells['0:0'][4]=='grassland' and s.world_map.cells['0:0'][6]==1 and not s.world_map.cells['100:0'])
+    local dest=assert(mod.coordinate_route({x=8,z=0,arrival_radius=.5},s))
+    assert(not dest.arrived and dest.route.status=='ready' and dest.route.action.x<=4)
+    assert(not mod.coordinate_route({x=400,z=0},s))
+    s=sample(7.7,0);assert(mod.coordinate_route({x=8,z=0,arrival_radius=.5},s).arrived)
 end)
 print("PASS: " .. passed .. " Lua exploration/bridge checks")

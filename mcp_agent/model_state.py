@@ -6,6 +6,7 @@ from copy import deepcopy
 
 from common import game_rules as rules
 from common.resource_events import resource_types
+from common.exploration_metrics import observed_cells
 from mcp_agent.region_resources import knowledge_for_graph
 
 
@@ -59,6 +60,8 @@ def model_game_state(state: dict) -> dict:
         "work": work,
         "execution": state.get("execution"),
         "execution_context": execution_context,
+        "refueling": state.get("refueling", {"available":False,"options":[]}),
+        "thermal": state.get("thermal", {"available":False,"active":False}),
         # Existing JEV convenience fields remain, and are now also sent to DeepSeek.
         "day": world.get("day"),
         "phase": world.get("phase"),
@@ -91,9 +94,20 @@ def model_game_state(state: dict) -> dict:
     if bridge.get("enabled"):
         facts["control"] = {
             "transport": "mcp", "execution_owner": "lua", "navigation_intent_owner": "python",
-            "protocol": bridge.get("protocol"), "available_actions": bridge.get("available_actions", {}),
+            "protocol": bridge.get("protocol"),
+            "placement_constraints": state.get("telemetry",{}).get("placement_constraints",False), "available_actions": {
+                k: a for k, a in bridge.get("available_actions", {}).items() if not a.get("planner_only")
+                and k not in rules.PLANNER_ONLY_ACTIONS},
             "board_revision": bridge.get("board_revision"), "board_paused": bridge.get("board_paused"),
-            "unsupported": ["attack", "equip_weapon", "automatic_tool_prerequisite_solver", "alchemyengine"],
+            "unsupported": ["attack", "equip_weapon", "automatic_tool_prerequisite_solver"],
         }
-    # Neither consumers nor subsequent telemetry/board updates may rewrite a snapshot.
-    return deepcopy(facts)
+    # Older Mod snapshots may still contain world-area counters. Models see one
+    # explicit grid-cell unit; retain the original snapshot for transport clients.
+    facts=deepcopy(facts)
+    navigation=facts.get("navigation",{})
+    graph=navigation.get("graph") or {}
+    for region in [graph.get("current") or {},*(graph.get("routes") or [])]:
+        count=observed_cells(region,navigation.get("cell_size",4))
+        if count is not None:region["observed_cells"]=count
+        region.pop("explored_area",None)
+    return facts

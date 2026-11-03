@@ -16,10 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from common.task_board import validate_board, board_view, validate_navigation_targets
+from common.residence import validate_area, allowed as residence_allowed
+from common.coordinates import move_action
+from common.placement import resolve as placement_area, inside as inside_placement, BUILD_ACTIONS
 from .transport_metrics import TransportRecorder, lua_measurements
 
 TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
-SUPPORTED = {"wait", "collect", "craft_torch", "craft_axe", "craft_pickaxe",
+SUPPORTED = {"cool_down", "add_fuel", "set_home", "craft", "place", "wait", "collect", "craft_torch", "craft_axe", "craft_pickaxe",
              "equip_torch", "unequip_torch", "eat_safe_food", "cook_food",
              "build_campfire", "build_sciencemachine",
              "chop_nearest_tree", "mine_nearest_rock", "explore", "flee_from_nearest_hostile"}
@@ -98,6 +101,9 @@ class GameBridge:
         self.active = None
         self.board = None
         self.board_revision = 0
+        self.recipe_catalog_version = None
+        self.recipe_catalog = None
+        self.map_version, self.map_cells = None, None
 
     def _fresh(self):
         if self.state is None or self.clock() - self.received > self.max_age:
@@ -136,6 +142,8 @@ class GameBridge:
                 self.session, self.sequence, self.active = session, 0, None
                 self.board, self.observations = None, OrderedDict()
                 self.state, self.state_version = None, 0
+                self.recipe_catalog_version, self.recipe_catalog = None, None
+                self.map_version, self.map_cells = None, None
                 self.snapshot_received = -float("inf")
                 self.snapshot_request, self.snapshot_fulfilled = 0, 0
                 self.changed.notify_all()
@@ -145,6 +153,57 @@ class GameBridge:
             if kind == "snapshot":
                 copy_started = time.perf_counter() if measurements is not None else None
                 self.state = copy.deepcopy(state)
+                version = state.get("recipe_version")
+                if type(version) is int and version >= 0:
+                    if isinstance(state.get("recipes"), dict):
+                        self.recipe_catalog = self.state["recipes"]
+                        self.recipe_catalog_version = version
+                    elif (isinstance(state.get("recipe_patch"), dict)
+                          and state["recipe_patch"].get("base_version") == self.recipe_catalog_version
+                          and self.recipe_catalog is not None):
+                        patch = self.state.pop("recipe_patch")
+                        updates, removed = patch.get("updates"), patch.get("removed")
+                        if (not isinstance(updates, dict) or not isinstance(removed, list)
+                                or len(updates) > 5000 or len(removed) > 5000
+                                or any(not isinstance(k, str) or not isinstance(v, dict) for k, v in updates.items())
+                                or any(not isinstance(k, str) for k in removed)):
+                            raise BridgeError("Invalid recipe patch")
+                        catalogue = dict(self.recipe_catalog)
+                        catalogue.update(updates)
+                        for key in removed:
+                            catalogue.pop(key, None)
+                        self.recipe_catalog, self.recipe_catalog_version = catalogue, version
+                        self.state["recipes"] = catalogue
+                    elif self.recipe_catalog_version == version and self.recipe_catalog is not None:
+                        self.state["recipes"] = self.recipe_catalog
+                    else:
+                        # A reconnect/server restart can receive a delta first.
+                        # Keep ordinary observations usable, request full facts,
+                        # and never reuse a different world's recipe catalogue.
+                        self.state["recipes"] = {}
+                world_map = self.state.get("world_map")
+                if isinstance(world_map,dict):
+                    version = world_map.get("version")
+                    cells = world_map.get("cells")
+                    patch = world_map.pop("patch",None)
+                    if cells == []:
+                        cells = {}
+                    if isinstance(cells,dict) and len(cells)<=4096 and type(version) is int and version>=0:
+                        self.map_cells,self.map_version = cells,version
+                    elif (isinstance(patch,dict) and patch.get("base_version")==self.map_version
+                          and self.map_cells is not None and type(version) is int and version>=0):
+                        updates,removed = patch.get("updates"),patch.get("removed")
+                        if updates == []:
+                            updates = {}
+                        if not isinstance(updates,dict) or not isinstance(removed,list) or len(updates)>4096 or len(removed)>4096:
+                            raise BridgeError("Invalid world map patch")
+                        merged = {**self.map_cells,**updates}
+                        for key in removed:
+                            merged.pop(key,None)
+                        if len(merged)>4096:
+                            raise BridgeError("World map exceeds cell budget")
+                        self.map_cells,self.map_version = merged,version
+                    world_map["cells"] = self.map_cells if self.map_version==version and self.map_cells is not None else {}
                 self.state_version, self.snapshot_received = seq, self.received
                 self.state["bridge"]["snapshot_sampled_at"] = state["bridge"].get("sampled_at")
                 requested = payload.get("snapshot_request_id")
@@ -203,7 +262,13 @@ class GameBridge:
                                "choice": record["choice"], "action": record["action"]}
             result = {"server_id": self.server_id, "session_id": session, "sequence": seq, "command": command,
                       "board_revision": self.board_revision, "snapshot_request_id": self.snapshot_request,
-                      "need_snapshot": self.state is None}
+                      "need_snapshot": self.state is None,
+                      "world_map_patches": True,"need_world_map":isinstance((self.state or {}).get("world_map"),dict)
+                          and self.state["world_map"].get("version")!=self.map_version,
+                      "recipe_catalog_deltas": True, "recipe_catalog_patches": True,
+                      "need_recipe_catalog": self.state is not None
+                          and type(self.state.get("recipe_version")) is int
+                          and self.recipe_catalog_version != self.state["recipe_version"]}
             if kind == "snapshot" or control.get("board_revision") != self.board_revision:
                 result["task_board"] = copy.deepcopy(self.board)
             return result
@@ -264,7 +329,7 @@ class GameBridge:
                         self.state["bridge"].get("executor_busy") or (self.board and self.board.get("auto_execute"))),
                     "task_board": board_view(self.board, self.state) if self.board else None}
 
-    def start_action(self, choice: str, observation_id: str, navigation_targets: list | None = None):
+    def start_action(self, choice: str, observation_id: str, navigation_targets: list | None = None, residence: dict | None = None, destination: dict | None = None, placement: dict | None = None):
         with self.lock:
             self._fresh()
             if self.active or (self.board and self.board.get("auto_execute")) \
@@ -276,9 +341,29 @@ class GameBridge:
             if observation[2] != signature(self.state):
                 raise BridgeError("Game player changed; get available actions again")
             old = observation[3].get(choice)
+            if destination is not None:
+                if choice != "move_to":
+                    raise BridgeError("destination applies only to move_to")
+                old = move_action(destination, self.state)
             if not old:
                 raise BridgeError("Action was not offered by this observation")
             action = copy.deepcopy(old)
+            if placement is not None:
+                if action.get("kind") not in BUILD_ACTIONS:
+                    raise BridgeError("placement applies only to building actions")
+                if not self.state.get("telemetry", {}).get("placement_constraints"):
+                    raise BridgeError("Placement constraints require updated Mod and re-entering the world")
+                area = placement_area(placement,self.state)
+                if not inside_placement(self.state.get("player",{}).get("position"),area):
+                    raise BridgeError("Outside placement area; visit the anchor before building")
+                action["placement"] = area
+            if residence is not None:
+                if self.state.get("bridge",{}).get("residence_constraints") is not True:
+                    raise BridgeError("Update Lua Mod and re-enter world before residence actions")
+                area = validate_area(residence, self.state)
+                if not residence_allowed(action, self.state, area):
+                    raise BridgeError("Action would leave the residence area")
+                action["residence"] = area
             if navigation_targets is not None:
                 if old.get("kind") != "explore":
                     raise BridgeError("Navigation targets apply only to offered navigation actions")
@@ -337,9 +422,13 @@ class GameBridge:
             if self.active:
                 raise BridgeError("Cancel the active action before replacing the board")
             clean = validate_board(board, int(self.state.get("world", {}).get("day", 1)))
+            if auto_execute and any(t.get("start_at") or "duration" in t or t["target"].get("placement") or t["target"]["type"] in {"stay_home","move_to","refuel"} or t.get("timing_error")
+                                    for t in clean["tasks"]):
+                raise BridgeError("Timed/residence/refuel tasks require the Python priority-board scheduler; use auto_execute=false")
             self.board_revision += 1
             self.board = {**clean, "board_id": f"mcp:{self.board_revision}", "auto_execute": bool(auto_execute)}
             return {"board_revision": self.board_revision, "auto_execute": bool(auto_execute),
+                    "task_errors": clean.get("task_errors",[]),
                     "task_board": board_view(self.board, self.state)}
 
 

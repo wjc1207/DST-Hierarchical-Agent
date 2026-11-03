@@ -10,13 +10,26 @@ local function state_signature(s,status)
         tostring(math.floor((w.time or 0)*4)),
         tostring(math.floor((v.hunger or 0)/math.max(v.hunger_max or 1,1)*10)),
         tostring(math.floor((v.sanity or 0)/math.max(v.sanity_max or 1,1)*4)),
-        tostring(graph.current_node),tostring(graph.known_nodes),tostring(status.board_ready)}
+        tostring(graph.current_node),tostring(graph.known_nodes),tostring(status.board_ready),tostring(s.recipe_version)}
     local inventory=p.inventory or {}; local counts={}
     for _,group in ipairs({"items","equipped"}) do for _,item in ipairs(inventory[group] or {}) do
         local key=group..":"..tostring(item.prefab)..":"..tostring(item.slot)
         counts[key]=(counts[key] or 0)+(item.count or 1)
     end end
     for key,n in pairs(counts) do parts[#parts+1]="i:"..key..":"..n end
+    -- Generic crafting may put output in an overflow backpack. Buildings are
+    -- scanned separately from the capped nearby list, including manual builds.
+    for prefab,n in pairs(s.recipe_inventory or {}) do
+        parts[#parts+1]="ri:"..prefab..":"..n
+    end
+    for _,entity in ipairs(s.recipe_entities or {}) do
+        parts[#parts+1]="re:"..tostring(entity.guid)..":"..entity.prefab
+    end
+    local places=s.places or {}
+    parts[#parts+1]="home:"..tostring(places.home and places.home.id)..":"..tostring(places.home and places.home.arrived)
+    for _,building in ipairs(places.buildings or {}) do
+        parts[#parts+1]="building:"..building.id..":"..building.status..":"..tostring(building.arrived)
+    end
     for key,a in pairs(status.available_actions or {}) do
         parts[#parts+1]="a:"..key..":"..tostring(a.kind)..":"..tostring(a.prefab)
     end
@@ -50,14 +63,14 @@ function M.new(config,env,executor)
         local available=measurement.call(env.wall_now,timings,"available_actions_ms",function()
             return executor.available and executor:available(state,env.now()) or env.available(state) end)
         return {enabled=true,connected=self.connected,session_id=self.session_id,
-            protocol=4,validation_owner="lua",transport_mode="event_snapshot",board_revision=executor.board_revision,
+            protocol=4,residence_constraints=true,coordinate_navigation=true,validation_owner="lua",transport_mode="event_snapshot",board_revision=executor.board_revision,
             board_auto_execute=executor.board and executor.board.auto_execute==true or false,
             board_ready=ready,
             events=executor.events,
             executor_busy=executor.active~=nil,board_paused=executor.board_paused,
             action_report=executor.report,sampled_at=env.now(),
             transport={last_round_trip_ms=self.last_round_trip_ms,measurement_version=1,
-                measurement_clock=env.wall_now and "lua_real_seconds" or "unavailable"},
+                measurement_clock=env.wall_now and (env.wall_clock_name or "lua_real_seconds") or "unavailable"},
             available_actions=available}
     end
     local function revision()
@@ -105,14 +118,51 @@ function M.new(config,env,executor)
         for _,r in ipairs(self.receipts) do if r.done then completed[#completed+1]=r end end
         local payload={token=config.token,session_id=self.session_id,sequence=sequence,
             kind=snapshot and "snapshot" or "heartbeat",action_report=executor.report,
-            measurement={clock=env.wall_now and "lua_real_seconds" or "unavailable",
+            measurement={clock=env.wall_now and (env.wall_clock_name or "lua_real_seconds") or "unavailable",
+                performance=env.performance and env.performance() or nil,
                 sampling=self.sampling,refresh=refresh,previous_exchanges=completed}}
+        local sent_recipe_version
+        local sent_map
         if snapshot then
-            payload.state=state; payload.snapshot_request_id=self.snapshot_request_id
+            local wire={}
+            for key,value in pairs(state) do if key~="_recipe_wire" then wire[key]=value end end
+            if state.recipe_version then
+                if self.recipe_deltas and self.ack_recipe_version==state.recipe_version then wire.recipes=nil
+                else
+                    wire.recipes=state._recipe_wire or state.recipes
+                    if self.recipe_patches and self.ack_recipe_catalog and self.ack_recipe_version then
+                        local updates,removed={},{}
+                        for id,row in pairs(wire.recipes or {}) do
+                            if row~=self.ack_recipe_catalog[id] then updates[id]=row end
+                        end
+                        for id in pairs(self.ack_recipe_catalog) do
+                            if not wire.recipes[id] then removed[#removed+1]=id end
+                        end
+                        wire.recipe_patch={base_version=self.ack_recipe_version,updates=updates,removed=removed}
+                        wire.recipes=nil
+                    end
+                    sent_recipe_version=state.recipe_version
+                end
+            end
+            if state.world_map then
+                local map={};for k,v in pairs(state.world_map) do map[k]=v end
+                if self.map_patches and self.ack_map then
+                    if self.ack_map.version==map.version then map.cells=nil
+                    else
+                        local updates,removed={},{}
+                        for key,row in pairs(map.cells or {}) do if row~=(self.ack_map.cells or {})[key] then updates[key]=row end end
+                        for key in pairs(self.ack_map.cells or {}) do if not map.cells[key] then removed[#removed+1]=key end end
+                        map.patch={base_version=self.ack_map.version,updates=updates,removed=removed};map.cells=nil
+                    end
+                end
+                wire.world_map=map;sent_map=state.world_map
+            end
+            payload.state=wire; payload.snapshot_request_id=self.snapshot_request_id
             payload.snapshot_reason=self.force_snapshot and "resync"
                 or self.snapshot_request_id>self.snapshot_ack_id and "requested"
                 or not self.ack_signature and "initial" or "event"
         else payload.control=heartbeat_control(status) end
+        local sent_recipe_catalog=sent_recipe_version and (state._recipe_wire or state.recipes)
         local sent_snapshot_request=self.snapshot_request_id
         self.sampling={ticks=0,sum_ms={},max_ms={}}
         local receipt={sequence=sequence,done=false}
@@ -131,6 +181,17 @@ function M.new(config,env,executor)
                 if executor.active then executor:finish("interrupted","bridge_server_restarted") end
             elseif snapshot then
                 self.ack_signature=signature; self.snapshot_ack_id=sent_snapshot_request; self.force_snapshot=false
+            end
+            self.recipe_deltas=result.recipe_catalog_deltas==true
+            self.recipe_patches=result.recipe_catalog_patches==true
+            self.map_patches=result.world_map_patches==true
+            if sent_map and not result.need_world_map then self.ack_map=sent_map end
+            if result.need_world_map or restarted then self.ack_map=nil;self.force_snapshot=true end
+            if sent_recipe_version and not result.need_recipe_catalog then
+                self.ack_recipe_version,self.ack_recipe_catalog=sent_recipe_version,sent_recipe_catalog
+            end
+            if result.need_recipe_catalog or restarted then
+                self.ack_recipe_version,self.ack_recipe_catalog=nil,nil; self.force_snapshot=true
             end
             if result.need_snapshot then self.force_snapshot=true end
             if type(result.snapshot_request_id)=="number" and result.snapshot_request_id>=0 then

@@ -18,13 +18,15 @@ if __package__ in {None, ""}:
 
 from common import timing_log as timing
 from mcp_agent.daily_planner import DailyPlanner, DEFAULT_API_URL as DS_URL, DEFAULT_MODEL as DS_MODEL
-from mcp_agent.navigation_intents import ExplorationExecutor, dispatch_for_navigation
+from mcp_agent.navigation_intents import ExplorationExecutor, dispatch_for_navigation, local_candidates
 from common.config import load_dotenv, resolve_env_path
 from mcp_agent.jev_client import call_jev, DEFAULT_API_URL, DEFAULT_MODEL
 from common.game_rules import survival_dangers, SAFE_FOOD_PREFABS
 from mcp_server.game_bridge import TERMINAL, finite_time, BridgePortUnavailable, check_bridge_port
 from mcp_agent.action_sequence import SequenceExecutor, is_sequence
-from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, task_signature
+from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, task_signature, idle_review_reason, progress_signatures_match
+from common.residence import allowed as residence_allowed
+from common.thermal import heat_risk
 
 
 class MCPRejected(RuntimeError):
@@ -75,6 +77,7 @@ class MCPAgent:
         self.deferred_safety = None
         self.goal_gap_marker = None
         self.goal_light = None
+        self.active_policy = None
 
     def measured_decision(self, request_id, submitted_at, metadata, state, criteria, plan):
         # ContextVars are intentionally NOT copied from the async host into this
@@ -149,7 +152,7 @@ class MCPAgent:
         goal_owner = self.goal_actions.pop(identity, None)
         if goal_owner:
             task_id, signature, action = goal_owner
-            if self.goals.records.get(task_id, {}).get("signature") == signature:
+            if progress_signatures_match(self.goals.records.get(task_id, {}).get("signature"), signature):
                 if is_priority_board(self.plan):
                     self.goals.view(self.plan, state)
                 self.goals.on_result(task_id, choice, action, status, reason, self.navigator, state)
@@ -206,6 +209,13 @@ class MCPAgent:
         self.session, self.packet = session, packet
         timing.annotate(game_session_id=session, state_version=packet.get("state_version"))
         self.drain_request_timings()
+        vitals=state.get("player",{}).get("vitals",{})
+        timing.annotate(temperature=vitals.get("temperature"),overheating=vitals.get("overheating"),
+                        freezing=vitals.get("freezing"),heat_warning_threshold=vitals.get("heat_warning_threshold"),
+                        thermal_status=(state.get("thermal") or {}).get("status"),
+                        thermal_reason=(state.get("thermal") or {}).get("reason"),
+                        fire_state=[{k:row.get(k) for k in ("building_id","guid","lit","fire_section","fuel_percent","fuel_min","fuel_max","fuel_estimated","fire_data_source","reason","ratio_reason")}
+                                    for row in (state.get("refueling") or {}).get("targets",[])[:4]])
         timing.annotate(mcp_state_age_ms=packet.get("state_age_ms"))
         timing.annotate(mcp_connection_age_ms=packet.get("connection_age_ms"))
         status = packet.get("action_status") or {}
@@ -273,9 +283,28 @@ class MCPAgent:
                 if result["status"] in TERMINAL:
                     self.record(result, packet["state"])
                     self.active_id = None
+                    self.active_policy = None
                     timing.annotate(outcome="executed" if result["status"] == "completed" else result["status"],
                                     action_reason=result.get("reason"))
                     return
+                if self.active_policy and result["status"] != "cancel_requested":
+                    current_ids = self.goals.timed_task_ids(self.plan,packet["state"])
+                    area = self.goals.residence
+                    old_area = self.active_policy["residence"]
+                    action = self.active_policy["action"]
+                    changed = current_ids != self.active_policy["timed_ids"]
+                    owner = self.goal_actions.get(self.active_id)
+                    if changed and action.get("kind") == "add_fuel" and owner:
+                        task = next((t for t in self.goals.view(self.plan,packet["state"])["tasks"] if t["id"]==owner[0]),None)
+                        # A newly adequate fire must not cancel the physical addition before its native confirmation.
+                        if (task and (task["status"]=="maintaining" or (task["status"]=="done" and "duration" not in task))
+                                and set(current_ids).symmetric_difference(self.active_policy["timed_ids"])=={owner[0]}):
+                            changed = False
+                    changed = changed or bool(old_area and old_area["holding"] and not area)
+                    changed = changed or bool(area and area["holding"] and not residence_allowed(action,packet["state"],area))
+                    if changed:
+                        timing.event("task_time.review_requested",reason="task_time_or_residence_changed",action_id=self.active_id)
+                        await self.rpc("cancel_action",action_id=self.active_id)
                 owner = self.goal_actions.get(self.active_id)
                 if owner and owner[2].get("kind") == "explore" and "navigation_targets" in owner[2] \
                         and result["status"] != "cancel_requested":
@@ -290,7 +319,7 @@ class MCPAgent:
                     raise RuntimeError("Native action exceeded its bound; cancellation requested, awaiting confirmation")
                 await asyncio.sleep(self.poll)
 
-    async def perform(self, choice, packet, sequence_step=None, goal_task=None):
+    async def perform(self, choice, packet, sequence_step=None, goal_task=None, *, safety=False):
         timing.annotate(action=choice, current_action=choice)
         if not self.execute:
             print(f"dry_run choice={choice}: no game command sent")
@@ -301,11 +330,25 @@ class MCPAgent:
                      host_observed_to_submit_ms=round((time.monotonic()-self.last_terminal[1])*1000, 3)
                      if self.last_terminal else None)
         arguments = {"choice": choice, "observation_id": packet["observation_id"]}
+        if packet["actions"][choice].get("coordinate_target"):
+            arguments["destination"] = packet["actions"][choice]["coordinate_target"]
+        policy = None
+        policy_state = (self.packet or packet)["state"]
+        if is_priority_board(self.plan) and not safety:
+            ids = self.goals.timed_task_ids(self.plan,policy_state)
+            area = copy.deepcopy(self.goals.residence)
+            if area and area["holding"]:
+                arguments["residence"] = {"home_id":area["home_id"],"radius":area["radius"]}
+            policy = {"timed_ids":ids,"residence":area,"action":copy.deepcopy(packet["actions"][choice])}
         if goal_task is not None and packet["actions"][choice]["kind"] == "explore" and is_priority_board(self.plan):
-            arguments["navigation_targets"] = self.goals.navigation_targets(self.plan, packet["state"])
+            arguments["navigation_targets"] = self.goals.navigation_targets(self.plan, policy_state)
             timing.annotate(navigation_target_count=len(arguments["navigation_targets"]))
+        if (goal_task is not None and goal_task["target"].get("placement")
+                and packet["actions"][choice]["kind"] in {"place","build_campfire","build_sciencemachine"}):
+            arguments["placement"] = copy.deepcopy(goal_task["target"]["placement"])
         result = await self.rpc("start_action", **arguments)
         self.active_id, self.active_started = result["action_id"], time.monotonic()
+        self.active_policy = policy
         if sequence_step is not None:
             self.sequence_actions[self.active_id] = (self.sequence.identity, sequence_step)
         if goal_task is not None:
@@ -319,7 +362,7 @@ class MCPAgent:
 
     async def choose_local(self, packet, handoff="local"):
         state = packet["state"]
-        local = {k: a for k, a in packet["actions"].items() if a["kind"] != "explore"}
+        _, local = local_candidates({}, packet["actions"])
         criteria = {k: a.get("description", k) for k, a in local.items()}
         if set(local) == {"wait"} or not local:
             return "wait" if local else None, packet
@@ -374,6 +417,8 @@ class MCPAgent:
         if self.active_id:
             await self.wait_action()
             return False
+        if await self.handle_thermal(packet):
+            return False
         if is_priority_board(self.plan):
             # New host-side scheduling must not race a previously uploaded Lua board.
             if self.execute and self.uploaded and not self.board_acked:
@@ -425,15 +470,29 @@ class MCPAgent:
         return await self.run_local_control(packet, planning_gap=self.planner is not None and self.plan is None)
 
     def board_can_resume(self, packet):
-        return (is_priority_board(self.plan) and
-                self.goals.choose(self.plan, packet["state"], packet["actions"], self.navigator) is not None)
+        if not is_priority_board(self.plan):
+            return False
+        # A focus promoted while a gap-model request was in flight must reclaim
+        # control even if it is blocked. Discard the old optional response.
+        view = self.goals.view(self.plan, packet["state"])
+        if view.get("focus_task_ids") or self.goals.residence:
+            return True
+        return self.goals.choose(self.plan, packet["state"], packet["actions"], self.navigator) is not None
 
     def gap_packet(self, packet):
         # Temporary control must respect exact-choice failure pauses too.
         paused = {(choice, guid) for (_, choice, guid), until in self.goals.paused.items()
                   if until > time.monotonic()}
+        deferred, ready = set(), set()
+        if is_priority_board(self.plan):
+            for task in self.goals.view(self.plan,packet["state"])["tasks"]:
+                keys = {key for key,_ in self.goals.local_choices(task,packet["actions"],packet["state"])}
+                if task["status"] == "scheduled":
+                    deferred.update(keys)
+                elif task["status"] in {"ready","in_progress"}:
+                    ready.update(keys)
         return {**packet, "actions": {k: a for k, a in packet["actions"].items()
-                                     if (k, a.get("guid")) not in paused}}
+                                     if (k, a.get("guid")) not in paused and k not in deferred-ready}}
 
     async def run_local_control(self, packet, *, planning_gap=False):
         """Existing no-plan control also fills gaps without dropping future board goals."""
@@ -454,7 +513,7 @@ class MCPAgent:
         actions = packet["actions"]
         navigation = self.navigator.choose(packet["state"], dispatch_for_navigation(actions, packet["state"]),
                                            None if planning_gap else self.plan)
-        local = {k: a for k, a in actions.items() if a["kind"] not in {"explore", "wait"}}
+        local = {k: a for k, a in local_candidates({}, actions)[1].items() if a["kind"] != "wait"}
         if navigation and (not local or (not planning_gap and not self.navigator.handoff)):
             choice = navigation[0]
             timing.annotate(decision_source="gap_navigation" if planning_gap else "exploration_auto",
@@ -525,6 +584,31 @@ class MCPAgent:
         print(f"action_sequence_step index={view['step_index'] + 1}/{len(view['steps'])} id={step_id} choice={choice}")
         await self.perform(choice, packet, sequence_step=step_id)
 
+    async def handle_thermal(self, packet):
+        state,actions=packet["state"],packet["actions"]
+        if not heat_risk(state) or any(e.get("activeThreat") for e in state.get("nearby",[])):
+            return False
+        self.goals.pause_accounting()
+        self.goals.needs_safety_decision=False
+        # Release a legacy automatic board before issuing a host safety action.
+        if self.execute and self.auto_enabled:
+            await self.sync_board(None,False)
+            packet=await self.observe()
+            state,actions=packet["state"],packet["actions"]
+            if not heat_risk(state) or any(e.get("activeThreat") for e in state.get("nearby",[])):
+                return False
+        if state.get("bridge",{}).get("executor_busy"):
+            await asyncio.sleep(self.poll)
+            return True
+        choice="cool_down" if "cool_down" in actions else "equip_torch" if "equip_torch" in actions else None
+        timing.annotate(decision_source="thermal_safety" if choice else "thermal_holding",safety_reasons=["thermal_warning"])
+        if choice:
+            print(f"thermal_safety temperature={state['player']['vitals'].get('temperature')} choice={choice}")
+            await self.perform(choice,packet,safety=True)
+        else:
+            await asyncio.sleep(self.poll)
+        return True
+
     async def handle_safety(self, packet, owner, source, *, light_changed=False):
         state, actions = packet["state"], packet["actions"]
         reasons = survival_dangers(state)
@@ -555,7 +639,7 @@ class MCPAgent:
         self.deferred_safety = signature if choice in {None, "wait"} else None
         if choice is not None:
             owner.needs_safety_decision = False
-            await self.perform(choice, offered)
+            await self.perform(choice, offered, safety=True)
         return True
 
     async def run_priority_board(self, packet):
@@ -565,6 +649,8 @@ class MCPAgent:
             return
         if packet.get("state_age_ms", 0) > 1000:
             packet = await self.observe(refresh=True)
+        if await self.handle_thermal(packet):
+            return
         if not is_priority_board(self.plan):
             return
         state, actions = packet["state"], packet["actions"]
@@ -578,6 +664,8 @@ class MCPAgent:
         selected = self.goals.choose(self.plan, state, actions, self.navigator)
         if selected:
             task, choice, action = selected
+            if action.get("coordinate_target"):
+                packet = {**packet,"actions":{**packet["actions"],choice:action}}
             self.goal_gap_marker = None
             # New resources may reschedule board work, but never request an
             # off-board model decision. JEV owns only safety and planning gaps.
@@ -590,12 +678,31 @@ class MCPAgent:
             return
         self.goals.pause_accounting()
         reason = "no_tasks" if not self.plan.get("tasks") else self.goals.reason or "no_feasible_action_or_route"
+        if reason in {"residence_holding", "refuel_settling", "maintenance_holding"}:
+            timing.annotate(decision_source="residence_idle" if reason=="residence_holding" else reason,goal_reason=reason)
+            await asyncio.sleep(self.poll)
+            return
+        if reason == "waiting_for_start":
+            timing.annotate(goal_reason=reason)
+            await self.run_local_control(packet,planning_gap=True)
+            return
         marker = (self.board_id(self.plan), reason)
         first_gap = marker != self.goal_gap_marker
         self.goal_gap_marker = marker
         if isinstance(self.planner, DailyPlanner):
             with timing.span("planner.update"):
-                self.plan = self.planner.request_review(state, reason, immediate=first_gap)
+                if idle_review_reason(self.goals.view(self.plan, state)):
+                    # DailyPlanner owns idle-board review deduplication, including
+                    # across accepted revisions that still have nothing runnable.
+                    self.plan = self.planner.update(state)
+                else:
+                    self.plan = self.planner.request_review(state, reason, immediate=first_gap)
+        if is_priority_board(self.plan) and (self.goals.view(self.plan, state).get("focus_task_ids") or self.goals.residence):
+            # A blocked focused goal is still exclusive while DeepSeek reviews
+            # it or its search budget cools down. Safety was handled above.
+            timing.annotate(goal_reason=reason, decision_source="focus_pending")
+            await asyncio.sleep(self.poll)
+            return
         if first_gap:
             print(f"task_board_handoff reason={reason} controller=jev_planning_gap")
         timing.annotate(goal_reason=reason)

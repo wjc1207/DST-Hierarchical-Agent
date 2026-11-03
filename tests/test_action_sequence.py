@@ -19,7 +19,7 @@ def state(**counts):
                        "vitals": {"health": 150, "hunger": 100, "hunger_max": 150},
                        "inventory": {"items": [{"prefab": k, "count": v} for k, v in counts.items()], "equipped": []}},
             "navigation": {"graph": {"current_node": "A", "known_nodes": 2,
-                                     "current": {"explored_area": 100, "boundary_complete": False}, "routes": []}},
+                                     "current": {"observed_cells": 6, "boundary_complete": False}, "routes": []}},
             "nearby": [], "crafting": {}}
 
 
@@ -72,14 +72,14 @@ class SequenceTests(unittest.TestCase):
         self.assertEqual(executor.view(sequence, s)["status"], "completed")
 
     def test_local_survey_and_new_region_search_have_bounded_distinct_completion(self):
-        for action, field, increment in (("explore_current_region", "explored_area", 256),
+        for action, field, increment in (("explore_current_region", "observed_cells", 16),
                                           ("explore_other_region", "known_nodes", 1)):
             with self.subTest(action=action):
                 executor = SequenceExecutor()
                 sequence = plan({"action": action})
                 s = state(); executor.view(sequence, s)
                 graph = s["navigation"]["graph"]
-                subject = graph["current"] if field == "explored_area" else graph
+                subject = graph["current"] if field == "observed_cells" else graph
                 subject[field] += increment - 1
                 self.assertEqual(executor.view(sequence, s)["status"], "active")
                 subject[field] += 1

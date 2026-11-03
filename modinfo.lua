@@ -3,7 +3,7 @@ description = [[
 Exports the local player's structured state to client_log.txt and accepts
 semantic actions from the local JEV controller.
 ]]
-author = "Local JEV Agent"
+author = "Retard Wang"
 version = "1.8.8"
 
 icon_atlas = "modicon.xml"
@@ -19,16 +19,16 @@ server_filter_tags = {}
 configuration_options =
 {
     {
-        name = "sample_interval",
-        label = "Sample interval",
-        hover = "Seconds between state records written to client_log.txt.",
+        name = "performance_interval",
+        label = "Performance log interval",
+        hover = "Seconds between compact client FPS summaries; full state dumps are disabled.",
         options =
         {
-            { description = "0.5 seconds", data = 0.5 },
-            { description = "1 second", data = 1.0 },
             { description = "2 seconds", data = 2.0 },
+            { description = "5 seconds", data = 5.0 },
+            { description = "10 seconds", data = 10.0 },
         },
-        default = 1.0,
+        default = 5.0,
     },
     {
         name = "scan_radius",

@@ -264,7 +264,7 @@ class BoardTests(unittest.TestCase):
             def __exit__(self, *_args): return False
             def read(self): return b'{"answers":{"next_action":{"choice":"wait","confidence":1}}}'
         board, actual = validate_board(raw_board(), 1), state([])
-        criteria = {"wait": "Wait", "explore_current_region": "Explore"}
+        criteria = {"wait": "Wait", "explore_current_region": "Explore", "build_sciencemachine": "Build science"}
         with patch.object(jev_agent.urllib.request, "urlopen", return_value=Response()) as send:
             jev_agent.call_jev("https://example.invalid", "secret", "jev", actual, criteria, board)
         body = json.loads(send.call_args.args[0].data)

@@ -121,7 +121,7 @@ The legacy scheduler accepts `steps`, not priority-sorted `tasks`:
   {"id":"grass","action":"collect","prefab":"cutgrass","count":2},
   {"id":"twigs","action":"collect","prefab":"twigs","count":2},
   {"id":"torch","action":"craft","prefab":"torch","count":1},
-  {"id":"survey","action":"explore_current_region","area":256}
+  {"id":"survey","action":"explore_current_region","cells":16}
 ]}
 ```
 
@@ -139,7 +139,9 @@ pickaxe, torch), `build {prefab}` (campfire, sciencemachine),
 items), `equip_torch`, `unequip_torch`, and bounded `wait {seconds:1..30}`.
 `travel_region {node_id}` requires actual entry into an observed topology node,
 not a display index or historical entered flag. `explore_current_region {area}`
-requires additional observed area (default 256), or a fully surveyed boundary.
+requires additional observed map cells (default 16, range 1-256), or a fully surveyed boundary.
+Each cell is 4x4 world units; old area values are divided by 16 on import, so area
+512 becomes 32 cells. Use `cells` in new tasks; combining `cells` and `area` is invalid.
 `explore_other_region {new_regions}` discovers new nodes (default 1), not merely
 another already-known region.
 
@@ -490,3 +492,22 @@ actions/replication in the actual updated game client.
 `python -m unittest discover -s tests -p test_mcp_agent.py -v` covers fake-model
 autonomous handoffs, Mod-owned feasibility, lifecycle changes, board acknowledgements
 and shutdown.
+
+
+## Fire refueling
+
+`add_fuel(building_id,fuel_prefab,observation_id)` queues one native fuel addition
+to a nearby observed campfire/firepit, including relighting an extinguished firepit.
+Priority boards accept `refuel` targets with `building_id`, explicit common
+`fuel_prefab`, and `count:1..10` (default 1). Travel and fuel collection are explicit
+prerequisites; progress counts verified additions. Python scheduling is required.
+JEV options are unchanged. See [refueling details](REFUELING.md).
+
+
+## Camp placement constraints
+
+Structure targets accept `placement:{anchor_id:building:<GUID>,radius:4..20}`
+(default 10). The scheduler visits the anchor before construction. Native placement
+and completion must remain inside that area; distant identical buildings do not
+satisfy the goal. `start_action` accepts the same optional policy for building
+actions. Updated Lua and Python scheduling are required; see [placement](PLACEMENT.md).

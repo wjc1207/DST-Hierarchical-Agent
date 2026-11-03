@@ -26,7 +26,7 @@ def state(**items):
                        "vitals": {"hunger": 100, "hunger_max": 150, "health": 150},
                        "inventory": {"items": [{"prefab": p, "count": n, "durability_percent": 1} for p, n in items.items()], "equipped": []}},
             "nearby": [], "navigation": {"graph": {"current_node": "A:FlowerPatch",
-                "known_nodes": 2, "current": {"id": "A:FlowerPatch", "explored_area": 64}, "routes": []}}}
+                "known_nodes": 2, "current": {"id": "A:FlowerPatch", "observed_cells": 4}, "routes": []}}}
 
 
 def collect(product, prefab="grass", guid=1):
@@ -38,6 +38,105 @@ NAV = {"explore_current_region": {"kind": "explore", "mode": "region", "x": 4, "
 
 
 class GoalTests(unittest.TestCase):
+    def test_focus_validation_and_patch_promotes_demotes_without_resetting_progress(self):
+        for bad in (1, "true", None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                board(task("grass", "cutgrass", focus=bad))
+        with self.assertRaises(ValueError):
+            board(*(task(str(i), "cutgrass", count=i+1, focus=True) for i in range(3)))
+        old = board(task("grass", "cutgrass", focus=True), task("twigs", "twigs", focus=True))
+        with self.assertRaises(ValueError):
+            merge_goals(old, board(task("flint", "flint", focus=True)))
+        incoming = board(task("grass", "cutgrass", focus=False), task("flint", "flint", focus=True))
+        merged = merge_goals(old, incoming)
+        modes = {t["id"]: t["focus"] for t in merged["tasks"]}
+        self.assertEqual(modes, {"grass": False, "twigs": True, "flint": True})
+        runtime = PriorityBoardExecutor()
+        runtime.view(old, state(cutgrass=2))
+        runtime.adopt(merged)
+        self.assertEqual(next(t for t in runtime.view(merged, state())["tasks"] if t["id"] == "grass")["status"], "done")
+
+    def test_focus_excludes_local_detours_and_watches_only_its_prerequisite_closure(self):
+        goals = board(task("torch", "torch", count=1, focus=True, depends_on=["grass"]),
+                      task("grass", "cutgrass", priority=4, depends_on=["twigs"]),
+                      task("twigs", "twigs", priority=5), task("flint", "flint"))
+        runtime = PriorityBoardExecutor(); s = state(); nav = ExplorationExecutor()
+        actions = {**NAV, "flint": collect("flint", "flint"), "twigs": collect("twigs", "sapling")}
+        self.assertEqual(runtime.choose(goals, s, actions, nav)[0]["id"], "twigs")
+        self.assertEqual(runtime.navigation_targets(goals, s), [{"type":"inventory", "prefab":"twigs", "count":2}])
+        del actions["twigs"]
+        self.assertEqual(runtime.choose(goals, s, actions, nav)[0]["id"], "twigs")
+        self.assertEqual(runtime.selected, "twigs", "visible ordinary flint must not preempt focus navigation")
+
+    def test_two_focus_goals_can_advance_and_release_when_both_complete(self):
+        goals = board(task("grass", "cutgrass", focus=True), task("twigs", "twigs", priority=2, focus=True),
+                      task("flint", "flint", priority=3))
+        runtime = PriorityBoardExecutor(); nav = ExplorationExecutor()
+        actions = {**NAV, "twigs": collect("twigs", "sapling"), "flint": collect("flint", "flint")}
+        self.assertEqual(runtime.choose(goals, state(), actions, nav)[0]["id"], "twigs")
+        self.assertEqual(runtime.choose(goals, state(cutgrass=2, twigs=2), actions, nav)[0]["id"], "flint")
+
+    def test_focus_review_cancels_an_ordinary_route_even_if_its_goal_is_still_ready(self):
+        ordinary = board(task("grass", "cutgrass"), task("twigs", "twigs", priority=2))
+        focused = board(task("grass", "cutgrass"), task("twigs", "twigs", priority=2, focus=True))
+        runtime = PriorityBoardExecutor(); s = state()
+        targets = runtime.navigation_targets(ordinary, s)
+        self.assertEqual(runtime.navigation_review_reason(focused, s, "grass", task_signature(ordinary["tasks"][0]), targets),
+                         "goal_changed_or_blocked")
+
+    def test_mode_changes_preserve_search_cost_and_an_existing_cooldown(self):
+        clock = [0.]; runtime = PriorityBoardExecutor(clock=lambda:clock[0]); nav = ExplorationExecutor()
+        ordinary = board(task("grass", "cutgrass", search_budget_seconds=10))
+        focused = board(task("grass", "cutgrass", focus=True, search_budget_seconds=10))
+        s = state(); runtime.adopt(ordinary); runtime.choose(ordinary, s, NAV, nav)
+        clock[0] = 5; runtime.view(ordinary, s); runtime.adopt(focused)
+        self.assertEqual(runtime.view(focused, s)["tasks"][0]["search_spent"]["seconds"], 5)
+        clock[0] = 11; runtime.view(focused, s); runtime.adopt(ordinary)
+        self.assertEqual(runtime.view(ordinary, s)["tasks"][0]["blocked_reason"], "search_budget_exhausted")
+
+    def test_blocked_focus_never_falls_back_to_ordinary_work(self):
+        goals = board(task("torch", "torch", count=1, focus=True), task("flint", "flint"))
+        runtime = PriorityBoardExecutor()
+        self.assertIsNone(runtime.choose(goals, state(), {**NAV, "flint": collect("flint", "flint")}, ExplorationExecutor()))
+        self.assertEqual(runtime.reason, "focused_task_unavailable")
+
+    def test_distance_budget_cools_down_then_retries_without_board_revision(self):
+        clock = [0.]; runtime = PriorityBoardExecutor(clock=lambda: clock[0]); nav = ExplorationExecutor()
+        s = state(); goals = board(task("grass", "cutgrass", focus=True, search_budget_seconds=300, search_budget_distance=8))
+        runtime.choose(goals, s, NAV, nav)
+        clock[0] = 2; s["player"]["position"]["x"] = 9
+        view = runtime.view(goals, s)
+        self.assertEqual(view["tasks"][0]["blocked_reason"], "search_budget_exhausted")
+        self.assertIsNone(runtime.choose(goals, s, NAV, nav))
+        self.assertEqual(runtime.reason, "search_budget_cooldown")
+        self.assertIn(("A:FlowerPatch", "cutgrass"), nav.deferred_sources)
+        clock[0] = 18
+        self.assertIsNotNone(runtime.choose(goals, s, NAV, nav))
+        t = runtime.view(goals, s)["tasks"][0]
+        self.assertEqual(t["search_retry"]["attempt"], 2)
+        self.assertEqual(t["search_spent"]["distance"], 0)
+        self.assertEqual(t["search_retry"]["total_distance"], 9)
+
+    def test_new_local_source_resumes_during_budget_cooldown(self):
+        clock = [0.]; runtime = PriorityBoardExecutor(clock=lambda: clock[0]); nav = ExplorationExecutor()
+        s = state(); goals = board(task("grass", "cutgrass", focus=True, search_budget_seconds=10))
+        runtime.choose(goals, s, NAV, nav); clock[0] = 11
+        runtime.view(goals, s)
+        self.assertEqual(runtime.choose(goals, s, {"grass": collect("cutgrass")}, nav)[1], "grass")
+        self.assertEqual(runtime.view(goals, s)["tasks"][0]["search_retry"]["attempt"], 2)
+
+    def test_place_route_is_not_a_local_opportunity_that_bypasses_budget_cooldown(self):
+        clock = [0.]; runtime = PriorityBoardExecutor(clock=lambda:clock[0])
+        goals = board({"id":"visit", "title":"Visit science", "focus":True, "search_budget_distance":8,
+                       "target":{"type":"visit_building", "building_id":"building:1"}})
+        actions = {"visit": {"kind":"explore", "mode":"graph", "planner_only":True, "building_id":"building:1"}}
+        s = state(); nav = ExplorationExecutor()
+        s["places"] = {"buildings":[{"id":"building:1", "status":"unconfirmed", "arrived":False}]}
+        self.assertEqual(runtime.choose(goals, s, actions, nav)[1], "visit")
+        s["player"]["position"]["x"] = 9; clock[0] = 2
+        self.assertIsNone(runtime.choose(goals, s, actions, nav))
+        self.assertEqual(runtime.reason, "search_budget_cooldown")
+
     def test_navigation_targets_include_all_ready_local_goals_but_not_done_or_blocked(self):
         goals = board(task("gold","goldnugget"), task("grass","cutgrass",priority=2),
                       task("twigs","twigs",depends_on=["grass"]), task("logs","log"),
@@ -66,7 +165,7 @@ class GoalTests(unittest.TestCase):
         targets = runtime.navigation_targets(goals,s); signature = task_signature(goals["tasks"][0])
         runtime.navigation, runtime.navigation_mode, runtime.selected = True, "region", "gold"
         runtime.last_tick = 0
-        runtime.room_search[("gold","A:FlowerPatch")] = {"seconds":0.,"area":64}
+        runtime.room_search[("gold","A:FlowerPatch")] = {"seconds":0.,"cells":4}
         self.assertIsNone(runtime.navigation_review_reason(goals,s,"gold",signature,targets))
         clock[0] = 30
         self.assertEqual(runtime.navigation_review_reason(goals,s,"gold",signature,targets),"room_search_budget")
@@ -174,15 +273,15 @@ class GoalTests(unittest.TestCase):
         self.assertFalse(runtime.records["grass"]["done"])
         self.assertEqual(runtime.view(goals,state())["status"],"active")
 
-    def test_survey_means_additional_area_and_navigates_only_current_region(self):
+    def test_survey_means_additional_cells_and_navigates_only_current_region(self):
         goals=validate_goals({"goal":"Survey","tasks":[{"id":"survey","title":"Survey",
-            "target":{"type":"survey_region","node_id":"A:FlowerPatch","area":64}}]},1)
-        s=state(); s["navigation"]["graph"]["current"]["explored_area"]=1000
+            "target":{"type":"survey_region","node_id":"A:FlowerPatch","cells":4}}]},1)
+        s=state(); s["navigation"]["graph"]["current"]["observed_cells"]=62
         runtime=PriorityBoardExecutor(); nav=ExplorationExecutor()
         self.assertEqual(runtime.view(goals,s)["status"],"active")
         self.assertEqual(runtime.choose(goals,s,NAV,nav)[1],"explore_current_region")
         self.assertEqual(nav.strategy,"board_survey")
-        s["navigation"]["graph"]["current"]["explored_area"]=1064
+        s["navigation"]["graph"]["current"]["observed_cells"]=66
         self.assertEqual(runtime.view(goals,s)["status"],"completed")
 
     def test_long_graph_transit_does_not_consume_local_room_survey_budget(self):
@@ -214,6 +313,25 @@ class GoalTests(unittest.TestCase):
         self.assertEqual({t["id"] for t in reviewed["tasks"]}, {"grass", "gold"})
         raw = {"goal": "Cancel gold because unreachable", "tasks": [task("grass", "cutgrass")], "cancel_task_ids": ["gold"]}
         self.assertEqual(len(merge_goals(reviewed, validate_goals(raw, 1))["tasks"]), 1)
+
+    def test_review_retires_unreferenced_completed_tasks_to_make_room(self):
+        old = board(task("grass", "cutgrass"), task("twigs", "twigs"), task("axe", "axe", count=1), task("rocks", "rocks"))
+        for t in old["tasks"][:3]:
+            t["status"] = "done"
+        incoming = board(task("rocks", "rocks"), task("flint", "flint"), task("gold", "goldnugget"),
+                         task("logs", "log"), task("food", "berries"), task("carrot", "carrot"))
+        merged = merge_goals(old, incoming)
+        self.assertEqual(len(merged["tasks"]), 6)
+        self.assertEqual({t["id"] for t in merged["tasks"]}, {t["id"] for t in incoming["tasks"]})
+
+    def test_review_keeps_completed_prerequisites_and_rejects_unfinished_overflow(self):
+        old = board(task("grass", "cutgrass"), task("torch", "torch", count=1, depends_on=["grass"]))
+        old["tasks"][0]["status"] = "done"
+        merged = merge_goals(old, board(task("flint", "flint")))
+        self.assertIn("grass", {t["id"] for t in merged["tasks"]})
+        incoming = board(*(task(str(i), "log", count=i+1) for i in range(6)))
+        with self.assertRaisesRegex(ValueError, "Merged task board.*cancel_task_ids"):
+            merge_goals(old, incoming)
 
     def test_source_route_failure_does_not_block_goal_and_skips_failed_choice(self):
         runtime = PriorityBoardExecutor(); goals = board(task("grass", "cutgrass")); nav = ExplorationExecutor(); s = state()
@@ -330,6 +448,77 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(p.executor.calls[-1][4]["replan_reason"], "all_tasks_completed")
         self.assertEqual(p.executor.calls[-1][4]["current_task_board"]["tasks"][0]["status"], "done")
+
+    def test_scheduled_and_mixed_idle_boards_review_immediately(self):
+        cases = [
+            ([task("later", "twigs", start_at={"day": 1, "progress": .7})],
+             "only_scheduled_tasks", ["scheduled"]),
+            ([task("done", "cutgrass"), task("later", "twigs", start_at={"day": 1, "progress": .7})],
+             "only_scheduled_tasks", ["done", "scheduled"]),
+            ([task("later", "twigs", start_at={"day": 1, "progress": .7}),
+              task("dependent", "flint", depends_on=["later"])],
+             "no_actionable_tasks", ["blocked", "scheduled"]),
+            ([task("done", "cutgrass"), task("later", "twigs", start_at={"day": 1, "progress": .7}),
+              task("dependent", "flint", depends_on=["later"])],
+             "no_actionable_tasks", ["blocked", "done", "scheduled"]),
+        ]
+        for tasks, reason, statuses in cases:
+            with self.subTest(reason=reason, statuses=statuses):
+                p = self.planner(); p.plan = board(*tasks)
+                p.requested_slot = (1, 0); p.goal_retry_at = 999
+                with patch.object(daily_planner.time, "monotonic", return_value=100):
+                    view = p.update(state(cutgrass=2))
+                    for _ in range(3):
+                        p.update(state(cutgrass=2))
+                self.assertEqual(len(p.executor.calls), 1)
+                context = p.executor.calls[0][4]
+                self.assertEqual(context["replan_reason"], reason)
+                self.assertEqual(sorted(t["status"] for t in view["tasks"]), statuses)
+                self.assertEqual(context["current_task_board"], view)
+
+    def test_ready_work_prevents_idle_review(self):
+        p = self.planner(); p.plan = board(task("now", "cutgrass"),
+            task("later", "twigs", start_at={"day": 1, "progress": .7}))
+        p.requested_slot = (1, 0)
+        with patch.object(daily_planner.time, "monotonic", return_value=100):
+            p.update(state())
+        self.assertEqual(p.executor.calls, [])
+
+    def test_idle_response_acknowledges_wait_across_revisions_and_telemetry(self):
+        p = self.planner()
+        tasks = [task("later", "twigs", start_at={"day": 1, "progress": .7}),
+                 task("dependent", "flint", depends_on=["later"])]
+        p.plan = board(*tasks); p.requested_slot = (1, 0)
+        with patch.object(daily_planner.time, "monotonic", return_value=100):
+            p.update(state())
+            p.executor.futures[0].set_result((board(*tasks), .5, None))
+            adopted = p.update(state())
+        self.assertNotEqual(adopted["board_id"], "goals:1")
+        later = state(); later["observed_at"] = 2; later["world"]["time"] = .2
+        with patch.object(daily_planner.time, "monotonic", return_value=200):
+            p.update(later)
+        self.assertEqual(len(p.executor.calls), 1)
+        # When the schedule opens, normal execution re-arms the idle transition.
+        later["world"]["time"] = .8; p.requested_slot = (1, 3)
+        p.update(later)
+        self.assertIsNone(p.goal_terminal)
+        later["player"]["vitals"]["dead"] = True
+        p.update(later)
+        self.assertEqual(len(p.executor.calls), 2)
+        self.assertEqual(p.executor.calls[-1][4]["replan_reason"], "search_or_prerequisite_blocked")
+
+    def test_scheduled_review_failure_keeps_backoff(self):
+        p = self.planner(); p.plan = board(task("later", "twigs", start_at={"day": 1, "progress": .7}))
+        p.requested_slot = (1, 0)
+        with patch.object(daily_planner.time, "monotonic", return_value=100):
+            p.update(state())
+            p.executor.futures[0].set_result((None, .5, RuntimeError("offline failure")))
+            p.update(state()); p.update(state())
+            self.assertEqual(len(p.executor.calls), 1)
+            self.assertEqual(p.goal_replan_reason, "review_retry")
+        with patch.object(daily_planner.time, "monotonic", return_value=116):
+            p.update(state())
+        self.assertEqual(len(p.executor.calls), 2)
 
     def test_unavailable_board_review_is_immediate_deduplicated_and_keeps_error_backoff(self):
         p = self.planner(); p.plan = board({"id":"campfire","title":"Night fire",

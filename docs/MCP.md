@@ -53,13 +53,15 @@ python .\mcp_agent\mcp_agent.py --loop --execute
 
 按 `Ctrl+C` 停止，程序请求取消并等待确认；来不及确认则依赖服务关闭后的 3 秒租约停止。不要把关窗口等同于立即停止角色。终端输出 `TASK BOARD`、`task_board_action`、`lua_action`、`mcp_cycle` 和规划预览；细分时序保存在 `logs/mcp_timing.jsonl`，新规划保存在 `logs/task_board.json` 与 `logs/task_board.jsonl`。旧动作序列日志不代表当前活动规划。旧键鼠控制链及预测缓冲已移除。
 
+科学机器建造仅由 DeepSeek 看板或显式 MCP 指令发起，不进入 JEV 候选；规划空窗期也不会让 JEV 自行再造科学机器。其他原有本地动作保持不变。
+
 ## 优先级看板与资源导航（1.8.7）
 
-DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priority_goals`。每项有优先级、可验证目标、依赖和搜索预算。先完成视野内可执行任务，再为最高优先级的未完成任务导航；采草和采石头可以交错完成，不再被数组顺序锁死。
+DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priority_goals`。每项有优先级、可验证目标、依赖、搜索预算和 `focus` 布尔字段（默认 `false`，最多两个 `true`）。没有未完成专注任务时，先完成视野内可执行任务，再为最高优先级任务导航，允许顺路完成低优先级任务。有专注任务时，只执行专注任务及其未完成的递归前置任务，寻路也只因这些任务的可行动机会而让出；专注暂时受阻仍保留控制权，安全处置始终优先。提交同 ID 任务时设置 `focus: true/false` 可升降级，遗漏任务保留原模式，完成全部专注任务后恢复普通调度。
 
 导航顺序：记忆中的具体资源位置 → 实际记录过来源的区域 → Klei 生成配置支持该资源的已知区域 → 未知分支。区域以拓扑 ID 区分，不以地皮切分；已知路线按 BFS 跳数和入口距离排序（不是全程精确最短距离）。资源记忆只来自实际观察，不读取未探索地图里的实体。完整扫描确认消失、已采集和重新生长会更新记忆；截断扫描不会把遗漏实体当作消失。
 
-每任务搜索预算默认 120 秒／240 单位，范围分别为 10–600 秒和 8–2000 单位，只在导航时累计。区域内搜索达到 30 秒或新增 256 面积时，降低该资源在该区域的优先级，不禁止其他资源或过境。普通路线失败暂停重试，不直接使整个任务失败。每 1/4 天后台复核并合并更新，遗漏不代表取消；使用 `cancel_task_ids` 明确取消。已完成任务锁存，不因材料被消耗而重启。跨季度回复按当前玩家会话及实际状态验证，不仅因为时间跨界而丢弃。
+每任务搜索预算默认 120 秒／240 单位，范围分别为 10–600 秒和 8–2000 单位，只在导航时累计；时间或距离任一达到上限都会进入 15 秒冷却，之后自动恢复搜索，新出现的可执行本地目标可提前恢复。重试保留探索及失败记忆，暂缓当前／原定来源区域 45 秒以尝试其他来源；日志 `search_retry` 记录轮次、冷却和累计成本。区域内搜索达到 30 秒或新增 256 面积时，降低该资源在该区域的优先级，不禁止其他资源或过境。普通路线失败暂停重试，不直接使整个任务失败；同一目标／目的地区域在 60 秒内连续入口失败两次后暂避该目的地 30 秒。新发现的具体资源位置优先于保留的区域先验意图；仅发现新区域不会停止看板行走。每 1/4 天后台复核并合并更新，遗漏不代表取消；使用 `cancel_task_ids` 明确取消。已完成任务锁存，不因材料被消耗而重启。跨季度回复按当前玩家会话及实际状态验证，不仅因为时间跨界而丢弃。
 
 完整 JSON 格式、约束、搜索预算和更新文件见 [Goal scheduling and navigation](GOAL_NAVIGATION.md)。请同步新增的 `mcp_agent/priority_board.py`、`mcp_agent/region_resources.py`、`data/worldgen_resources.json`、`scripts/jev_resource_memory.lua`，以及更新后的 Python 文件、`modmain.lua`、`scripts/jev_exploration.lua`、`scripts/jev_native_executor.lua` 和 `modinfo.lua`，重新进入世界并重启 Python。保留原 `.env`、桥接令牌和 `scripts/jev_bridge_config.lua`。协议仍为 4，不需要重新生成令牌。
 
@@ -77,7 +79,7 @@ DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priorit
     {"id": "grass", "action": "collect", "prefab": "cutgrass", "count": 2},
     {"id": "twigs", "action": "collect", "prefab": "twigs", "count": 2},
     {"id": "torch", "action": "craft", "prefab": "torch", "count": 1},
-    {"id": "survey", "action": "explore_current_region", "area": 256}
+    {"id": "survey", "action": "explore_current_region", "cells": 16}
   ]
 }
 ```
@@ -136,10 +138,19 @@ python .\mcp_server\mcp_server.py --bridge-only
 
 ## 工具
 
+性能优化、帧率统计与日志格式见 [性能说明](PERFORMANCE.md)。
+
+建筑记忆、前往建筑、设置家和返回家见 [地点与家](PLACES.md)。
+
+新增 DeepSeek 侧配方查询与通用制作／放置，详见 [配方说明](RECIPES.md)。JEV 候选保持原有范围。
+
 | 工具 | 含义 |
 | --- | --- |
 | `get_state(refresh=false)` | 最新事件快照及其实际年龄；`refresh=true` 按需请求新快照，最多等待 3 秒；连接断开时报错 |
 | `get_available_actions(refresh=false)` | 缓存游戏事实与动作、快照年龄、最新控制状态及短期 `observation_id`；`refresh=true` 等 Mod 上传新快照 |
+| `query_places(query="", building_id=null, offset=0, limit=12, refresh=false)` | 分页查询建筑记忆、当前家和合法落脚点；只读 |
+| `add_fuel(building_id, fuel_prefab, observation_id)` | 给附近营火／石头火堆添加一份指定常用燃料，返回动作 ID；DS 看板可用 `refuel` 的 `at_least` 比例目标及可选 `duration` 维护燃料，详见 [添燃料](REFUELING.md) |
+| `query_recipes(query="", recipe_id=null, offset=0, limit=12, refresh=false)` | 分页查询当前快照的配方、材料缺口、科技与支持状态；只读 |
 | `start_action(choice, observation_id)` | 排队执行一个已提供动作；返回 `action_id`，不是完成证明 |
 | `get_action_status(action_id)` | 查询状态、原因及连接状态 |
 | `cancel_action(action_id)` | 请求取消，需等 Lua 确认，不提前声称已经停止 |
@@ -160,7 +171,7 @@ python .\mcp_server\mcp_server.py --bridge-only
 - 基于可通行逃跑候选的有界撤离；“没有可见锁定敌人”不等于证明敌人已永久消除仇恨。
 - 看板默认只保存；显式启用后自动执行视野内的采集、制作、进食和建造任务。通过重新提交 `auto_execute=false` 的看板暂停；活动的看板动作会停止。
 
-**尚未把完整 DFS/BFS 和历史来源失败记忆迁到 Lua**：自带控制程序暂时复用 Python 意图选择器，经 MCP 交给 Lua 行走，不依赖键鼠控制。攻击／装备武器、自动工具前置链、炼金引擎动作尚未提供；Lua 看板遇到缺失来源／需导航／不支持的任务交回外部控制程序，而不是自己请求模型。可用动作不接受任意 Lua 代码、文件路径或自定义坐标。
+**尚未把完整 DFS/BFS 和历史来源失败记忆迁到 Lua**：自带控制程序暂时复用 Python 意图选择器，经 MCP 交给 Lua 行走，不依赖键鼠控制。攻击／装备武器、自动工具前置链尚未提供；炼金引擎等普通建筑可由通用配方动作执行，仍需显式规划材料和科技；Lua 看板遇到缺失来源／需导航／不支持的任务交回外部控制程序，而不是自己请求模型。可用动作不接受任意 Lua 代码、文件路径或自定义坐标。
 
 ## 安全与时序
 
@@ -198,7 +209,7 @@ Lua 游戏时钟、服务时钟和宿主时钟不互相相减。各字段可能�
 | JEV 后台线程 | `worker_queue_ms`、状态／请求编码、`api.response_headers`、`api.read_body`、`api.parse_response` |
 | 宿主发现模型结果 | `decision.result_observed.result_ready_to_notice_ms` |
 
-Lua 采用已从本机游戏脚本确认单位的 `GetTimeRealSeconds`（或 `GetTimeReal()/1000`），不再用帧内不前进的 `GetTime()` 计 CPU／请求耗时。没有实时时钟则标记 `unavailable`。`query_call_ms` 是原生 API 返回前的同步调用时间；`query_to_callback_ms` 是调用到 Lua 回调入口，**仍包含引擎排队、实际 HTTP 与回调派发，不能独立称为网络延迟**。回调解码和控制派发另计。
+Lua 优先采用原版 profiler 使用的高精度 `walltime`，回退到 `GetTimeRealSeconds`（或 `GetTimeReal()/1000`），不再用帧内不前进的 `GetTime()` 计 CPU／请求耗时。没有实时时钟则标记 `unavailable`。`query_call_ms` 是原生 API 返回前的同步调用时间；`query_to_callback_ms` 是调用到 Lua 回调入口，**仍包含引擎排队、实际 HTTP 与回调派发，不能独立称为网络延迟**。回调解码和控制派发另计。
 
 HTTP 接收行按 `(server_id, session_id, sequence)` 标识。Lua 编码与回调耗时只有完成后才知道，所以由**下一次请求**的 `lua.previous_exchanges` 补报，保留最近 8 条；按回执自身的 `server_id`／`sequence` 去重并与原 HTTP 行关联，不要误用承载回执那次请求的耗时。结束测试时最后一条回执可能尚未来得及补报。采样每 0.2 秒执行而非每次都发 HTTP，因此 `lua.sampling` 是自上次发送以来的 tick 数和各阶段累计／最大值；`lua.refresh` 是本次发送前的控制状态刷新。
 
@@ -243,6 +254,23 @@ Python 保留会话／玩家变更、死亡停止、观察凭据过期、断线�
 
 ## 验证
 
+探索任务统一使用地图格数：`target={type:"survey_region",node_id:"已知区域",cells:32}`。
+每格为 4×4 世界单位，因此旧的 512 面积单位等于 32 格；默认 16 格，允许 1–256 格。
+进度显示为 `已新增观察格数/目标格数`，例如 `31/32`，已有观察不计入新任务进度，
+同一格反复经过也不会重复计数。达到目标代表完成这一轮探查，不代表整个区域探完。
+旧 `area` 参数自动除以 16 并向上取整，同时填写 `cells` 与 `area` 会报错。
+状态提供区域 `observed_cells`，不再用放大的 `explored_area`；搜索时间和距离预算不变。
+需要同步更新 Python 与 Lua，重新进入世界并重启控制程序。
+
+新增坐标移动工具 `move_to(x,z,observation_id,arrival_radius=2)`，只接受已观察陆地；
+Lua 复查路线、危险和照明。DS 的按需地图图片查询及建家流程见
+[看图选址与前往坐标](MAP_SELECTION.md)。该能力保留 JEV 候选范围和建筑家锚点。
+
+任务开始时间和驻留使用 Python 优先级调度器，详见 [任务时间与驻留](TASK_TIME.md)。
+`submit_task_board` 返回单任务时间参数错误 `task_errors`；定时看板不能启用原生
+`auto_execute=true`。`start_action` 可附带 `residence={home_id,radius}`，由 MCP 绑定
+当前家的坐标，再由 Lua 复核每个动作步骤；需要 `residence_constraints=true` 能力。
+
 ```powershell
 python .\run_tests.py
 python -m unittest discover -s tests -p test_game_bridge.py -v
@@ -250,3 +278,17 @@ python -m unittest discover -s tests -p test_mcp_agent.py -v
 ```
 
 未装 MCP SDK 时仅跳过真实 MCP 协议测试；其余桥接状态机测试仍运行。安装后会额外验证官方 SDK 工具发现、真实 STDIO 子进程、回环 HTTP、模拟 Lua 消息、取消确认和鉴权。Lua 回归在 `tests/exploration_spec.lua` 中覆盖原生执行与异步回调；可用 Lua/Fengari 运行。所有这些都使用模拟世界，不替代安装新版 Mod 后对游戏内 `QueryServer`、原生移动、采集及服务器复制的实测。
+
+
+## 营地建筑位置约束
+
+结构目标可附带 `placement:{anchor_id:building:<GUID>,radius:4..20}`（默认 10）。
+调度器先前往锚点，Lua 只在范围内放置，完成也按实际建筑位置判断。MCP
+`start_action` 接收同名参数，仅用于建筑动作。详见 [位置约束](PLACEMENT.md)。
+更新 Lua 后重新进入世界；带此约束的看板要求 Python 调度。
+
+
+温度预警、添料暂停、夜间降温避让及相关日志字段见[温度安全与火势控制](THERMAL.md)。`cool_down` 为宿主确定性安全动作，JEV 选项保持不变。
+
+
+`hunger_ratio` 看板任务支持可选任务级 `duration`（游戏天）：达标后为 `maintaining` 并释放执行权，低于目标重新补食，到期达标完成，否则过期。它由 Python 优先级主循环计时，拒绝原生 `auto_execute=true`。详见[任务时间与饥饿维持](TASK_TIME.md)。

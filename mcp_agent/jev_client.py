@@ -6,6 +6,7 @@ import urllib.request
 from typing import Dict, Optional
 from common import timing_log as timing
 from common.task_board import board_view
+from common.game_rules import PLANNER_ONLY_ACTIONS
 from .model_state import model_game_state
 from .navigation_intents import exploration_key
 
@@ -20,6 +21,7 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
         "goal": "Survive indefinitely and steadily improve food, light, tools, resources, and safety.",
         "hard_rules": [
             "Choose only an action listed in the available criteria; unavailable actions cannot be executed.",
+            "Native thermal safety owns cooling movement and may equip a torch beside dangerous heat. Do not override it. Fire proximity does not normally heal health; high temperature requires reducing heat exposure.",
             "During daytime the executor automatically unequips a held torch to save fuel; this does not require your decision.",
             "At night without an equipped torch, exploration and collection are blocked even beside a stationary fire; fleeing an immediate threat is an exception.",
             "A torch can be equipped only at night and only when no lit campfire or firepit is nearby. A campfire can be built only at night when no lit fire is nearby.",
@@ -84,7 +86,7 @@ def call_jev(
     criteria: Dict[str, str], daily_plan: Optional[dict] = None,
 ) -> dict:
     # Also enforce the boundary for direct callers, not only the control loop.
-    criteria = {k: v for k, v in criteria.items() if not exploration_key(k)}
+    criteria = {k: v for k, v in criteria.items() if not exploration_key(k) and k not in PLANNER_ONLY_ACTIONS and not k.startswith("add_fuel:")}
     with timing.span("api.encode_state"):
         state_json = json.dumps(compact_game_state(state, daily_plan), ensure_ascii=False, separators=(",", ":"))
     body = {

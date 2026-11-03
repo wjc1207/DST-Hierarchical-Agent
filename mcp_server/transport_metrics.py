@@ -10,7 +10,7 @@ from pathlib import Path
 LUA_STAGES = {"camera_ms", "entities_ms", "navigation_ms", "collection_paths_ms", "vitals_ms",
               "inventory_ms", "execution_read_ms", "crafting_ms", "control_status_ms",
               "board_ready_ms", "available_actions_ms", "state_total_ms", "native_tick_ms",
-              "board_step_ms", "resource_memory_ms", "campfire_siting_ms", "total_ms"}
+              "board_step_ms", "resource_memory_ms", "campfire_siting_ms", "recipes_ms", "places_ms", "refueling_ms", "thermal_ms", "total_ms"}
 RECEIPT_FIELDS = {"encode_ms", "request_bytes", "response_bytes", "http_status", "query_call_ms",
                   "query_to_callback_ms", "decode_ms", "callback_dispatch_ms"}
 
@@ -24,7 +24,13 @@ def lua_measurements(value, current_sequence):
     """Whitelist a small numeric schema; do not trust diagnostic fields as text."""
     if not isinstance(value, dict):
         return {}
-    result = {"clock": "lua_real_seconds" if value.get("clock") == "lua_real_seconds" else "unavailable"}
+    result = {"clock": value["clock"] if value.get("clock") in {"lua_real_seconds", "lua_walltime_seconds"} else "unavailable"}
+    performance = value.get("performance")
+    if isinstance(performance, dict):
+        result["performance"] = {"available": performance.get("available") is True,
+            "source": "frontend_wall_update" if performance.get("source") == "frontend_wall_update" else "unavailable",
+            **numbers(performance, {"fps", "frame_ms", "max_frame_ms", "p95_frame_ms",
+                                   "frames", "window_seconds", "sampled_at", "age_seconds"})}
     sample = value.get("sampling")
     if isinstance(sample, dict):
         result["sampling"] = {**numbers(sample, {"ticks"}),

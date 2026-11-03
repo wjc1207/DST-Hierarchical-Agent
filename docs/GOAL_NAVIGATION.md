@@ -9,22 +9,34 @@
   "goal": "Gather basic supplies",
   "tasks": [
     {"id":"grass","title":"Gather grass","priority":1,
-     "target":{"type":"inventory","prefab":"cutgrass","count":12},
+     "target":{"type":"inventory","prefab":"cutgrass","count":2},
      "search_budget_seconds":120,"search_budget_distance":240},
     {"id":"stone","title":"Gather rocks","priority":2,
      "target":{"type":"inventory","prefab":"rocks","count":6}},
-    {"id":"torch","title":"Prepare portable light","priority":1,
+    {"id":"twigs","title":"Torch twigs","priority":1,
+     "target":{"type":"inventory","prefab":"twigs","count":2}},
+    {"id":"torch","title":"Prepare portable light","priority":1,"focus":true,
      "target":{"type":"inventory","prefab":"torch","count":1},
-     "depends_on":["grass"],"reason":"Prepare light before night"}
+     "depends_on":["grass","twigs"],"reason":"Minimum light before reserves"}
   ],
   "cancel_task_ids":[]
 }
 ```
 
 One to six tasks; priority 1 is highest. The host adds `kind=task_board`,
-`schema=2`, `execution_policy=priority_goals` and a revision ID. The example's
-torch still needs enough twigs in actual inventory; add a twig goal/dependency
-if not already satisfied. No implicit recipe solver creates prerequisites.
+`schema=2`, `execution_policy=priority_goals` and a revision ID.
+No implicit recipe solver creates prerequisites. Keep urgent minimum ingredients
+separate from optional reserves; a torch must not wait for campfire/spare stock.
+
+Tasks accept `focus: true/false` (default false), with at most **two** focused
+tasks in a submitted or merged board. While any focused task is unfinished,
+only focused tasks and their unfinished transitive prerequisites may run or
+interrupt navigation. Dependencies need not themselves be marked focused.
+Blocked focus stays exclusive during review/cooldown; safety still overrides it.
+When all focused tasks complete, normal opportunistic scheduling resumes.
+Promote/demote a stable task by resubmitting it with `focus: true/false`;
+omitted tasks retain their mode. Existing completion/search progress is retained.
+The CLI marks `[FOCUS]`; logs include `focus_task_ids` and `execution_task_ids`.
 
 Supported targets:
 
@@ -34,7 +46,7 @@ Supported targets:
 | structure | Campfire or Science Machine observed/verified built |
 | hunger_ratio | Observed hunger fraction reaches `at_least` |
 | visit_region | Player actually enters known `node_id`; historical entered flag is insufficient |
-| survey_region | Reveal `area` additional observed area in known `node_id`, or finish its boundary survey |
+| survey_region | Reveal `cells` additional observed passable map cells in known `node_id`, or finish its boundary survey |
 | known_regions | Observed topology-node count reaches absolute `count` |
 
 Completed goals latch from observed state only; consuming ingredients does not
@@ -46,7 +58,8 @@ and emergency lighting remain local safety decisions, not timed wait goals.
 
 ## Scheduling and navigation
 
-1. Scan all ready goals by priority for an offered native collection/work/craft,
+1. Restrict ready goals to the focus/prerequisite scope when focus is active.
+   Otherwise scan all ready goals by priority for an offered native collection/work/craft,
    construction or eating action. A missing priority-1 source does not block a
    visible priority-2 goal. Real dependencies still block dependent tasks.
 2. If none is executable locally, navigate for the first ready navigable goal.
@@ -55,13 +68,14 @@ and emergency lighting remain local safety decisions, not timed wait goals.
    then unknown topology branches. Verified graph destinations are ordered by
    BFS hops and next-exit distance, not an invented exact full-route cost.
 4. Board navigation carries `navigation_targets`: local targets from ALL ready
-   goals, excluding latched completion, unsatisfied dependencies and search blocks.
+   goals in the current execution scope, excluding latched completion, unsatisfied dependencies and search blocks.
    Lua continues through unrelated resource appearances/disappearances. After at
    least four units of displacement, an offered local action that advances a
    still-unmet target yields with `goal_action_available`; this includes pickups,
    sufficient-tool/durability tree or ore work, crafting, construction and food.
    No collectible type-set change is required for tree/ore discovery. The host
-   reselects by board priority without JEV. Region/path events remain in force.
+   reselects by board priority without JEV. New room discovery alone does not stop
+   a board walk; destination, path and safety events remain in force.
    While a walk runs, the host cancels and waits for acknowledgement when the
    goal/ready targets change or existing room/global search budgets require a
    review; continuous movement must not postpone a planner update for 120 seconds.
@@ -119,36 +133,86 @@ entrance and `route_no_progress` / `route_gateway_unavailable`. Room-label chang
 along a committed detour do not reset the progress window. At the fixed crossing
 endpoint, Lua waits up to three seconds for topology confirmation without
 repeated zero-distance walks; expiry reports `region_confirmation_timeout` and
-pauses only that entrance. These interruptions
-do not ban other entrances to the destination or mark its resources exhausted.
+pauses only that entrance. A first failure allows other entrances to that
+destination. Two entrance failures for the same goal/destination within 60 seconds
+defer the destination for 30 seconds so other routes can run, then it becomes
+eligible again. Neither entrance nor destination failures imply exhausted resources.
 
 Per-task navigation budget defaults to 120 seconds / 240 distance units, with
 allowed ranges 10–600 seconds / 8–2000 units. Gathering, planning waits and safety
 handling do not deliberately consume that budget. A per-room resource survey is
-deprioritized after 30 navigation seconds or 256 additional observed area. This is
+deprioritized after 30 navigation seconds or 16 additional observed map cells. This is
 negative evidence for that resource, not a ban on transit or other resources.
 Fresh obtainable evidence can restore a source room's priority.
 
+Exploration uses **grid-cell counts**, not walking steps or world area. Each cell
+is 4x4 world units. A `survey_region` target accepts `cells:1..256`, default 16;
+for example, former `area:512` is now `cells:32`. The priority executor counts
+additional deduplicated observations from the task baseline, not already known
+cells. Progress is displayed as `31/32`; a completed probe does not imply that
+the whole region is explored. `boundary_complete` remains an independent fact.
+
+Older `area` targets are normalized with `ceil(area/16)` into `cells`; supplying
+both fields is rejected. Legacy ordered exploration steps use the same conversion.
+Current Lua region snapshots expose `observed_cells` instead of `explored_area`.
+Python can convert older area snapshots on upgrade and removes area counters from
+model inputs, preventing double scaling. Seconds and route distance budgets retain
+their existing units and values. Update Python/Lua together and restart both the
+world and the Python controller after upgrading.
+
 A transient native failure pauses its exact choice/target for 15 seconds and
 lets routing or another visible goal proceed. It does not terminate the board or
-prove the resource absent. Exhausted task budgets appear as blocked and request
-review; a justified task revision can renew the budget. If no task can currently
-advance, the host immediately requests evaluation and lets JEV take temporary
-local control rather than idling for 15 seconds. Exact-choice failure pauses
-also apply during temporary control. Missing paths are not completion.
+prove the resource absent. Either time OR distance reaching its per-attempt limit
+blocks further navigation for 15 seconds and requests review. Then the search
+automatically retries without requiring a changed board or erasing surveys and
+negative evidence; newly offered local work can resume sooner. Recovery releases
+the retained intent and deprioritizes the current/intended resource room for 45
+seconds, allowing alternate sources/branches first. Exact resource positions
+always outrank a retained room-prior intent. `search_spent` is per attempt;
+`search_retry` reports attempt, remaining cooldown and cumulative seconds/distance.
+
+If no task can currently advance, the host immediately requests evaluation.
+With unfinished focus, it retains control (`focus_pending`) and checks safety
+while waiting for review/retry; without focus, JEV can take temporary local
+control. Exact-choice failure pauses also apply during temporary control.
+Missing paths are not completion.
 
 ## Asynchronous review
 
 Every quarter is a background review opportunity, not an expiry. The active board
 continues while DeepSeek responds. Reviews merge tasks by stable ID/target;
 omitted tasks remain and cancellation requires `cancel_task_ids`. Dependencies are
-revalidated after merge. Completed milestones and unchanged task budgets survive
-reviews. Completed or wholly blocked boards request replanning, throttled to
-avoid a busy request loop. Reply acceptance checks current player/session and
+revalidated after merge. Remaining tasks retain latched completion and unchanged
+search budgets across reviews. A board with every task done, scheduled, failed or
+blocked requests immediate review, including mixed states. Any ready/in-progress
+task prevents this idle-board trigger. Reasons are `all_tasks_completed`,
+`only_scheduled_tasks`, `no_actionable_tasks` (scheduled plus blocked work), or
+`search_or_prerequisite_blocked`. Useful schedules remain while DS plans current
+work, return travel or intentional residence. A reply that still leaves no runnable
+work acknowledges waiting; new board revisions and changing telemetry do not
+immediately trigger another request. Runnable work re-arms this check, and changed
+idle task targets/timing/status can request a fresh review. Quarter reviews remain
+available; failed requests retain the 15-second retry backoff. Reply acceptance checks current player/session and
 observation continuity, not quarter equality; actual progress is re-evaluated.
 
+Completed tasks omitted from a review leave the active board once no remaining
+task depends on them. Explicitly retained completed tasks and completed
+prerequisites stay; unfinished tasks always require explicit cancellation.
+The **merged** board must fit six slots. The planner validates that merge before
+accepting a response; errors include retained IDs and are sent back for one
+bounded corrective retry, with the previous valid board kept on failure.
+
+Query batches execute at most four calls. Excess calls receive tool error
+results so the model can split them into later rounds, instead of aborting the
+whole plan. Eight response rounds and the existing retry bound remain in force.
+Validation failures, query-limit events and adoption/request errors are saved
+to `logs/planner_errors.jsonl` as bounded diagnostic summaries without request
+bodies or credentials.
+
 Missing/empty/completed boards and boards with no feasible offered action or
-route hand control to JEV while DeepSeek evaluates and updates the goals. Only
+route hand control to JEV while DeepSeek evaluates and updates the goals, unless
+unfinished focus reserves control. A focus promoted during a pending optional
+JEV request discards that response, even if the focused task is blocked. Only
 one DeepSeek request runs at a time; failed requests retain the 15-second retry
 backoff while local control continues. Useful future goals remain on the board.
 Temporary navigation uses free exploration rather than a currently unexecutable

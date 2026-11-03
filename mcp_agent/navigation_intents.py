@@ -28,7 +28,8 @@ FOOD_SEARCH_PRODUCT = "safe_food"
 
 def local_candidates(criteria, dispatch):
     """Keep all navigation choices out of local model arbitration."""
-    actions = {k: a for k, a in dispatch.items() if a["kind"] != "explore"}
+    actions = {k: a for k, a in dispatch.items() if a["kind"] != "explore" and not a.get("planner_only")
+               and k not in rules.PLANNER_ONLY_ACTIONS}
     return {k: v for k, v in criteria.items() if k in actions}, actions
 
 
@@ -42,7 +43,7 @@ def dispatch_for_navigation(actions, state):
     return {key: {**a, "navigation_mode": a.get("mode"), "target_node_id": a.get("node_id"),
                   "search_region_id": region if a.get("mode") == "search" else None,
                   "target_x": a.get("x"), "target_z": a.get("z")}
-            for key, a in actions.items() if a["kind"] == "explore"}
+            for key, a in actions.items() if a["kind"] == "explore" and not a.get("planner_only")}
 
 
 def sources_for(product):
@@ -100,6 +101,9 @@ class ExplorationExecutor:
         self.visited = set()
         self.closed = set()
         self.deferred_rooms = {}
+        self.deferred_sources = {}
+        self.deferred_routes = {}
+        self.route_failures = {}
         # Negative source evidence has no timer: only new relevant evidence can
         # restore its priority. This does not ban transit or unrelated tasks.
         self.source_failures = {}
@@ -148,8 +152,8 @@ class ExplorationExecutor:
         if board.get("execution_policy") == "priority_goals":
             for task in view["tasks"]:
                 if task["target"]["type"] == "survey_region":
-                    # Runtime supplies ADDITIONAL-area completion; the generic
-                    # view only knows absolute explored area.
+                    # Runtime supplies ADDITIONAL-cell completion; the generic
+                    # view only knows the absolute observed cell count.
                     original = next(t for t in board["tasks"] if t["id"] == task["id"])
                     task["status"] = original.get("status", "ready")
                 if task["status"] not in {"ready", "in_progress"}:
@@ -218,6 +222,7 @@ class ExplorationExecutor:
 
     def _prior_source(self, node, product, sources, area):
         return bool((node, product) not in self.source_failures
+                    and self.deferred_sources.get((node, product), 0) <= time.monotonic()
                     and not area.get("boundary_complete")
                     and self.deferred_rooms.get(node, 0) <= time.monotonic()
                     and expected_sources(area, sources))
@@ -228,7 +233,20 @@ class ExplorationExecutor:
         if key in self.source_failures and recorded - self.source_failures[key]:
             self._restore_source(key, "new_usable_source_type")
         return bool(recorded and key not in self.source_failures
+                    and self.deferred_sources.get(key, 0) <= time.monotonic()
                     and self.deferred_rooms.get(node, 0) <= time.monotonic())
+
+    def recover_search(self, product, state):
+        """Retry a bounded search without erasing surveys or repeating its destination."""
+        node = self._observe(state)
+        targets = {node}
+        if self.goal == ("inventory", product) and self.intent and self.intent[0] == "graph":
+            targets.add(self.intent[1])
+        until = time.monotonic() + 45
+        for target in targets - {None}:
+            self.deferred_sources[(target, product)] = until
+        self.intent = None
+        timing.annotate(exploration_search_recovery={"product": product, "deferred_nodes": sorted(targets - {None})})
 
     def choose(self, state, dispatch, board=None):
         node = self._observe(state)
@@ -238,13 +256,18 @@ class ExplorationExecutor:
             return None
         # dispatch has already passed the common light/hunger/danger legality checks.
         actions = {k: {**a, "_executor_region": node if a.get("navigation_mode") != "graph" else None}
-                   for k, a in dispatch.items() if a["kind"] == "explore"}
+                   for k, a in dispatch.items() if a["kind"] == "explore" and not a.get("planner_only")}
         actions = {k: a for k, a in actions.items()
                    if self.paused.get(self.identity(a), 0) <= time.monotonic()}
         goal = self._goal(state, board, node)
         if goal != self.goal:
             self.intent = None
         self.goal = goal
+        now = time.monotonic()
+        self.deferred_sources = {k: v for k, v in self.deferred_sources.items() if v > now}
+        self.deferred_routes = {k: v for k, v in self.deferred_routes.items() if v > now}
+        actions = {k: a for k, a in actions.items() if a.get("navigation_mode") != "graph"
+                   or self.deferred_routes.get((goal, a.get("target_node_id")), 0) <= now}
         graph = state.get("navigation", {}).get("graph") or {}
         current_area = graph.get("current") or {}
         sources = usable_sources_for(goal[1], state) if goal[0] == "inventory" else set()
@@ -258,6 +281,19 @@ class ExplorationExecutor:
             routes = [*(graph.get("adjacent") or []),
                       *([graph["return_route"]] if graph.get("return_route") else [])]
         route_map = {r.get("node_id"): r for r in routes}
+        if self.intent and goal[0] == "visit" and self.intent != ("graph", goal[1], None):
+            self.intent = None
+        # Newly observed exact resource positions outrank a retained room-prior
+        # intent. Keep a current exact-resource leg stable while it remains valid.
+        if goal[0] == "inventory":
+            concrete = [(k, a) for k, a in actions.items() if a.get("navigation_mode") == "resource"
+                        and a.get("prefab") in sources]
+            if concrete:
+                concrete.sort(key=lambda pair: (self.identity(pair[1]) != self.intent,
+                                                float(pair[1].get("distance", 999)), pair[0]))
+                pair = concrete[0]
+                self.intent, self.strategy = self.identity(pair[1]), "remembered_source_position"
+                return pair
         if self.intent and self.strategy in {"source_room", "known_source_bfs", "worldgen_source_room", "worldgen_source_bfs"}:
             target = self.intent[1] if self.intent[0] == "graph" else node
             area = current_area if target == node else route_map.get(target, {})
@@ -298,11 +334,6 @@ class ExplorationExecutor:
                 return select(("explore_current_region", actions["explore_current_region"]), "board_survey")
             return None
         if goal[0] == "inventory":
-            concrete = [(k, a) for k, a in actions.items() if a.get("navigation_mode") == "resource"
-                        and a.get("prefab") in sources]
-            if concrete:
-                concrete.sort(key=lambda pair: (float(pair[1].get("distance", 999)), pair[0]))
-                return select(concrete[0], "remembered_source_position")
             # Search inside a known source room before treating an entrance as exhausted.
             if self._known_source(node, goal[1], sources, current_area):
                 if "explore_current_region" in actions:
@@ -320,23 +351,27 @@ class ExplorationExecutor:
         actions = {k: a for k, a in actions.items() if a.get("navigation_mode") != "resource"}
 
         # Depth-first branch order, using the existing safe short-leg navigator.
-        unseen = [(k, a, r) for k, a, r in travel
+        search_travel = [(k, a, r) for k, a, r in travel if goal[0] != "inventory"
+                         or self.deferred_sources.get((a.get("target_node_id"), goal[1]), 0) <= now]
+        unseen = [(k, a, r) for k, a, r in search_travel
                   if not r.get("entered") and a.get("target_node_id") not in self.visited]
         direct = next(((k, a) for k, a, r in unseen if int(r.get("hops", 1)) == 1), None)
         if direct:
             return select(direct, "dfs_neighbor")
         for key in ("explore_other_region", "explore_current_region"):
             if key in actions:
+                if key == "explore_current_region" and goal[0] == "inventory" and self.deferred_sources.get((node, goal[1]), 0) > now:
+                    continue
                 return select((key, actions[key]), "dfs_unknown_exit" if key == "explore_other_region" else "local_frontier")
         if len(self.path) >= 2:
             parent = self.path[-2]
-            match = next(((k, a) for k, a, _ in travel if a.get("target_node_id") == parent), None)
+            match = next(((k, a) for k, a, _ in search_travel if a.get("target_node_id") == parent), None)
             failed_parent = goal[0] == "inventory" and (parent, goal[1]) in self.source_failures
             if match and not (failed_parent and parent in self.closed):
                 return select(match, "dfs_backtrack")
         if unseen:
             return select(unseen[0][:2], "dfs_pending_branch")
-        for key, action, route in travel:
+        for key, action, route in search_travel:
             target = action.get("target_node_id")
             if (target not in self.closed and not route.get("boundary_complete")
                     and self.deferred_rooms.get(target, 0) <= time.monotonic()):
@@ -351,9 +386,23 @@ class ExplorationExecutor:
                                   "phase_changed", "player_dead", "player_changed"}
         if reason in {"route_no_progress", "route_gateway_unavailable", "region_confirmation_timeout"}:
             # Lua pauses the failed entrance, not every route to this region.
+            # After a second failure defer this destination for this goal too;
+            # another entrance was allowed a chance, but repeated bouncing is not.
+            if self.intent and self.intent[0] == "graph":
+                key = (self.goal, self.intent[1])
+                count, at = self.route_failures.get(key, (0, 0))
+                now = time.monotonic()
+                count = count + 1 if now - at < 60 else 1
+                self.route_failures[key] = (count, now)
+                if count >= 2:
+                    self.deferred_routes[key] = now + 30
+                    self.route_failures.pop(key, None)
+                    timing.annotate(exploration_destination_deferred={"node": key[1], "reason": reason, "seconds": 30})
             self.intent = None
         if reason in {"destination_reached", "region_changed", "path_unavailable", "route_paused", "region_route_unavailable",
                       "movement_stalled"}:
+            if reason in {"destination_reached", "region_changed"} and self.intent and self.intent[0] == "graph":
+                self.route_failures.pop((self.goal, self.intent[1]), None)
             if self.intent and reason not in {"destination_reached", "region_changed"}:
                 self.paused[self.intent] = time.monotonic() + 15
             self.intent = None

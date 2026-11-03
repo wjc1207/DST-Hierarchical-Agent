@@ -47,6 +47,43 @@ class ExplorationExecutorTests(unittest.TestCase):
         self.choose(actual, board({"type": "inventory", "prefab": "goldnugget", "count": 1}))
         self.assertEqual(self.navigator.strategy, "source_room")
 
+    def test_new_exact_grass_position_preempts_retained_room_prior(self):
+        from mcp_agent.navigation_intents import dispatch_for_navigation
+        actual = observed(); plan = board({"type":"inventory", "prefab":"cutgrass", "count":2})
+        actual["navigation"]["graph"]["routes"] = [{**route("B:BGGrass"), "hops":1}]
+        dispatch = {"travel": {"kind":"explore", "mode":"graph", "node_id":"B:BGGrass"}}
+        self.assertEqual(self.navigator.choose(actual, dispatch_for_navigation(dispatch, actual), plan)[0], "travel")
+        dispatch["grass"] = {"kind":"explore", "mode":"resource", "resource_guid":99,
+                             "prefab":"grass", "node_id":"A", "distance":20}
+        self.assertEqual(self.navigator.choose(actual, dispatch_for_navigation(dispatch, actual), plan)[0], "grass")
+        self.assertEqual(self.navigator.strategy, "remembered_source_position")
+
+    def test_budget_recovery_tries_another_room_and_preserves_negative_evidence(self):
+        from mcp_agent.navigation_intents import dispatch_for_navigation
+        actual = observed(); plan = board({"type":"inventory", "prefab":"cutgrass", "count":2})
+        actual["navigation"]["graph"]["routes"] = [{**route("B:BGGrass"), "hops":1}, {**route("C:BGGrass"), "hops":2}]
+        dispatch = {n: {"kind":"explore", "mode":"graph", "node_id":n} for n in ("B:BGGrass", "C:BGGrass")}
+        dispatch = dispatch_for_navigation(dispatch, actual)
+        self.navigator.exhaust_source("old", "cutgrass", {}, "room_search_budget")
+        self.assertEqual(self.navigator.choose(actual, dispatch, plan)[0], "B:BGGrass")
+        self.navigator.recover_search("cutgrass", actual)
+        self.assertEqual(self.navigator.choose(actual, dispatch, plan)[0], "C:BGGrass")
+        self.assertIn(("old", "cutgrass"), self.navigator.source_failures)
+
+    def test_second_entrance_failure_temporarily_defers_destination_then_recovers(self):
+        now = [100.]
+        with patch("mcp_agent.navigation_intents.time.monotonic", side_effect=lambda:now[0]):
+            actual = observed(); plan = board({"type":"visit_region", "node_id":"B"})
+            self.choose(actual, plan)
+            self.navigator.on_event({"reason":"region_confirmation_timeout"}, actual)
+            self.assertEqual(self.choose(actual, plan)[1]["target_node_id"], "B")
+            self.navigator.on_event({"reason":"region_confirmation_timeout"}, actual)
+            selected = self.choose(actual, plan)
+            self.assertTrue(selected is None or selected[1].get("target_node_id") != "B")
+            self.assertFalse(self.navigator.source_failures, "route trouble is not exhausted resource evidence")
+            now[0] += 31
+            self.assertEqual(self.choose(actual, plan)[1]["target_node_id"], "B")
+
     def test_explicit_visit_is_not_completed_by_an_old_entered_flag(self):
         actual = observed()  # B.entered is already true, but currently in A.
         plan = board({"type": "visit_region", "node_id": "B"})

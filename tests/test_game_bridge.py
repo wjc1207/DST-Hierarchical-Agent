@@ -384,7 +384,7 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with Client(create_server(bridge), read_timeout_seconds=3) as client:
             result = await client.list_tools()
             self.assertEqual({t.name for t in result.tools}, {"get_state", "get_available_actions", "start_action",
-                "get_action_status", "cancel_action", "submit_task_board"})
+                "get_action_status", "cancel_action", "submit_task_board", "query_recipes", "query_places", "move_to", "add_fuel"})
             response = await client.call_tool("get_available_actions", {})
             self.assertFalse(response.is_error)
             data = response.structured_content
@@ -393,6 +393,57 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result = await client.call_tool("start_action", {"choice": "wait", "observation_id": data["observation_id"]})
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["status"], "queued")
+
+    async def test_real_protocol_move_to_preserves_world_coordinates(self):
+        from mcp import Client
+        from mcp_server.mcp_server import create_server
+        bridge=GameBridge(TOKEN);s=state()
+        s['bridge']['coordinate_navigation']=True
+        s['world_map']={'version':1,'cell_size':4,'cells':{'2:0':[2,0,1,'grassland','A',0]}}
+        bridge.exchange({'token':TOKEN,'session_id':'offline','sequence':1,'state':s})
+        async with Client(create_server(bridge),read_timeout_seconds=3) as client:
+            packet=(await client.call_tool('get_available_actions',{})).structured_content
+            result=await client.call_tool('move_to',{'x':8,'z':0,'arrival_radius':1,'observation_id':packet['observation_id']})
+            self.assertFalse(result.is_error)
+            queued=bridge.actions[result.structured_content['action_id']]['action']
+            self.assertEqual(queued['coordinate_target'],{'x':8,'z':0,'arrival_radius':1})
+
+    async def test_real_protocol_add_fuel_preserves_target_and_item(self):
+        from mcp import Client
+        from mcp_server.mcp_server import create_server
+        bridge=GameBridge(TOKEN); s=state()
+        s['bridge']['available_actions']['add_fuel:40:log']={
+            'kind':'add_fuel','guid':40,'prefab':'firepit','building_id':'building:40',
+            'fuel_prefab':'log','fuel_guid':20,'native_action':'ADDFUEL','planner_only':True}
+        bridge.exchange({'token':TOKEN,'session_id':'offline','sequence':1,'state':s})
+        async with Client(create_server(bridge),read_timeout_seconds=3) as client:
+            packet=(await client.call_tool('get_available_actions',{})).structured_content
+            invalid=await client.call_tool('add_fuel',{'building_id':'building:40','fuel_prefab':'livinglog',
+                'observation_id':packet['observation_id']})
+            self.assertTrue(invalid.is_error)
+            result=await client.call_tool('add_fuel',{'building_id':'building:40','fuel_prefab':'log',
+                'observation_id':packet['observation_id']})
+            self.assertFalse(result.is_error)
+            queued=bridge.actions[result.structured_content['action_id']]['action']
+            self.assertEqual((queued['guid'],queued['fuel_guid'],queued['fuel_prefab']),(40,20,'log'))
+
+    async def test_real_protocol_build_placement_keeps_anchor_policy(self):
+        from mcp import Client
+        from mcp_server.mcp_server import create_server
+        bridge=GameBridge(TOKEN);s=state()
+        s['telemetry']={'placement_constraints':True}
+        s['places']={'buildings':[{'id':'building:40','prefab':'researchlab','status':'observed','x':0,'z':0}]}
+        s['player']['position']={'x':2,'z':0}
+        s['bridge']['available_actions']['recipe_firepit']={'kind':'place','recipe_id':'firepit',
+            'product':'firepit','x':4,'z':0,'rotation':0,'planner_only':True}
+        bridge.exchange({'token':TOKEN,'session_id':'offline','sequence':1,'state':s})
+        async with Client(create_server(bridge),read_timeout_seconds=3) as client:
+            packet=(await client.call_tool('get_available_actions',{})).structured_content
+            result=await client.call_tool('start_action',{'choice':'recipe_firepit',
+                'observation_id':packet['observation_id'],'placement':{'anchor_id':'building:40','radius':10}})
+            self.assertFalse(result.is_error)
+            queued=bridge.actions[result.structured_content['action_id']]['action']
+            self.assertEqual(queued['placement'],{'anchor_id':'building:40','radius':10,'x':0,'z':0})
 
     async def test_real_protocol_delivers_optional_navigation_targets(self):
         from mcp import Client

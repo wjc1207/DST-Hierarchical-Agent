@@ -1,6 +1,13 @@
 -- Native, snapshot-verified execution. No network, keyboard or model policy.
 local M = {}
 local tree_work=require("jev_tree_work")
+local recipes=require("jev_recipes")
+local refueling=require("jev_refueling")
+local placement=require("jev_placement")
+local thermal=require("jev_thermal")
+local places=require("jev_places")
+local residence=require("jev_residence")
+local coordinates=require("jev_coordinates")
 local products={grass="cutgrass",sapling="twigs",sapling_moon="twigs",berrybush="berries",
     berrybush2="berries",berrybush_juicy="berries_juicy",carrot_planted="carrot",flower="petals"}
 local loose={twigs=true,cutgrass=true,flint=true,log=true,rocks=true,goldnugget=true,nitre=true,
@@ -141,6 +148,19 @@ function M.available(s,blocked_escapes,now)
     local night=(s.world or {}).phase=="night"
     local torch=count(s,"torch",true)>0; local lit=fire(s)
     local dark=night and not torch and not lit
+    if thermal.hot(v) or (s.thermal or {}).active then
+        result.wait={kind="wait",description="Wait while thermal safety searches for a safe cooling position."}
+        local route=(s.thermal or {}).route
+        if route and finite(route.x) and finite(route.z) then
+            result.cool_down={kind="cool_down",x=route.x,z=route.z,planner_only=true,
+                description="Move away from nearby heat along an observed safe illuminated route."}
+        end
+        if night and not torch and count(s,"torch")>0 then
+            result.equip_torch={kind="equip_torch",thermal_safety=true,
+                description="Equip a carried torch to leave dangerous heat safely, even beside a fire."}
+        end
+        return result
+    end
     local crafting=s.crafting or {}
     local function add(id,kind,description,spec)
         local a=spec or {}; a.kind=kind; a.description=description; result[id]=a
@@ -165,7 +185,9 @@ function M.available(s,blocked_escapes,now)
         return emergency
     end
     if dark then return result end
-    if crafting.sciencemachine then add("build_sciencemachine","build_sciencemachine","Build and place a Science Machine.") end
+    if crafting.sciencemachine then
+        add("build_sciencemachine","build_sciencemachine","Build and place a Science Machine.",{planner_only=true})
+    end
     for _,tool in ipairs({"axe","pickaxe"}) do if crafting[tool] and count(s,tool)==0 then
         add("craft_"..tool,"craft_"..tool,"Craft one "..tool..".")
     end end
@@ -226,6 +248,11 @@ function M.available(s,blocked_escapes,now)
                 {guid=best.guid,prefab=best.prefab,tree_stage=best.tree_stage}) end
         end
     end
+    for id,action in pairs(refueling.actions(s)) do result[id]=action end
+    for id,action in pairs(recipes.actions(s.recipes)) do result[id]=action end
+    for id,action in pairs(places.actions(s.places)) do
+        if action.kind~="explore" or not night or torch then result[id]=action end
+    end
     return result
 end
 
@@ -236,10 +263,10 @@ local function valid_navigation_targets(targets)
         if type(index)~="number" or index%1~=0 or index<1 or index>#targets or type(t)~="table" then return false end
         size=size+1
         if t.type=="inventory" then
-            if not (loose[t.prefab] or t.prefab=="torch" or t.prefab=="axe" or t.prefab=="pickaxe")
+            if not (type(t.prefab)=="string" and #t.prefab<=60 and string.match(t.prefab,"^[a-z0-9_]+$"))
                 or not finite(t.count) or t.count%1~=0 or t.count<1 or t.count>1000 then return false end
         elseif t.type=="structure" then
-            if t.prefab~="campfire" and t.prefab~="firepit" and t.prefab~="sciencemachine" then return false end
+            if type(t.prefab)~="string" or #t.prefab>60 or not string.match(t.prefab,"^[a-z0-9_]+$") then return false end
         elseif t.type=="hunger_ratio" then
             if not finite(t.at_least) or t.at_least<=0 or t.at_least>1 then return false end
         else return false end
@@ -251,14 +278,29 @@ local function goal_action_available(s,targets,available)
     for _,t in ipairs(targets) do
         if t.type=="inventory" and count(s,t.prefab)<t.count then
             for id,a in pairs(available) do
-                if (a.kind=="collect" and (a.product or a.prefab)==t.prefab) or id=="craft_"..t.prefab
+                if (a.kind=="collect" and (a.product or a.prefab)==t.prefab) or id=="craft_"..t.prefab or (a.kind=="craft" and a.product==t.prefab and (not t.recipe_id or a.recipe_id==t.recipe_id))
                     or (t.prefab=="log" and a.kind=="chop_nearest_tree" and log_trees[a.prefab])
                     or (a.kind=="mine_nearest_rock" and (mine_products[a.prefab] or {})[t.prefab]) then return true end
             end
-        elseif t.type=="structure" and available["build_"..t.prefab] then
+        elseif t.type=="structure" then
+            local offered=available["build_"..t.prefab]
+            for _,a in pairs(available) do
+                if a.kind=="place" and a.product==t.prefab and (not t.recipe_id or a.recipe_id==t.recipe_id) then offered=a end
+            end
             local exists=false
             for _,e in ipairs(s.nearby or {}) do if e.prefab==t.prefab then exists=true end end
-            if not exists then return true end
+            for _,e in ipairs(s.recipe_entities or {}) do if e.prefab==t.prefab then exists=true end end
+            if t.placement then
+                local area=placement.target(t.placement,s)
+                if not area or not placement.inside(s.player.position,area) then offered=nil end
+                exists=false
+                if area then
+                    for _,e in ipairs((s.places or {}).buildings or {}) do
+                        if e.prefab==t.prefab and e.status~="missing" and placement.inside(e,area) then exists=true end
+                    end
+                end
+            end
+            if offered and not exists then return true end
         elseif t.type=="hunger_ratio" then
             local v=s.player.vitals
             if finite(v.hunger) and finite(v.hunger_max) and v.hunger_max>0 and v.hunger/v.hunger_max<t.at_least then
@@ -276,7 +318,18 @@ function M.new(adapter)
     local self={active=nil,report=nil,board=nil,board_revision=-1,board_paused=false,
         events={},event_sequence=0,paused={},blocked_escapes={},last_now=0,visits_done={},science_machine_built=false,
         command_ids={},command_order={}}
-    local function action_key(choice,a) return choice..":"..tostring(a.guid or a.node_id or "") end
+    local function action_key(choice,a) return choice..":"..tostring(a.guid or a.building_id or a.home_id or a.node_id or "") end
+    function self:issue(choice,action)
+        if self.issue_blocked then return false end
+        local run=self.active
+        if run and run.residence and (not residence.valid(run.residence,self.state)
+            or not residence.allowed(action,self.state,run.residence,choice=="walk")) then
+            self.issue_blocked=true
+            self:finish("interrupted","residence_boundary")
+            return false
+        end
+        return adapter.issue(choice,action)
+    end
     local function remember_command(id)
         if self.command_ids[id] then return end
         self.command_ids[id]=true
@@ -311,7 +364,9 @@ function M.new(adapter)
             escape_reroutes=run.escape_reroutes}
         if #self.events>64 then table.remove(self.events,1) end
         self.last_finished=self.events[#self.events]
-        if run.action.kind~="flee_from_nearest_hostile" and (status=="failed" or reason=="movement_stalled"
+        if run.action.kind=="cool_down" and adapter.cooling_failed
+            and (status=="failed" or reason=="movement_stalled") then adapter.cooling_failed(run.action) end
+        if run.action.kind~="flee_from_nearest_hostile" and run.action.kind~="cool_down" and (status=="failed" or reason=="movement_stalled"
             or reason=="target_path_unavailable" or reason=="target_changed" or reason=="navigation_path_became_unsafe") then
             self.paused[action_key(run.choice,run.action)]=self.last_now+15
         end
@@ -334,7 +389,7 @@ function M.new(adapter)
         end
         run.action=next_action
         run.last_position={x=s.player.position.x,z=s.player.position.z}; run.progress_at=now
-        adapter.issue(run.choice,next_action)
+        self:issue(run.choice,next_action)
     end
     function self:cancel(id)
         if self.active and self.active.id~=id then return end
@@ -349,7 +404,7 @@ function M.new(adapter)
             action.pickup_deadline=action.pickup_deadline or self.last_now+4
             action.next_retry=self.last_now+1
         end
-        local accepted=adapter.issue(choice,action)
+        local accepted=self:issue(choice,action)
         if accepted~=false and action==run.action and ground_harvest[action.prefab] then
             run.harvest_issued_at=self.last_now
         end
@@ -373,7 +428,7 @@ function M.new(adapter)
             end
             run.approach={guid=action.guid,choice=choice,action=action,after=after,waypoint=point,
                 last_position=s.player.position,progress_at=self.last_now}
-            run.stage="approach"; adapter.issue("walk",{kind="explore",x=point.x,z=point.z}); return
+            run.stage="approach"; self:issue("walk",{kind="explore",x=point.x,z=point.z}); return
         end end
         self:finish("failed","target_missing")
     end
@@ -383,6 +438,7 @@ function M.new(adapter)
     end
     function self:start(command,s,now,board)
         self.last_now=now
+        self.state=s;self.issue_blocked=false
         if self.active then return false end
         if self.command_ids[command.action_id] then return false end
         remember_command(command.action_id)
@@ -396,6 +452,22 @@ function M.new(adapter)
             return reject("targeted_by_hostile")
         end
         local a=self:available(s,now)[command.choice]
+        if command.choice=="move_to" then
+            if s.world.phase=="night" and count(s,"torch",true)==0 then return reject("night_requires_portable_light") end
+            if requested.kind~="explore" or requested.mode~="coordinate" or not adapter.coordinate_destination then
+                return reject("invalid_coordinate_action")
+            end
+            local point,err=coordinates.point(requested.coordinate_target)
+            if not point then return reject(err) end
+            local dest,reason=adapter.coordinate_destination(point,s)
+            if not dest then return reject(reason or "coordinate_route_unavailable") end
+            if dest.arrived then
+                self.report={action_id=command.action_id,choice=command.choice,status="completed",reason="coordinate_arrived"}
+                return true
+            end
+            a,reason=coordinates.action(point,dest.route)
+            if not a then return reject(reason) end
+        end
         if not a then
             if command.choice=="build_campfire" then
                 local site=(s.construction or {}).campfire
@@ -413,15 +485,49 @@ function M.new(adapter)
             end
             return reject("action_unavailable")
         end
-        if command.action and (a.guid~=requested.guid or a.node_id~=requested.node_id
+        local build_area
+        if requested.placement~=nil then
+            if a.kind~="place" and a.kind~="build_campfire" and a.kind~="build_sciencemachine" then
+                return reject("invalid_placement_action")
+            end
+            build_area=placement.resolve(requested.placement,s)
+            if not build_area or not placement.inside(s.player.position,build_area) then
+                return reject("placement_anchor_changed_or_outside")
+            end
+            local bound={};for k,v in pairs(a) do bound[k]=v end;a=bound
+            a.placement=build_area
+            if a.kind=="place" then
+                local site=adapter.placement_site and adapter.placement_site(a,build_area)
+                if not site or not placement.inside(site,build_area) then return reject("no_valid_site_in_placement_area") end
+                a.x,a.z=site.x,site.z
+            end
+        end
+        if command.action and (a.guid~=requested.guid or (a.node_id~=requested.node_id and command.choice~="move_to")
             or (requested.kind and a.kind~=requested.kind) or (requested.prefab and a.prefab~=requested.prefab)
-            or (requested.mode and a.mode~=requested.mode)) then
+            or (requested.mode and a.mode~=requested.mode and command.choice~="move_to")
+            or a.refuel_approach~=requested.refuel_approach
+            or a.fuel_guid~=requested.fuel_guid or a.fuel_prefab~=requested.fuel_prefab
+            or a.ratio_refuel~=requested.ratio_refuel
+            or (a.kind=="add_fuel" and a.native_action~=requested.native_action)
+            or a.recipe_id~=requested.recipe_id
+            or a.building_id~=requested.building_id or a.home_id~=requested.home_id or a.anchor_id~=requested.anchor_id
+            or (a.kind=="set_home" and not places.home_point_matches(a,requested))
+            or ((a.kind=="craft" or a.kind=="place") and (a.product~=requested.product or a.output_count~=requested.output_count))
+            or (a.kind=="place" and a.rotation~=requested.rotation)
+            or (a.kind=="place" and not build_area and (not finite(requested.x) or not finite(requested.z)
+                or not finite(a.x) or not finite(a.z) or math.abs(a.x-requested.x)>0.0001
+                or math.abs(a.z-requested.z)>0.0001 or a.rotation~=requested.rotation))) then
             return reject("target_changed")
+        end
+        if a.kind=="cool_down" and (not adapter.cooling_safe or not adapter.cooling_safe(a)) then
+            return reject("cooling_route_unsafe")
         end
         if requested.navigation_targets~=nil and (a.kind~="explore"
             or not valid_navigation_targets(requested.navigation_targets)) then
             return reject("invalid_navigation_targets")
         end
+        if requested.residence~=nil and (not residence.valid(requested.residence,s)
+            or not residence.allowed(a,s,requested.residence)) then return reject("residence_boundary") end
         -- Use the current route/recipe facts, never stale request coordinates.
         -- Target GUID/node identity is preserved; this is not a new AI choice.
         local position=s.player.position
@@ -432,6 +538,7 @@ function M.new(adapter)
             harvest_inventory_before=harvest and count(s,a.product) or nil,
             origin={x=position.x,z=position.z},resources=types(s),board=board,task_id=command.task_id,
             navigation_targets=requested.navigation_targets,
+            residence=requested.residence,placement=build_area,
             last_position={x=position.x,z=position.z},progress_at=now,
             known_nodes=((s.navigation or {}).graph or {}).known_nodes or 0,
             region=((s.navigation or {}).graph or {}).current_node}
@@ -450,11 +557,12 @@ function M.new(adapter)
                 self.active.work_origin={x=position.x+(e.dx or 0),z=position.z+(e.dz or 0)}
             end
         end
+        for _,e in ipairs(s.recipe_entities or {}) do self.active.preexisting[e.guid]=true end
         if a.kind=="collect" or drops[a.kind] then
             self:issue_target(self.active,s,command.choice,a,nil)
         elseif a.kind=="eat_safe_food" and fire(s,true) and total(s,raw)>0 then
-            self.active.stage="cook_before_eat"; adapter.issue("cook_food",{kind="cook_food"})
-        elseif a.kind~="wait" then adapter.issue(command.choice,a) end
+            self.active.stage="cook_before_eat"; self:issue("cook_food",{kind="cook_food"})
+        elseif a.kind~="wait" then self:issue(command.choice,a) end
         return true
     end
     function self:set_board(board,revision)
@@ -465,6 +573,7 @@ function M.new(adapter)
     end
     function self:tick(s,now,control_enabled)
         self.last_now=now
+        self.state=s
         for key,until_time in pairs(self.paused) do if until_time<=now then self.paused[key]=nil end end
         local run=self.active
         -- Daylight fuel saving is executor maintenance, including while idle
@@ -475,10 +584,18 @@ function M.new(adapter)
             and not (run and (run.action.kind=="craft_torch" or run.action.kind=="unequip_torch")) then
             if now>=(self.daylight_cleanup_after or 0) then
                 self.daylight_cleanup_after=now+1
-                adapter.issue("unequip_torch",{kind="unequip_torch",automatic_reason="daylight"})
+                self:issue("unequip_torch",{kind="unequip_torch",automatic_reason="daylight"})
             end
         else self.daylight_cleanup_after=nil end
         if not run then return end
+        if run.residence and (not residence.valid(run.residence,s)
+            or not residence.inside(s.player.position,run.residence,0.5)) then
+            self.issue_blocked=true;self:finish("interrupted","residence_boundary");return
+        end
+        if run.placement and (not placement.resolve(run.placement,s)
+            or not placement.inside(s.player.position,run.placement)) then
+            self:finish("interrupted","placement_anchor_changed_or_outside");return
+        end
         local a,b=run.action,run.before; local night=s.world.phase=="night"
         -- Accepted is not proof of native execution. Keep confirmation unknown
         -- until exact native identity/replication or movement supplies evidence.
@@ -487,6 +604,10 @@ function M.new(adapter)
             if a.kind=="collect" then expected=execution.action=="PICK" or execution.action=="PICKUP"
             elseif a.kind=="chop_nearest_tree" then expected=execution.action=="CHOP"
             elseif a.kind=="mine_nearest_rock" then expected=execution.action=="MINE"
+            elseif a.kind=="add_fuel" then
+                expected=execution.action==a.native_action
+            elseif a.kind=="craft" or a.kind=="place" then
+                expected=execution.action=="BUILD" and execution.recipe==a.recipe_id
             elseif string.sub(a.kind,1,6)=="craft_" then
                 expected=execution.action=="BUILD" and execution.recipe==string.sub(a.kind,7)
             end
@@ -495,7 +616,7 @@ function M.new(adapter)
                 and (not execution.started_at or execution.started_at>=run.started) then
                 run.confirmed_started_at=execution.started_at or now
                 run.start_source=execution.start_source or "native_buffered"
-            elseif (a.kind=="explore" or a.kind=="flee_from_nearest_hostile")
+            elseif (a.kind=="explore" or a.kind=="flee_from_nearest_hostile" or a.kind=="cool_down")
                 and distance(run.origin,s.player.position)>=0.1 then
                 run.confirmed_started_at=now; run.start_source="position_progress"
             end
@@ -504,8 +625,39 @@ function M.new(adapter)
                 self.report.start_source=run.start_source
             end
         end
+        local cooling=a.kind=="cool_down"
+        local heat_risk=thermal.hot(s.player.vitals) or (s.thermal or {}).active
+        if heat_risk and not cooling and a.kind~="flee_from_nearest_hostile"
+            and not (a.kind=="equip_torch" and a.thermal_safety) then
+            -- Preserve an already verified physical fuel consumption before yielding.
+            if a.kind=="add_fuel" and run.confirmed_started_at then
+                local before=(b.recipe_inventory or {})[a.fuel_prefab] or count(b,a.fuel_prefab)
+                local after=(s.recipe_inventory or {})[a.fuel_prefab] or count(s,a.fuel_prefab)
+                for _,e in ipairs(s.nearby or {}) do
+                    if e.guid==a.guid and e.prefab==a.prefab and before-after>=1 then
+                        for _,tag in ipairs(e.tags or {}) do
+                            if tag=="fire" then self:finish("completed","observed_effect");return end
+                        end
+                    end
+                end
+            end
+            self:finish("interrupted","thermal_warning");return
+        end
+        if cooling then
+            if s.player.guid~=b.player.guid then self:finish("interrupted","player_changed");return end
+            if s.player.vitals.dead then self:finish("interrupted","player_dead");return end
+            if threat(s) then self:finish("interrupted","targeted_by_hostile");return end
+            if not heat_risk then self:finish("completed","temperature_safe");return end
+            if not adapter.cooling_safe or not adapter.cooling_safe(a) then self:finish("interrupted","cooling_route_unsafe");return end
+            if distance(run.last_position,s.player.position)>=0.15 then
+                run.last_position={x=s.player.position.x,z=s.player.position.z};run.progress_at=now
+            elseif now-run.progress_at>=1 then self:finish("failed","movement_stalled");return end
+            if distance(s.player.position,a)<=0.3 then self:finish("completed","cooling_step_completed");return end
+            if now>=run.deadline then self:finish("failed","verification_timeout");return end
+            return
+        end
         local fleeing=a.kind=="flee_from_nearest_hostile"
-        local light=a.kind=="craft_torch" or a.kind=="equip_torch" or a.kind=="build_campfire"
+        local light=a.kind=="craft_torch" or a.kind=="equip_torch" or a.kind=="build_campfire" or a.kind=="add_fuel"
         local reason
         if s.player.guid~=b.player.guid then reason="player_changed"
         elseif s.player.vitals.dead then reason="player_dead"
@@ -588,7 +740,7 @@ function M.new(adapter)
                 approach.last_position=s.player.position; approach.progress_at=now
             elseif now-approach.progress_at>=3 then self:finish("interrupted","movement_stalled"); return end
             if distance(s.player.position,approach.waypoint)<=0.6 then
-                approach.waypoint=point; adapter.issue("walk",{kind="explore",x=point.x,z=point.z})
+                approach.waypoint=point; self:issue("walk",{kind="explore",x=point.x,z=point.z})
             end
             return
         elseif run.stage=="collection_retry" then
@@ -617,7 +769,7 @@ function M.new(adapter)
             return
         elseif run.stage=="cook_before_eat" then
             if total(s,cooked)>total(b,cooked) then
-                run.stage="eating"; adapter.issue("eat_safe_food",a)
+                run.stage="eating"; self:issue("eat_safe_food",a)
             end; return
         elseif run.stage=="loot" then
             if run.loot then
@@ -663,17 +815,41 @@ function M.new(adapter)
         elseif a.kind=="collect" then done=count(s,a.product)>count(b,a.product)
         elseif a.kind=="equip_torch" then done=count(s,"torch",true)>0
         elseif a.kind=="unequip_torch" then done=count(s,"torch",true)==0 and count(s,"torch")>=count(b,"torch")
+        elseif a.kind=="set_home" then
+            done=s.places and s.places.home and s.places.home.anchor_id==a.anchor_id
+        elseif a.kind=="craft" then
+            done=((s.recipe_inventory or {})[a.product] or count(s,a.product))-((b.recipe_inventory or {})[a.product] or count(b,a.product))>=(a.output_count or 1)
+        elseif a.kind=="place" then
+            for _,e in ipairs(s.recipe_entities or {}) do
+                if e.prefab==a.product and not run.preexisting[e.guid]
+                    and finite(e.x) and finite(e.z)
+                    and distance(e,{x=a.x,z=a.z})<=2
+                    and (not run.placement or placement.inside(e,run.placement)) then done=true end
+            end
         elseif a.kind=="craft_torch" or a.kind=="craft_axe" or a.kind=="craft_pickaxe" then
             local product=string.sub(a.kind,7); done=count(s,product)>count(b,product)
             if done and product=="torch" and not night and count(s,"torch",true)>0 then
-                if not run.cleanup then run.cleanup=true; adapter.issue("unequip_torch",{kind="unequip_torch"}) end
+                if not run.cleanup then run.cleanup=true; self:issue("unequip_torch",{kind="unequip_torch"}) end
                 done=false
             end
         elseif a.kind=="eat_safe_food" then done=(s.player.vitals.hunger or 0)>(b.player.vitals.hunger or 0)
         elseif a.kind=="cook_food" then done=total(s,cooked)>total(b,cooked)
+        elseif a.kind=="add_fuel" then
+            local target
+            for _,e in ipairs(s.nearby or {}) do if e.guid==a.guid then target=e;break end end
+            if not target or target.prefab~=a.prefab then self:finish("failed","refuel_target_missing");return end
+            local lit=false
+            for _,tag in ipairs(target.tags or {}) do if tag=="fire" then lit=true end end
+            local before=(b.recipe_inventory or {})[a.fuel_prefab] or count(b,a.fuel_prefab)
+            local after=(s.recipe_inventory or {})[a.fuel_prefab] or count(s,a.fuel_prefab)
+            done=run.confirmed_started_at~=nil and before-after>=1 and lit
         elseif a.kind=="build_campfire" or a.kind=="build_sciencemachine" then
             for _,e in ipairs(s.nearby or {}) do
-                if e.prefab==string.sub(a.kind,7) and not run.preexisting[e.guid] then done=true end
+                if e.prefab==string.sub(a.kind,7) and not run.preexisting[e.guid] then
+                    local point={x=e.x or (finite(e.dx) and s.player.position.x+e.dx),
+                        z=e.z or (finite(e.dz) and s.player.position.z+e.dz)}
+                    if not run.placement or placement.inside(point,run.placement) then done=true end
+                end
             end
         elseif drops[a.kind] then
             local w=s.work or {}
@@ -686,13 +862,29 @@ function M.new(adapter)
                 end
             end
         elseif a.kind=="explore" then
+            local destination
+            local coordinate_next
+            if a.coordinate_target then
+                local reason
+                destination,reason=adapter.coordinate_destination(a.coordinate_target,s)
+                if not destination then self:finish("interrupted",reason or "coordinate_route_unavailable");return end
+                if destination.arrived then self:finish("completed","coordinate_arrived");return end
+                coordinate_next,reason=coordinates.action(a.coordinate_target,destination.route)
+                if not coordinate_next then self:finish("interrupted",reason);return end
+            elseif a.building_id or a.home_id then
+                destination=places.destination(s.places,a)
+                if not destination or destination.status=="missing" then
+                    self:finish("interrupted",a.home_id and "home_changed" or "building_missing"); return
+                end
+                if destination.arrived then self:finish("completed","destination_observed"); return end
+            end
             local p=s.player.position
             local route_pause=(((s.navigation or {}).graph or {}).route_pause or {})
             if a.mode=="graph" and a.gateway_id and route_pause.gateway_id==a.gateway_id
                 and (route_pause.remaining_seconds or 0)>0 then
                 self:finish("interrupted",route_pause.reason); return
             end
-            if (((s.navigation or {}).graph or {}).known_nodes or 0)>run.known_nodes then
+            if run.navigation_targets==nil and (((s.navigation or {}).graph or {}).known_nodes or 0)>run.known_nodes then
                 self:finish("interrupted","region_discovered"); return
             end
             if distance(run.origin,p)>=4 then
@@ -708,20 +900,22 @@ function M.new(adapter)
             end
             local region=((s.navigation or {}).graph or {}).current_node
             if region~=run.region then
-                if a.mode~="graph" or region==a.node_id then self:finish("completed","region_changed"); return end
-                local next_action=M.available(s)[run.choice]
+                if a.mode~="graph" or region==a.node_id then
+                    self:finish(destination and "interrupted" or "completed",destination and "destination_region_entered" or "region_changed"); return
+                end
+                local next_action=coordinate_next or M.available(s)[run.choice]
                 if not next_action then self:finish("interrupted","region_route_unavailable"); return end
-                run.region=region; run.action=next_action; adapter.issue(run.choice,next_action); return
+                run.region=region; run.action=next_action; self:issue(run.choice,next_action); return
             end
             if distance(p,{x=a.x,z=a.z})<=(a.arrival or 1) then
-                local next_action=M.available(s)[run.choice]
-                if not next_action then self:finish("completed","navigation_yield"); return end
+                local next_action=coordinate_next or M.available(s)[run.choice]
+                if not next_action then self:finish(destination and "interrupted" or "completed",destination and "destination_route_unavailable" or "navigation_yield"); return end
                 if next_action.awaiting_region then
                     run.action=next_action
                     return
                 end
                 adapter.stop()
-                run.action=next_action; adapter.issue(run.choice,next_action)
+                run.action=next_action; self:issue(run.choice,next_action)
             end
         end
         if done then self:finish("completed","observed_effect") end
@@ -737,12 +931,19 @@ function M.new(adapter)
         local available=self:available(s,now); local complete={}
         for _,t in ipairs(board.tasks or {}) do
             local goal=t.target or {}; local done=false
-            if goal.type=="inventory" then done=count(s,goal.prefab)>=goal.count
+            if goal.type=="inventory" then done=((s.recipe_inventory or {})[goal.prefab] or count(s,goal.prefab))>=goal.count
             elseif goal.type=="hunger_ratio" then
                 done=(s.player.vitals.hunger or 0)/math.max(s.player.vitals.hunger_max or 1,1)>=goal.at_least
             elseif goal.type=="structure" then
                 done=goal.prefab=="sciencemachine" and self.science_machine_built or false
                 for _,e in ipairs(s.nearby or {}) do if e.prefab==goal.prefab then done=true end end
+                for _,e in ipairs(s.recipe_entities or {}) do if e.prefab==goal.prefab then done=true end end
+            elseif goal.type=="visit_building" or goal.type=="return_home" then
+                local destination=places.destination(s.places,goal)
+                if destination and destination.arrived and destination.status~="missing" then self.visits_done[t.id]=true end
+                done=self.visits_done[t.id]==true
+            elseif goal.type=="set_home" then
+                done=s.places and s.places.home and s.places.home.anchor_id==goal.anchor_id or false
             elseif goal.type=="known_regions" then done=(((s.navigation or {}).graph or {}).known_nodes or 0)>=goal.count
             elseif goal.type=="visit_region" then
                 if ((s.navigation or {}).graph or {}).current_node==goal.node_id then self.visits_done[t.id]=true end
@@ -751,18 +952,34 @@ function M.new(adapter)
             complete[t.id]=done
         end
         local tasks={}; for _,t in ipairs(board.tasks or {}) do tasks[#tasks+1]=t end
+        local by_id,focus={},nil
+        for _,t in ipairs(tasks) do by_id[t.id]=t end
+        local function include(id)
+            if not by_id[id] or complete[id] or focus[id] then return end
+            focus[id]=true
+            for _,dependency in ipairs(by_id[id].depends_on or {}) do include(dependency) end
+        end
+        for _,t in ipairs(tasks) do
+            if t.focus and not complete[t.id] then focus=focus or {}; include(t.id) end
+        end
         table.sort(tasks,function(a,b) return a.priority<b.priority end)
         for _,t in ipairs(tasks) do
-            local ready=not complete[t.id]
+            local ready=not complete[t.id] and (not focus or focus[t.id])
             for _,id in ipairs(t.depends_on or {}) do if not complete[id] then ready=false end end
             if ready then for id,a in pairs(available) do
                 local goal=t.target; local matches=false
                 if goal.type=="inventory" then
                     matches=(a.kind=="collect" and a.product==goal.prefab) or id=="craft_"..goal.prefab
+                        or (a.kind=="craft" and a.product==goal.prefab and a.recipe_id==goal.recipe_id)
                         or (a.kind=="chop_nearest_tree" and goal.prefab=="log" and log_trees[a.prefab])
                         or (a.kind=="mine_nearest_rock" and (mine_products[a.prefab] or {})[goal.prefab])
                 elseif goal.type=="hunger_ratio" then matches=id=="eat_safe_food"
-                elseif goal.type=="structure" then matches=id=="build_"..goal.prefab end
+                elseif goal.type=="visit_building" then matches=a.building_id==goal.building_id
+                elseif goal.type=="return_home" then matches=a.home_id==goal.home_id
+                elseif goal.type=="set_home" then matches=(a.kind=="set_home" and a.anchor_id==goal.anchor_id)
+                    or (a.kind=="explore" and a.building_id==goal.anchor_id)
+                elseif goal.type=="structure" then matches=id=="build_"..goal.prefab
+                    or (a.kind=="place" and a.product==goal.prefab and a.recipe_id==goal.recipe_id) end
                 if matches then
                     return id,a,t.id
                 end

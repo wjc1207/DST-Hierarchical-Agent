@@ -8,6 +8,7 @@ import time
 
 from common.task_board import normalize_inventory_prefab, text
 from common.game_rules import WORK_PRODUCTS, SAFETY_INTERRUPTS
+from common.exploration_metrics import survey_cells, observed_cells
 
 ACTION_TYPES = (
     "collect", "craft", "build", "eat_safe_food", "cook_food", "equip_torch",
@@ -66,7 +67,7 @@ def validate_sequence(raw, day):
             if not result["node_id"]:
                 raise ValueError("travel_region requires an observed node_id")
         if action == "explore_current_region":
-            result["area"] = _number(step.get("area", 256), 16, 4096, "area", integer=True)
+            result["cells"] = survey_cells(step)
         if action == "explore_other_region":
             result["new_regions"] = _number(step.get("new_regions", 1), 1, 10, "new_regions", integer=True)
         if action == "wait":
@@ -122,7 +123,7 @@ class SequenceExecutor:
             step = plan["steps"][self.index]
             if self.baseline is None:
                 self.baseline = {"started_at": self.clock(), "node_id": graph.get("current_node"),
-                                 "area": current.get("explored_area"), "nodes": graph.get("known_nodes"),
+                                 "cells": observed_cells(current,state.get("navigation",{}).get("cell_size",4)), "nodes": graph.get("known_nodes"),
                                  "cooked": sum(counts.get(p, 0) for p in COOKED)}
             action, done = step["action"], False
             if action in {"collect", "craft"}:
@@ -136,8 +137,8 @@ class SequenceExecutor:
                 if graph.get("current_node") != self.baseline["node_id"]:
                     self.fail("left_survey_region")
                 done = bool(current.get("boundary_complete")) or (
-                    current.get("explored_area") is not None and self.baseline["area"] is not None
-                    and current["explored_area"] - self.baseline["area"] >= step["area"])
+                    observed_cells(current,state.get("navigation",{}).get("cell_size",4)) is not None and self.baseline["cells"] is not None
+                    and observed_cells(current,state.get("navigation",{}).get("cell_size",4)) - self.baseline["cells"] >= survey_cells(step))
             elif action == "explore_other_region":
                 done = (graph.get("known_nodes") is not None and self.baseline["nodes"] is not None
                         and graph["known_nodes"] - self.baseline["nodes"] >= step["new_regions"])
@@ -230,7 +231,7 @@ def format_sequence(plan):
              "Goal: " + plan["goal"]]
     for index, step in enumerate(plan["steps"], 1):
         args = ", ".join(f"{k}={step[k]}" for k in
-                         ("prefab", "count", "node_id", "area", "new_regions", "hunger_ratio", "seconds") if k in step)
+                         ("prefab", "count", "node_id", "cells", "new_regions", "hunger_ratio", "seconds") if k in step)
         lines.append(f"  {index}. [{step.get('status', 'pending')}] {step['action']}({args})")
     if plan.get("reason"):
         lines.append("Reason: " + plan["reason"])

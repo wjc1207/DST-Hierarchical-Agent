@@ -19,9 +19,9 @@ from mcp_server.game_bridge import GameBridge, serve_bridge, check_bridge_port, 
 def create_server(bridge):
     from mcp.server import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
-    def invoke(function, *args):
+    def invoke(function, *args, **kwargs):
         try:
-            return function(*args)
+            return function(*args, **kwargs)
         except ValueError as exc:
             raise ToolError(str(exc)) from None
     server = MCPServer("decisionLimitedDST", version="1.8.8", instructions=(
@@ -48,16 +48,68 @@ def create_server(bridge):
         return await asyncio.to_thread(invoke, bridge.get_available_actions, True) if refresh else invoke(bridge.get_available_actions)
 
     @server.tool()
+    async def query_recipes(query: str = "", recipe_id: str | None = None,
+                            offset: int = 0, limit: int = 12, refresh: bool = False) -> dict[str, Any]:
+        """Read/search live recipe facts; bounded pages, no model call or game action."""
+        from common.recipes import query_recipes as search
+        packet = await asyncio.to_thread(invoke, bridge.get_state, True) if refresh else invoke(bridge.get_state)
+        return {"session_id": packet["session_id"], "age_seconds": packet["age_seconds"],
+                "index": packet["state"].get("recipe_index"),
+                **invoke(search, packet["state"].get("recipes", {}), query, recipe_id, offset, limit,
+                         epoch=packet["state"].get("recipe_epoch"))}
+
+    @server.tool()
+    async def query_places(query: str = "", building_id: str | None = None,
+                           offset: int = 0, limit: int = 12, refresh: bool = False) -> dict[str, Any]:
+        """Read observed building memory, current home and legal home anchors; no game action."""
+        from common.places import query_places as search
+        packet = await asyncio.to_thread(invoke, bridge.get_state, True) if refresh else invoke(bridge.get_state)
+        return {"session_id": packet["session_id"], "age_seconds": packet["age_seconds"],
+                **invoke(search, packet["state"].get("places", {}), query, building_id, offset, limit)}
+
+    @server.tool()
     def start_action(choice: str, observation_id: str,
-                     navigation_targets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        """Queue one offered action; returns an ID, not completion. No arbitrary code or coordinates.
+                     navigation_targets: list[dict[str, Any]] | None = None,
+                     residence: dict[str, Any] | None = None,
+                     destination: dict[str, Any] | None = None,
+                     placement: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Queue one offered action; returns an ID, not completion. No arbitrary code.
 
         For navigation only, navigation_targets watches up to six local inventory,
         structure or hunger goals. Only an offered action advancing one may yield
         for resources. [] ignores ordinary resources; omission keeps resource-set
         events for planning gaps. Safety/region/path interruptions always apply.
+        residence={home_id,radius} restricts ordinary work to the current observed
+        home area, with native checks; no caller-supplied coordinates are accepted.
+        For choice=move_to only, destination={x,z,arrival_radius?} selects observed
+        passable land; equivalent to the move_to tool. Lua resolves the actual route.
+        placement={anchor_id:building:<GUID>,radius:4..20(default10)} bounds building
+        actions to the observed anchor; travel there first. Lua selects a legal
+        point inside this area and verifies it again before actual placement.
         """
-        return invoke(bridge.start_action, choice, observation_id, navigation_targets)
+        return invoke(bridge.start_action, choice, observation_id, navigation_targets, residence, destination, placement)
+
+    @server.tool()
+    def move_to(x: float, z: float, observation_id: str, arrival_radius: float = 2) -> dict[str, Any]:
+        """Travel to observed land in world x/z coordinates; Lua validates the live safe route.
+
+        Returns an action ID, not proof of arrival. Does not set home, teleport,
+        explore unknown coordinates or override lighting/safety. Cancel normally.
+        """
+        return invoke(bridge.start_action,"move_to",observation_id,[],None,
+                      {"x":x,"z":z,"arrival_radius":arrival_radius})
+
+    @server.tool()
+    def add_fuel(building_id: str, fuel_prefab: str, observation_id: str) -> dict[str, Any]:
+        """Add ONE specified common fuel item to a nearby observed campfire/firepit.
+
+        Use an offered add_fuel:<GUID>:<fuel> action. Native legality, exact target,
+        fuel item, safe proximity and actual effect are rechecked; supports wet fuel
+        and relighting an extinguished firepit. Returns an action ID, not completion.
+        """
+        from common.refueling import validate_target
+        target = invoke(validate_target, {"building_id":building_id,"fuel_prefab":fuel_prefab})
+        return invoke(bridge.start_action, "add_fuel:" + target["building_id"].split(":")[1] + ":" + target["fuel_prefab"], observation_id)
 
     @server.tool()
     def get_action_status(action_id: str) -> dict[str, Any]:
@@ -75,6 +127,18 @@ def create_server(bridge):
 
         Use auto_execute=false to pause a board. Missing sources, danger and unsupported
         prerequisites yield to the host; this is not a full automatic acquisition solver.
+        Tasks accept focus=true/false (default false), at most two focused tasks.
+        Unfinished focused tasks and their prerequisites exclude ordinary work.
+        Resubmit a task with focus changed to promote or demote it.
+        survey_region targets use cells:1..256 (default16), meaning ADDITIONAL
+        observed map grid cells, not walking steps or world area. Legacy area
+        parameters are converted by /16 and normalized to cells.
+        All tasks may have start_at:{day,progress|phase}. stay_home targets require
+        exactly one task-level duration (game days) or end_at. Timing errors are
+        returned per task in task_errors. Timed/residence execution requires the
+        Python priority scheduler; auto_execute=true is unsupported for these tasks.
+        refuel targets {building_id,fuel_prefab,count:1..10} also require Python;
+        each verified native addition advances progress by one.
         """
         return invoke(bridge.submit_task_board, board, observation_id, auto_execute)
 
