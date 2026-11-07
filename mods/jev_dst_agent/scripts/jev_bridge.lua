@@ -11,6 +11,7 @@ local function state_signature(s,status)
         tostring(math.floor((v.hunger or 0)/math.max(v.hunger_max or 1,1)*10)),
         tostring(math.floor((v.sanity or 0)/math.max(v.sanity_max or 1,1)*4)),
         tostring(graph.current_node),tostring(graph.known_nodes),tostring(status.board_ready),tostring(s.recipe_version)}
+    if s.autonomy then parts[#parts+1]="autonomy:"..tostring(s.autonomy.revision) end
     local inventory=p.inventory or {}; local counts={}
     for _,group in ipairs({"items","equipped"}) do for _,item in ipairs(inventory[group] or {}) do
         local key=group..":"..tostring(item.prefab)..":"..tostring(item.slot)
@@ -91,8 +92,9 @@ function M.new(config,env,executor)
         end
         local timings={}
         local state=measurement.call(env.wall_now,timings,"state_total_ms",function() return env.state(timings) end)
-        measurement.call(env.wall_now,timings,"native_tick_ms",function() executor:tick(state,now,self.connected) end)
-        if self.connected then
+        local permitted=self.connected and (not state.autonomy or state.autonomy.enabled)
+        measurement.call(env.wall_now,timings,"native_tick_ms",function() executor:tick(state,now,permitted) end)
+        if permitted then
             measurement.call(env.wall_now,timings,"board_step_ms",function() executor:board_step(state,now) end)
         end
         measurement.add(self.sampling,timings)
@@ -198,6 +200,9 @@ function M.new(config,env,executor)
                 self.snapshot_request_id=math.max(self.snapshot_request_id,result.snapshot_request_id)
             end
             self.server_id=result.server_id
+            if env.feedback then
+                for _,message in ipairs(result.agent_feedback or {}) do env.feedback(message) end
+            end
             local board=type(result.task_board)=="table" and result.task_board.kind=="task_board" and result.task_board or nil
             executor:set_board(board,result.board_revision or 0)
             local command=result.command

@@ -79,6 +79,14 @@ class SharedStateTests(unittest.TestCase):
         self.assertEqual(facts["vitals"]["sanity_max"], 200)
         self.assertEqual(facts["construction"]["campfire"], self.observed()["construction"]["campfire"])
 
+    def test_observed_main_inventory_capacity_is_shared_without_guessing_for_old_states(self):
+        actual = self.observed()
+        self.assertNotIn("free_slots", self.assert_same_facts(actual)["inventory_details"])
+        inventory = actual["player"]["inventory"]
+        inventory.update(total_slots=15, used_slots=5, free_slots=10)
+        inventory["items"][0].update(max_stack_size=40, stack_space=36)
+        self.assertEqual(self.assert_same_facts(actual)["inventory_details"], inventory)
+
     def test_farther_entities_are_not_filtered_for_only_one_model(self):
         actual = self.observed()
         actual["nearby"] = [grass(i, 0.1 * i, True) for i in range(25)] + [

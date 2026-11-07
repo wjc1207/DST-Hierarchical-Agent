@@ -2,6 +2,7 @@
 from copy import deepcopy
 
 PLACE_TARGETS = {"visit_building", "set_home", "return_home", "stay_home"}
+HOME_ANCHOR_UNAVAILABLE = "home building missing or unknown; query places again"
 
 
 def query_places(places, query="", building_id=None, offset=0, limit=12):
@@ -39,8 +40,11 @@ def target_progress(target, places):
     if kind == "set_home":
         if home and home.get("anchor_id") == target["anchor_id"]:
             return True, ""
-        building = next((b for b in places.get("buildings", []) if b.get("id") == target["anchor_id"]), None)
-        return False, "" if building and building.get("status") != "missing" else "home building missing or unknown; query places again"
+        buildings = places.get("buildings")
+        if not isinstance(buildings, list):
+            return False, "place telemetry unavailable"
+        building = next((b for b in buildings if b.get("id") == target["anchor_id"]), None)
+        return False, "" if building and building.get("status") != "missing" else HOME_ANCHOR_UNAVAILABLE
     if not home or home.get("id") != target["home_id"]:
         return False, "home unset or changed"
     return bool(home.get("arrived")), ""

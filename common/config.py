@@ -5,10 +5,6 @@ from typing import Optional
 
 from .paths import PROJECT_ROOT
 
-DEFAULT_INSTALLED_ENV = Path(
-    r"C:\Program Files (x86)\Steam\steamapps\common\Don't Starve Together\mods\jev_dst_agent\.env"
-)
-
 
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -27,7 +23,7 @@ def load_dotenv(path: Path) -> None:
 
 def resolve_env_path(explicit: Optional[Path]) -> Path:
     candidates = ([explicit] if explicit is not None else []) + [
-        PROJECT_ROOT / ".env", Path.cwd() / ".env", DEFAULT_INSTALLED_ENV,
+        PROJECT_ROOT / ".env", Path.cwd() / ".env",
     ]
     for candidate in candidates:
         if candidate.exists():

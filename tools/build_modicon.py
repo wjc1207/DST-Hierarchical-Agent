@@ -94,7 +94,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game-dir", type=Path, default=DEFAULT_GAME)
     parser.add_argument("--character", type=Path, default=ROOT / "assets/logo-character.png")
-    parser.add_argument("--output-dir", type=Path, default=ROOT)
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "mods" / "jev_dst_agent")
     parser.add_argument("--size", type=int, choices=(128, 256, 512), default=256)
     args = parser.parse_args()
     background = portrait_background(args.game_dir)

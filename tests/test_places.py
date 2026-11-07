@@ -85,6 +85,33 @@ class PlacesTests(unittest.TestCase):
         self.assertIn("missing", target_progress(board("set_home", "building:43")["tasks"][0]["target"], PLACES)[1])
         self.assertIn("telemetry", target_progress(board()["tasks"][0]["target"], None)[1])
 
+    def test_invalid_home_anchor_releases_focus_to_independent_rope_craft(self):
+        goals = validate_goals({"goal": "Set home and craft rope", "tasks": [
+            {**board("set_home", identity="camp")["tasks"][0], "priority": 1, "focus": True},
+            {"id": "rope", "title": "Craft rope", "priority": 2,
+             "target": {"type": "inventory", "prefab": "rope", "recipe_id": "rope", "count": 1}},
+        ]}, 1)
+        actions = {"recipe_rope": {"kind": "craft", "product": "rope", "recipe_id": "rope", "planner_only": True}}
+        for unavailable in ("destroyed", "forgotten"):
+            with self.subTest(unavailable=unavailable):
+                actual = self.actual()
+                runtime = PriorityBoardExecutor()
+                self.assertEqual(runtime.view(goals, actual)["focus_task_ids"], ["camp"])
+                # Missing telemetry also must not release focus.
+                complete = actual.pop("places")
+                self.assertEqual(runtime.view(goals, actual)["focus_task_ids"], ["camp"])
+                actual["places"] = complete
+                if unavailable == "destroyed":
+                    complete["buildings"][0]["status"] = "missing"
+                else:
+                    complete["buildings"].pop(0)
+                view = runtime.view(goals, actual)
+                self.assertEqual(view["tasks"][0]["status"], "failed")
+                self.assertIn("query places again", view["tasks"][0]["blocked_reason"])
+                self.assertEqual(view["focus_task_ids"], [])
+                self.assertEqual(view["execution_task_ids"], ["rope"])
+                self.assertEqual(runtime.choose(goals, actual, actions, None)[1], "recipe_rope")
+
     def test_task_executor_selects_exact_destination_but_does_local_work_first(self):
         actual = self.actual(); goals = board()
         travel = {"kind": "explore", "planner_only": True, "building_id": "building:42", "mode": "place", "x": 4, "z": 0}

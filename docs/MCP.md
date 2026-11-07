@@ -2,6 +2,17 @@
 
 [English](MCP.EN.md) · [项目首页](../README.md)
 
+游戏 HUD 左上侧提供“自主模式”开关，进入世界后默认关闭。先启动外部控制程序，
+再点击开启，Agent 才开始自主行动。关闭时会立即停止模组动作，玩家可以接管。
+
+在游戏聊天框输入 `goal("在营地建一个烹饪锅，并做出一份肉丸")` 设置或修改长期目标。
+命令只在本机处理，支持中文、英文和单引号，也支持转义引号和反斜杠。
+目标不能为空，最多 256 个字符，格式错误会显示原因并保留原目标。
+设置目标后仍需开启自主模式。鼠标悬停在开关上可查看当前目标。
+目标在当前玩家会话内保留，并随每次 DeepSeek 规划发送。修改目标会触发重新规划，
+迟到的旧回复无法继续执行。未设置目标时，开启模式会按自由生存规划。
+重新进入世界后需要重新设置目标并开启模式。
+
 当前只保留这条原生执行路径，不再提供旧键鼠控制入口：
 
 ```text
@@ -14,20 +25,21 @@ Lua Mod（可用动作、原生执行、结果验证、事件中断）
 
 Python 不再读取游戏日志或模拟键鼠；Lua 主动异步交换消息。MCP 服务本身不调用模型，不需要模型密钥。项目自带的外部控制程序 `mcp_agent/mcp_agent.py` 负责 DeepSeek/JEV 调用和自动循环，也可以替换成其他 MCP 客户端。旧键鼠控制链已删除；模型调用由独立客户端模块实现。
 
-服务端文件放在 `mcp_server/`（入口、`game_bridge.py`、`transport_metrics.py`），客户端文件放在 `mcp_agent/`（自动循环、连接检查器）。模型和搜索意图均在 `mcp_agent/`，共享规则在 `common/`，知识与资源表在 `data/`。`.env`、`logs/` 和 `scripts/jev_bridge_config.lua` 位置不变，不要因迁移重新生成令牌。也可以从项目根目录使用 `python -m mcp_server`、`python -m mcp_agent`。
+服务端文件放在 `mcp_server/`（入口、`game_bridge.py`、`transport_metrics.py`），客户端文件放在 `mcp_agent/`（自动循环、连接检查器）。模型和搜索意图均在 `mcp_agent/`，共享规则在 `common/`，知识与资源表在 `data/`。Python 读取仓库的 `.env` 和 `logs/`，游戏读取已安装模组中的 `scripts/jev_bridge_config.lua`。也可以从项目根目录使用 `python -m mcp_server`、`python -m mcp_agent`。
 
 ## 安装与连接
 
-需要 Python 3.11+。在项目目录运行（也可以在自己的虚拟环境中安装）：
+先将仓库的 `mods/jev_dst_agent` 复制到游戏的 `mods` 目录。需要 Python 3.11+，在项目目录运行以下命令，并将 `$dstMods` 改为实际安装位置。
 
 ```powershell
 python -m pip install -r requirements-mcp.txt
-python .\mcp_server\mcp_server.py --configure-only --write-mod-config .\scripts\jev_bridge_config.lua
+$dstMods = "C:\Program Files (x86)\Steam\steamapps\common\Don't Starve Together\mods"
+python .\mcp_server\mcp_server.py --configure-only --write-mod-config (Join-Path $dstMods "jev_dst_agent\scripts\jev_bridge_config.lua")
 ```
 
-第二条命令创建 `logs/mcp_bridge.json` 中的本机令牌，并生成同一令牌的 Mod 配置。两者都被 Git 忽略。**不要把 API 密钥放进 Mod 配置，不要分享生成的令牌文件。** 使用同一项目和 `--config` 路径启动服务；不要从另一个安装目录另生成一套令牌。
+配置命令在仓库的 `logs/mcp_bridge.json` 保存本机令牌，并把配套配置写入已安装模组。API 密钥保存在本机 `.env`。启动服务时使用同一项目和 `--config` 路径。
 
-把 `modmain.lua`、`modinfo.lua` 和 `scripts/` 复制到安装的 Mod 文件夹，覆盖相应旧版本文件；不要复制 `.env`、`logs/`、`.venv-mcp/`。首次配置时安装生成的 `scripts/jev_bridge_config.lua`；**升级时保留安装目录已有的这个配置，不要用另一目录的配置覆盖它**，也不要另生成一套令牌。完整更新 Python（包括 `mcp_agent/`、`mcp_server/`）与 Mod 文件后，重新进入世界。桥接协议为 4，详细测量版本仍为 1；新自动控制程序拒绝旧版 Mod 快照。不要仅更新一端。
+升级时，从仓库的 `mods/jev_dst_agent/` 复制运行文件，并保留安装目录的 `scripts/jev_bridge_config.lua` 和原来的令牌。完整更新 Python（包括 `mcp_agent/`、`mcp_server/`）与 Mod 文件后，重新进入世界。桥接协议为 4，详细测量版本为 1。
 
 ## DeepSeek/JEV 自动循环
 
@@ -292,3 +304,7 @@ python -m unittest discover -s tests -p test_mcp_agent.py -v
 
 
 `hunger_ratio` 看板任务支持可选任务级 `duration`（游戏天）：达标后为 `maintaining` 并释放执行权，低于目标重新补食，到期达标完成，否则过期。它由 Python 优先级主循环计时，拒绝原生 `auto_execute=true`。详见[任务时间与饥饿维持](TASK_TIME.md)。
+
+## 游戏内对话回复
+
+`send_agent_feedback(text, revision, message_id, finish=false)` 通过当前玩家的原生 `TheNet:Say` 接口发送带 `[DeepSeek]` 前缀的回复，同服玩家可见，长回复按游戏聊天长度限制分条发送。消息受当前控制版本约束，并按 `message_id` 去重。`finish=true` 仅用于指令模式，回复送达后暂停控制。详细交互见 [聊天模式](DIALOGUE.md)。

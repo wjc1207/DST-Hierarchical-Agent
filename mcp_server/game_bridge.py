@@ -20,9 +20,12 @@ from common.residence import validate_area, allowed as residence_allowed
 from common.coordinates import move_action
 from common.placement import resolve as placement_area, inside as inside_placement, BUILD_ACTIONS
 from .transport_metrics import TransportRecorder, lua_measurements
+from common import autonomy
 
 TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
-SUPPORTED = {"cool_down", "add_fuel", "set_home", "craft", "place", "wait", "collect", "craft_torch", "craft_axe", "craft_pickaxe",
+from common.camp_work import CAMP_ACTIONS, CAMP_TARGETS
+
+SUPPORTED = CAMP_ACTIONS | {"cool_down", "add_fuel", "set_home", "craft", "place", "wait", "collect", "craft_torch", "craft_axe", "craft_pickaxe",
              "equip_torch", "unequip_torch", "eat_safe_food", "cook_food",
              "build_campfire", "build_sciencemachine",
              "chop_nearest_tree", "mine_nearest_rock", "explore", "flee_from_nearest_hostile"}
@@ -72,7 +75,7 @@ def check_bridge_port(port):
 
 def signature(state):
     """Observation ownership only. Live game feasibility belongs to Lua."""
-    return state.get("player", {}).get("guid")
+    return state.get("player", {}).get("guid"), autonomy.revision(state)
 
 
 def finite_time(value):
@@ -104,6 +107,30 @@ class GameBridge:
         self.recipe_catalog_version = None
         self.recipe_catalog = None
         self.map_version, self.map_cells = None, None
+        self.agent_feedback = OrderedDict()
+
+    def send_agent_feedback(self, text, revision, message_id, finish=False):
+        """Idempotent player chat delivery scoped to the exact player intent."""
+        with self.lock:
+            self._fresh()
+            try:
+                autonomy.validate_text(text)
+            except ValueError as exc:
+                raise BridgeError(str(exc)) from exc
+            if (type(revision) is not int or revision != autonomy.revision(self.state)
+                    or not isinstance(message_id, str) or not 1 <= len(message_id) <= 100
+                    or type(finish) is not bool):
+                raise BridgeError("Agent feedback belongs to obsolete/invalid player intent")
+            if finish and (self.state.get("autonomy") or {}).get("mode") != "instruction":
+                raise BridgeError("Only instruction mode may finish control")
+            message = {"id": message_id, "text": text, "revision": revision, "finish": finish}
+            existing = self.agent_feedback.get(message_id)
+            if existing is not None and existing != message:
+                raise BridgeError("Agent feedback ID reused with different content")
+            self.agent_feedback[message_id] = message
+            while len(self.agent_feedback) > 32:
+                self.agent_feedback.popitem(last=False)
+            return {"queued": True, "message_id": message_id}
 
     def _fresh(self):
         if self.state is None or self.clock() - self.received > self.max_age:
@@ -132,6 +159,11 @@ class GameBridge:
                         or not isinstance(state.get("bridge", {}).get("available_actions"), dict)))
                     or (kind == "heartbeat" and ("state" in payload or not isinstance(control, dict)))):
                 raise BridgeError("Invalid exchange envelope")
+            if kind == "snapshot":
+                try:
+                    autonomy.settings(state)
+                except ValueError as exc:
+                    raise BridgeError(str(exc)) from exc
             if session != self.session:
                 if session in self.retired or (self.session and self.clock() - self.received <= self.max_age):
                     raise BridgeError("Another game session owns this bridge")
@@ -144,6 +176,7 @@ class GameBridge:
                 self.state, self.state_version = None, 0
                 self.recipe_catalog_version, self.recipe_catalog = None, None
                 self.map_version, self.map_cells = None, None
+                self.agent_feedback.clear()
                 self.snapshot_received = -float("inf")
                 self.snapshot_request, self.snapshot_fulfilled = 0, 0
                 self.changed.notify_all()
@@ -259,7 +292,8 @@ class GameBridge:
                         record.setdefault("_delivered_at", self.clock())
                     command = {"action_id": record["action_id"], "session_id": session,
                                "operation": "cancel" if record["status"] == "cancel_requested" else "start",
-                               "choice": record["choice"], "action": record["action"]}
+                               "choice": record["choice"], "action": record["action"],
+                               "autonomy_revision": record.get("autonomy_revision")}
             result = {"server_id": self.server_id, "session_id": session, "sequence": seq, "command": command,
                       "board_revision": self.board_revision, "snapshot_request_id": self.snapshot_request,
                       "need_snapshot": self.state is None,
@@ -269,6 +303,10 @@ class GameBridge:
                       "need_recipe_catalog": self.state is not None
                           and type(self.state.get("recipe_version")) is int
                           and self.recipe_catalog_version != self.state["recipe_version"]}
+            current_revision = autonomy.revision(self.state or {})
+            self.agent_feedback = OrderedDict((key, message) for key, message in self.agent_feedback.items()
+                                             if message["revision"] == current_revision)
+            result["agent_feedback"] = list(self.agent_feedback.values())
             if kind == "snapshot" or control.get("board_revision") != self.board_revision:
                 result["task_board"] = copy.deepcopy(self.board)
             return result
@@ -332,6 +370,8 @@ class GameBridge:
     def start_action(self, choice: str, observation_id: str, navigation_targets: list | None = None, residence: dict | None = None, destination: dict | None = None, placement: dict | None = None):
         with self.lock:
             self._fresh()
+            if not autonomy.enabled(self.state):
+                raise BridgeError("Autonomy is disabled in the game UI")
             if self.active or (self.board and self.board.get("auto_execute")) \
                     or self.state.get("bridge", {}).get("executor_busy"):
                 raise BridgeError("Executor busy; cancel its action or pause its board first")
@@ -371,6 +411,7 @@ class GameBridge:
             action_id = secrets.token_hex(12)
             record = {"action_id": action_id, "session_id": self.session, "choice": choice,
                       "action": action, "status": "queued", "reason": "",
+                      "autonomy_revision": autonomy.revision(self.state),
                       "expires": self.clock() + 5, "_queued_at": self.clock()}
             self.actions[action_id] = record
             self.active = action_id
@@ -415,6 +456,8 @@ class GameBridge:
             if type(auto_execute) is not bool:
                 raise BridgeError("auto_execute must be a boolean")
             self._fresh()
+            if auto_execute and not autonomy.enabled(self.state):
+                raise BridgeError("Autonomy is disabled in the game UI")
             observation = self.observations.get(observation_id)
             if (not observation or observation[0] != self.session or self.clock() - observation[1] > 10
                     or observation[2] != signature(self.state)):
@@ -422,11 +465,12 @@ class GameBridge:
             if self.active:
                 raise BridgeError("Cancel the active action before replacing the board")
             clean = validate_board(board, int(self.state.get("world", {}).get("day", 1)))
-            if auto_execute and any(t.get("start_at") or "duration" in t or t["target"].get("placement") or t["target"]["type"] in {"stay_home","move_to","refuel"} or t.get("timing_error")
+            if auto_execute and any(t.get("start_at") or "duration" in t or t["target"].get("placement") or t["target"]["type"] in CAMP_TARGETS | {"stay_home","move_to","refuel"} or t["target"].get("allow_ignite") or t.get("timing_error")
                                     for t in clean["tasks"]):
-                raise BridgeError("Timed/residence/refuel tasks require the Python priority-board scheduler; use auto_execute=false")
+                raise BridgeError("Timed/residence/refuel/camp tasks require the Python priority-board scheduler; use auto_execute=false")
             self.board_revision += 1
             self.board = {**clean, "board_id": f"mcp:{self.board_revision}", "auto_execute": bool(auto_execute)}
+            self.board["autonomy_revision"] = autonomy.revision(self.state)
             return {"board_revision": self.board_revision, "auto_execute": bool(auto_execute),
                     "task_errors": clean.get("task_errors",[]),
                     "task_board": board_view(self.board, self.state)}
@@ -506,11 +550,13 @@ def serve_bridge(bridge: GameBridge, port=8765, *, metrics_path: Path | None = N
             except (ValueError, TypeError, KeyError, OSError):
                 result, status = {"error": "Invalid or conflicting exchange"}, 400
             at = time.perf_counter()
-            encoded = json.dumps(result, ensure_ascii=True, allow_nan=False).encode()
+            # Klei's JSON4Lua reads strings as Lua literals and cannot decode
+            # JSON Unicode escapes (\uXXXX becomes literal uXXXX in Lua 5.1).
+            encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
             stages["json_encode_ms"] = (time.perf_counter()-at)*1000
             at = time.perf_counter()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Cache-Control", "no-store")
             # Keep the original one-exchange-per-connection lifetime. Enabling

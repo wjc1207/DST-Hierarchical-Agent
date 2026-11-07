@@ -68,6 +68,27 @@ def create_server(bridge):
                 **invoke(search, packet["state"].get("places", {}), query, building_id, offset, limit)}
 
     @server.tool()
+    async def query_storage(building_id: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        """Read observed chest and Crock Pot states; closed contents are unknown. Never opens containers."""
+        from common.camp_work import query_storage as search
+        packet = await asyncio.to_thread(invoke, bridge.get_state, True) if refresh else invoke(bridge.get_state)
+        return {"session_id": packet["session_id"], "age_seconds": packet["age_seconds"],
+                **invoke(search, packet["state"].get("camp_work") or {}, building_id)}
+
+    @server.tool()
+    async def query_meals(product: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        """Read supported Crock Pot ingredient combinations; never consumes ingredients."""
+        from common.camp_work import query_meals as search
+        packet = await asyncio.to_thread(invoke, bridge.get_state, True) if refresh else invoke(bridge.get_state)
+        return {"session_id": packet["session_id"], "age_seconds": packet["age_seconds"],
+                **invoke(search, packet["state"].get("camp_work") or {}, product)}
+
+    @server.tool()
+    def send_agent_feedback(text: str, revision: int, message_id: str, finish: bool = False) -> dict[str, Any]:
+        """Queue one DeepSeek reply through native player chat. finish stops instruction mode only."""
+        return invoke(bridge.send_agent_feedback, text, revision, message_id, finish)
+
+    @server.tool()
     def start_action(choice: str, observation_id: str,
                      navigation_targets: list[dict[str, Any]] | None = None,
                      residence: dict[str, Any] | None = None,

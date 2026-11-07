@@ -9,18 +9,19 @@ host, `mcp_agent/mcp_agent.py`, connects DeepSeek/JEV to this path. The keyboard
 
 ## Setup
 
-Python 3.11+ is required. From the project folder:
+Copy `mods/jev_dst_agent` from the repository into the game's `mods` directory.
+Use Python 3.11+ and run the following from the project folder. Adjust `$dstMods` to match your installation.
 
 ```powershell
 python -m pip install -r requirements-mcp.txt
-python .\mcp_server\mcp_server.py --configure-only --write-mod-config .\scripts\jev_bridge_config.lua
+$dstMods = "C:\Program Files (x86)\Steam\steamapps\common\Don't Starve Together\mods"
+python .\mcp_server\mcp_server.py --configure-only --write-mod-config (Join-Path $dstMods "jev_dst_agent\scripts\jev_bridge_config.lua")
 ```
 
-This creates an ignored token file at `logs/mcp_bridge.json` and matching ignored
-Mod configuration. Never put model API keys in that configuration or share either
-token file. Copy `modmain.lua`, `modinfo.lua` and `scripts/` to the installed Mod,
-including the generated configuration, then re-enter the world. Do not copy `.env`,
-`logs/` or `.venv-mcp/`. Start the service from the same project/token path.
+The configure command saves the local token at `logs/mcp_bridge.json` and writes
+matching bridge settings into the installed mod. Keep model API keys in the
+repository's local `.env`. Re-enter the world and start the service from the same
+project and token path.
 When upgrading, preserve the existing token/configuration, update Python
 files (including both `mcp_server/` and `mcp_agent/`), Mod entry files and `scripts/` (including
 `jev_timing.lua`), then re-enter the world to load 1.8.6.

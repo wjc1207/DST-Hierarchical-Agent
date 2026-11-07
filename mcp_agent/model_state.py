@@ -15,8 +15,12 @@ def model_game_state(state: dict) -> dict:
     world = state.get("world", {})
     player = state.get("player", {})
     vitals = player.get("vitals", {})
-    inventory_details = {section: player.get("inventory", {}).get(section, [])
+    inventory = player.get("inventory", {})
+    inventory_details = {section: inventory.get(section, [])
                          for section in ("items", "equipped")}
+    for field in ("total_slots", "used_slots", "free_slots"):
+        if field in inventory:
+            inventory_details[field] = inventory[field]
     items, equipped = inventory_details["items"], inventory_details["equipped"]
     counts = {}
     for item in items + equipped:
@@ -35,6 +39,7 @@ def model_game_state(state: dict) -> dict:
     work = state.get("work") or {}
     execution_context = state.get("_jev_execution_context")
     facts = {
+        **({"autonomy": state["autonomy"]} if "autonomy" in state else {}),
         "observed_at": state.get("observed_at"),
         "state_basis": "predicted" if (execution_context or {}).get("predicted_success") else "observed",
         "world": world,

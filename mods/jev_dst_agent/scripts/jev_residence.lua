@@ -16,9 +16,19 @@ function M.allowed(action,s,area,walk)
     if not M.inside(p,area,0.5) then return false end
     local kind=action.kind
     if walk then return M.inside(action,area,2) end
-    if kind=="explore" and action.refuel_approach==true then
+    if kind=="open_container" or kind=="store_item" or kind=="take_item" or kind=="start_meal" or kind=="harvest_meal" then
         for _,b in ipairs((s.places or {}).buildings or {}) do
-            if b.id==action.building_id and b.status~="missing" and (b.prefab=="campfire" or b.prefab=="firepit") then
+            if b.id==action.building_id and b.guid==action.guid then
+                return M.inside(b,area,2) and M.inside(p,area,5)
+            end
+        end
+        return false
+    end
+    if kind=="explore" and (action.refuel_approach==true or action.camp_approach==true) then
+        for _,b in ipairs((s.places or {}).buildings or {}) do
+            if b.id==action.building_id and b.status~="missing"
+                and ((action.refuel_approach and (b.prefab=="campfire" or b.prefab=="firepit"))
+                    or (action.camp_approach and (b.prefab=="cookpot" or b.prefab=="treasurechest"))) then
                 local route=b.route or {};local length=route.distance
                 return route.status=="ready" and action.mode=="place" and finite(length) and length>=0
                     and M.inside(b,area,2) and M.inside(action,area,2) and M.inside(p,area,length+2)

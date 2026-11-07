@@ -1,6 +1,7 @@
 """Conservative bounds for ordinary work during residence; safety is exempt."""
 import math
 from common.task_timing import number
+from common.camp_work import CAMP_ACTIONS
 
 
 def inside(point, area, margin=0):
@@ -14,12 +15,17 @@ def allowed(action, state, area):
     if not inside(position, area, .5):
         return False
     kind = action.get("kind")
-    if kind == "explore" and action.get("refuel_approach") is True:
+    if kind in CAMP_ACTIONS - {"ignite_tree"}:
+        fixture = next((r for r in (state.get("places") or {}).get("buildings", [])
+                        if r.get("id") == action.get("building_id") and r.get("guid") == action.get("guid")), None)
+        return inside(fixture, area, 2) and inside(position, area, 5)
+    if kind == "explore" and (action.get("refuel_approach") is True or action.get("camp_approach") is True):
+        allowed_prefabs = {"campfire", "firepit"} if action.get("refuel_approach") else {"cookpot", "treasurechest"}
         building = next((b for b in (state.get("places") or {}).get("buildings", [])
                          if b.get("id")==action.get("building_id")), None)
         route = (building or {}).get("route") or {}
         length = route.get("distance")
-        return (bool(building) and building.get("prefab") in {"campfire","firepit"}
+        return (bool(building) and building.get("prefab") in allowed_prefabs
                 and building.get("status")!="missing" and route.get("status")=="ready"
                 and action.get("mode")=="place"
                 and inside(building,area,2) and inside(action,area,2)

@@ -1,4 +1,4 @@
-package.path="./scripts/?.lua;"..package.path
+package.path="./mods/jev_dst_agent/scripts/?.lua;"..package.path
 local T=require("jev_thermal")
 local N=require("jev_native_executor")
 local R=require("jev_refueling")
@@ -171,6 +171,68 @@ test("heat warning cannot interrupt hostile escape",function()
  assert(x:start({action_id="flee",choice="flee_from_nearest_hostile"},s,0))
  local after=clone(s);after.player.position.x=2;x:tick(after,.2)
  assert(x.active and x.active.action.kind=="flee_from_nearest_hostile")
+end)
+test("burning trees cause retreat before overheating, even without a temperature replica",function()
+ local G,p=fixture()
+ p.player_classified=nil
+ local tree={prefab="evergreen",dx=2,dz=0,tags={"fire"}}
+ local result=T.sample(G,p,{}, {tree},function() return true end)
+ assert(result.active and result.flame_danger and result.available)
+ assert(result.reason=="move_away_from_flames" and result.route.x<1)
+ assert(N.available({world={phase="day"},player={vitals={},inventory={items={},equipped={}}},
+   nearby={},thermal=result}).cool_down)
+ tree.dx=5
+ assert(not T.sample(G,p,{}, {tree},function() return true end).active)
+ G.TheWorld.state.isspring=true;G.TUNING.SPRING_FIRE_RANGE_MOD=1.5
+ assert(T.sample(G,p,{}, {tree},function() return true end).flame_danger)
+end)
+test("flame retreat avoids unlit paths and cannot approach another burning object",function()
+ local G,p=fixture();p.player_classified.currenttemperature=30
+ local tree={prefab="evergreen",dx=2,dz=0,tags={"fire"}}
+ assert(not T.sample(G,p,vitals(G,p),{tree},function() return false end).route)
+ G.TheWorld.state.isnight=true
+ G.TheSim.GetLightAtPoint=function() return 0 end
+ assert(not T.sample(G,p,vitals(G,p),{tree},function() return true end).route)
+ G.TheWorld.state.isnight=false
+ p._jev_cooling_sources={{x=0,z=0,flame_radius=4},{x=6,z=0,flame_radius=4}}
+ assert(not T.route_safe(G,p,{x=5,z=0},function() return true end))
+end)
+test("a confirmed ignition immediately retreats and reports success only after getting clear",function()
+ local s=state(false);local calls={}
+ local action={kind="ignite_tree",guid=5,prefab="evergreen",torch_guid=10,planner_only=true}
+ s.camp_work={options={ignite=action},trees={}}
+ s.nearby={{guid=5,prefab="evergreen",distance=2,collect_path={status="ready"}}}
+ local x=N.new({stop=function() end,issue=function(_,a) calls[#calls+1]=a.kind;return true end,
+   cooling_safe=function() return true end})
+ assert(x:start({action_id="ignite",choice="ignite",action=action},s,0))
+ local burning=clone(s)
+ burning.player.vitals.health=149
+ burning.camp_work.trees={{guid=5,status="burning"}}
+ burning.thermal={active=true,flame_danger=true,route={x=-3,z=0}}
+ x:tick(burning,.2)
+ assert(x.active and x.report.status=="running" and calls[2]=="cool_down")
+ assert(x.active.ignition_confirmed)
+ local clear=clone(burning)
+ clear.player.position={x=-3,z=0}
+ clear.thermal={active=false,flame_danger=false}
+ x:tick(clear,1)
+ assert(not x.active and x.report.status=="completed" and x.report.reason=="tree_ignited")
+end)
+test("ignition retreat continues in bounded safe steps until outside flame range",function()
+ local s=state(false);local calls=0
+ local action={kind="ignite_tree",guid=5,prefab="evergreen",planner_only=true}
+ s.camp_work={options={ignite=action},trees={}}
+ s.nearby={{guid=5,prefab="evergreen",distance=2,collect_path={status="ready"}}}
+ local x=N.new({stop=function() end,issue=function() calls=calls+1;return true end,
+   cooling_safe=function() return true end})
+ assert(x:start({action_id="ignite",choice="ignite",action=action},s,0))
+ s.camp_work.trees={{guid=5,status="burning"}}
+ s.thermal={active=true,flame_danger=true,route={x=-1,z=0}}
+ x:tick(s,.2)
+ s.player.position={x=-1,z=0}
+ s.thermal.route={x=-3,z=0}
+ x:tick(s,.6)
+ assert(x.active and calls==3 and x.active.action.x==-3)
 end)
 test("fuel intervals preserve quarter boundaries and never label estimates exact",function()
  for section=0,4 do

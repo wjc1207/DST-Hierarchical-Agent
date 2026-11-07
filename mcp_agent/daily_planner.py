@@ -7,6 +7,7 @@ import math
 import shutil
 import time
 import uuid
+import threading
 import urllib.error
 import urllib.request
 from collections import deque
@@ -14,8 +15,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional
+from mcp_agent.planning_core import (PLANNING_CONTRACT, request_json_plan, validate_reply,
+                                     recent_exchanges as bounded_exchanges, load_knowledge,
+                                     DEFAULT_API_URL, DEFAULT_MODEL, PLAN_MAX_TOKENS,
+                                     PLAN_HISTORY_TURNS, PLAN_HISTORY_CHARS, MAX_KNOWLEDGE_CHARS)
 from common.paths import DATA_DIR, LOG_DIR
 from common.recipes import query_recipes, RECIPE_TOOL
+from common.camp_work import CAMP_TARGETS, MEALS_TOOL, STORAGE_TOOL, query_meals, query_storage, target_error as camp_error
+from common import autonomy
 from common.places import query_places, PLACE_TOOL, PLACE_TARGETS, target_progress
 from common.coordinates import observed_point, validate_point
 from common.refueling import target_error as refuel_error
@@ -29,16 +36,10 @@ from mcp_agent.action_sequence import SequenceExecutor, is_sequence, validate_se
 from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, validate_goals, merge_goals, idle_review_reason, idle_review_marker
 
 
-DEFAULT_API_URL = "https://api.deepseek.com/chat/completions"
-DEFAULT_MODEL = "deepseek-flash"
 PLAN_PREVIEW_CHARS = 240
 KNOWLEDGE_PATH = DATA_DIR / "DSTKnowledge.txt"
-MAX_KNOWLEDGE_CHARS = 12000
-PLAN_MAX_TOKENS = 4096
 BOARD_LOG_DIR = LOG_DIR
 COMPLETION_REPLAN_INTERVAL = 15.0
-PLAN_HISTORY_TURNS = 3
-PLAN_HISTORY_CHARS = 48000
 STATIC_REFERENCE_MARKER = "\n\nStatic reference JSON (background, not a live observation):\n"
 PLANNING_POLICY = {"quarters_per_day": 4, "mode": "review_not_reset"}
 CONTROL_CONTRACT = {
@@ -64,7 +65,7 @@ SUPPORTED_CAPABILITIES = {
     "inventory_target_prefabs": sorted(INVENTORY_TARGET_PREFABS),
     "inventory_prefab_aliases": dict(INVENTORY_PREFAB_ALIASES),
     "target_types": ["inventory", "structure", "hunger_ratio", "visit_region", "survey_region", "known_regions",
-                     "visit_building", "set_home", "return_home", "stay_home", "move_to", "refuel"],
+                     "visit_building", "set_home", "return_home", "stay_home", "move_to", "refuel", *sorted(CAMP_TARGETS)],
     "constraints": {"max_carried_tools_or_torches": 1, "campfire_build_phase": "night", "max_focus_tasks": 2},
 }
 
@@ -85,7 +86,7 @@ def planning_slot(state: dict) -> Optional[tuple[int, int]]:
 
 
 def load_dst_knowledge(path: Path = KNOWLEDGE_PATH) -> str:
-    return path.read_text(encoding="utf-8").strip()[:MAX_KNOWLEDGE_CHARS]
+    return load_knowledge(path, limit=MAX_KNOWLEDGE_CHARS)
 
 
 def planning_reference(knowledge_path: Path = KNOWLEDGE_PATH, *, knowledge: Optional[str] = None) -> dict:
@@ -125,6 +126,7 @@ def snapshot_message(context: dict) -> str:
     snapshot.pop("_recipe_epoch", None)
     snapshot.pop("_place_catalog", None)
     snapshot.pop("_map_context", None)
+    snapshot.pop("_camp_work", None)
     return json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -148,6 +150,12 @@ def planning_context(state: dict, history: list[dict]) -> dict:
                               "building_count": len(state["places"].get("buildings", [])),
                               "instructions": "Use query_places for building IDs and legal home anchors."}}
            if "places" in state else {}),
+        **({"_camp_work": {k: deepcopy(state["camp_work"].get(k)) for k in ("available", "fixtures", "meals", "trees")},
+            "camp_work_summary": {"available": True,
+                 "fixtures": [{k: row.get(k) for k in ("building_id", "prefab", "phase", "contents_known")}
+                              for row in state["camp_work"].get("fixtures", [])],
+                 "trees": deepcopy(state["camp_work"].get("trees", []))}}
+           if (state.get("camp_work") or {}).get("available") else {}),
         "recipe_query": {"available": bool(state.get("recipes")),
                          "recipe_count": len(state.get("recipes", {})),
                          "index": deepcopy(state.get("recipe_index")),
@@ -157,7 +165,21 @@ def planning_context(state: dict, history: list[dict]) -> dict:
             for event in history
         ),
         "recent_actions": history[-40:],
+        "long_term_goal": (state.get("autonomy") or {}).get("goal"),
+        "interaction": {key: deepcopy((state.get("autonomy") or {}).get(key))
+                        for key in ("mode", "revision", "instruction", "messages")},
     }
+
+
+def validate_agent_response(raw, day, context):
+    """Separate conversational/completion replies from executable task boards."""
+    reply = validate_reply(raw, context)
+    if reply is not None:
+        return reply
+    plan = validate_goals(raw, day)
+    if "reply" in raw:
+        plan["reply"] = autonomy.validate_text(raw["reply"])
+    return plan
 
 
 def _short_text(value: object, limit: int) -> str:
@@ -197,16 +219,8 @@ def validate_plan(raw: object, day: int) -> dict:
     }
 
 
-def recent_exchanges(exchanges) -> list[tuple[str, str]]:
-    """Keep a chronological suffix of complete user/assistant pairs, never fragments."""
-    retained, size = [], 0
-    for user, assistant in reversed(list(exchanges)[-PLAN_HISTORY_TURNS:]):
-        pair_size = len(user) + len(assistant)
-        if size + pair_size > PLAN_HISTORY_CHARS:
-            break
-        retained.append((user, assistant))
-        size += pair_size
-    return list(reversed(retained))
+def recent_exchanges(exchanges):
+    return bounded_exchanges(exchanges, turns=PLAN_HISTORY_TURNS, max_chars=PLAN_HISTORY_CHARS)
 
 
 def camp_site_requires_map(site, previous_site):
@@ -227,18 +241,9 @@ def camp_site_requires_map(site, previous_site):
 
 def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
                  conversation: Optional[list[tuple[str, str]]] = None,
-                 reference: Optional[dict] = None) -> dict:
+                 reference: Optional[dict] = None, *, cancel_event=None) -> dict:
     # Goal scheduling is deterministic. The model supplies needs, not movement legs.
-    system_prompt = (
-        "You maintain a priority task_board for Don't Starve Together. Return JSON only, not an action sequence. "
-        "Use 1-6 tasks with stable id, title, priority (1 highest..5), focus (boolean, default false), target, depends_on, reason, "
-        "Query tools at most FOUR times per response; split larger batches across responses. "
-        "search_budget_seconds (10-600, default120), search_budget_distance (8-2000, default240). "
-        "Any task may have start_at:{day,progress:0..1 exclusive} or start_at:{day,phase:day|dusk|night}. "
-        "Before start_at it is scheduled and does not activate focus. Omit start_at for immediate eligibility after dependencies. "
-        "Default to omitting start_at. Add it only for an explicit user schedule or a concrete phase/time requirement, "
-        "and explain that requirement in reason. Low priority, non-urgent reserves, or a plan to return home do not by themselves "
-        "justify postponing work until tomorrow. Keep existing immediately eligible goals eligible unless changed facts require a delay. "
+    system_prompt = PLANNING_CONTRACT + (
         "Ordinary tasks accept start_at. hunger_ratio and refuel ratio targets optionally accept task-level duration (game days, >0..7) to maintain the target. "
         "Without duration hunger_ratio is a one-shot milestone. With duration, its clock starts when start_at/dependencies "
         "are satisfied and observed hunger/time are available, even if hungry; safety does not pause this game-time window. "
@@ -271,6 +276,20 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "Explicitly plan intermediate ingredients and technology prerequisites; no automatic dependency solver exists. "
         "A supported but not-ready recipe can be a future goal after prerequisites. Unknown/unsupported recipes cannot. "
         "hunger_ratio {at_least:0..1}; visit_region {node_id} for a known node; known_regions {count}. "
+        "When camp_work_summary.available, query_places finds known treasurechest and cookpot IDs. "
+        "inspect_storage {building_id} travels to and opens a chest; query_storage reads observed slots only. Unknown or closed is not empty. "
+        "deposit/withdraw {building_id,prefab,count} move a counted batch once; use new IDs for new batches. "
+        "count is the TOTAL for that batch, not the remaining quantity. Changing count on the same task ID "
+        "retains verified transfers; do not subtract already moved items from count. "
+        "Do not treat storing or withdrawing as a generic inventory goal. Reserve essentials, and do not assume a chest contains items never observed. "
+        "query_meals lists verified crock-pot combinations. cook_meal {building_id,product,ingredients} needs an exact four-item list and "
+        "completes only after taking the named dish. Preserve the same ID and target while the pot cooks; other work can run while waiting. "
+        "Never replace foreign ingredients or harvest an untracked meal. Explicitly gather missing ingredients first. "
+        "Build and observe the chest or pot before submitting its interaction task. For chests, explicitly craft boards; for pots, explicitly "
+        "craft cutstone and stock twigs and charcoal. Use queried recipe IDs for these intermediate craft goals. Keep unfinished building goals across phase changes. "
+        "For charcoal, inventory {prefab:charcoal,count,allow_ignite:true} permits lighting safe isolated trees with a carried torch. It "
+        "waits for burnout, chops burnt trees and verifies charcoal pickup; prepare an axe and torch. Never ignite in camp or at night. "
+        "ignite_tree {tree_guid} is an explicit ignition-only task for a currently observed ignitable tree, not charcoal collection. "
         "Place goals: visit_building {building_id}, set_home {anchor_id}, return_home {home_id}. "
         "Building IDs from query_places are stable opaque site IDs; guid is only the current client entity binding. "
         "Never reconstruct building_id/anchor_id from a guid; retain the returned id after replica reloads. "
@@ -427,9 +446,9 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
     }
     catalog = context.get("_recipe_catalog", {})
     place_catalog = context.get("_place_catalog")
+    camp_catalog = context.get("_camp_work")
     functions = {}
     map_images = []
-    map_seen = False
     if isinstance(context.get("_map_context"),dict):
         def query_map(**args):
             metadata,url = render_map(context["_map_context"],output_dir=LOG_DIR,**args)
@@ -440,151 +459,78 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         functions["query_recipes"] = lambda **args: query_recipes(catalog, epoch=context.get("_recipe_epoch"), **args)
     if isinstance(place_catalog, dict):
         functions["query_places"] = lambda **args: query_places(place_catalog, **args)
+    if isinstance(camp_catalog, dict) and camp_catalog.get("available"):
+        functions["query_storage"] = lambda **args: query_storage(camp_catalog, **args)
+        functions["query_meals"] = lambda **args: query_meals(camp_catalog, **args)
     if functions:
-        body["tools"] = [tool for tool in (RECIPE_TOOL, PLACE_TOOL, MAP_TOOL) if tool["function"]["name"] in functions]
-    failures = 0
-    for attempt in range(8):
-        if failures:
-            # A short non-thinking retry leaves more of the budget for JSON output.
-            body["reasoning_effort"] = "none"
-        request = urllib.request.Request(
-            api_url,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"DeepSeek planning HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"DeepSeek planning connection failed: {exc.reason}") from exc
-
-        usage = payload.get("usage") or {}
-        if not isinstance(usage, dict):
-            usage = {}
-        cache_counts = {key: usage[key] for key in (
-            "prompt_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
-            if type(usage.get(key)) is int and usage[key] >= 0}
-        if cache_counts:
-            print(f"daily_plan_usage attempt={attempt + 1} " + " ".join(
-                f"{key}={value}" for key, value in cache_counts.items()))
-        choices = payload.get("choices") or []
-        if not choices or not isinstance(choices[0], dict):
-            raise RuntimeError("DeepSeek planning response has no choice")
-        choice = choices[0]
-        finish_reason = choice.get("finish_reason")
-        message = choice.get("message") or {}
-        calls = message.get("tool_calls") or []
-        if calls:
-            map_images.clear()
-            if len(calls) > 4:
-                record_plan_error(day, "query_limit", f"Received {len(calls)} tool calls; executing at most four")
-            body["messages"].append({"role": "assistant", "content": message.get("content"),
-                                     "tool_calls": calls,
-                                     **({"reasoning_content": message["reasoning_content"]} if "reasoning_content" in message else {})})
-            for index, call in enumerate(calls):
-                try:
-                    if index >= 4:
-                        raise ValueError("At most four query calls are executed per response. Submit this query again in a later response if still needed.")
-                    function = call["function"]
-                    if function["name"] not in functions:
-                        raise ValueError("Unknown planner tool")
-                    result = functions[function["name"]](**json.loads(function["arguments"]))
-                except (ValueError, TypeError, KeyError) as exc:
-                    result = {"error": str(exc)}
-                body["messages"].append({"role": "tool", "tool_call_id": call["id"],
-                                         "content": json.dumps(result, ensure_ascii=False)})
-            if map_images:
-                map_seen = True
-                # DeepSeek permits images in USER messages, not tool messages.
-                # Complete every tool reply before adding the requested images.
-                parts=[]
-                for metadata,url in map_images:
-                    parts.extend([{"type":"text","text":"Requested observed map from the SAME frozen planning snapshot: "+json.dumps(metadata)},
-                                  {"type":"image_url","image_url":{"url":url}}])
-                body["messages"].append({"role":"user","content":parts})
-            continue
-        content = message.get("content") or ""
-        completion_tokens = usage.get("completion_tokens")
-        if finish_reason == "stop" and content:
-            try:
-                plan = validate_goals(json.loads(content), day)
-                world_map = (context.get("_map_context") or {}).get("world_map")
-                if plan.get("camp_site"):
-                    accepted_board = context.get("current_task_board") or context.get("previous_task_board") or {}
-                    if not map_seen and camp_site_requires_map(plan["camp_site"], accepted_board.get("camp_site")):
-                        raise ValueError("Call query_map before first camp selection or changing camp_site primary/backup coordinates; unchanged accepted coordinates need no repeat image")
-                    observed_point(plan["camp_site"],world_map)
-                    if plan["camp_site"].get("backup"):
-                        observed_point(plan["camp_site"]["backup"],world_map)
-                for task in plan["tasks"]:
-                    if task.get("timing_error"):
-                        continue
-                    target = task["target"]
-                    if target["type"] == "move_to":
-                        observed_point(target,world_map)
-                    if target.get("placement"):
-                        placement_area(target["placement"],{"places":place_catalog})
-                        if not context.get("control",{}).get("placement_constraints"):
-                            raise ValueError("Placement constraints require updated Mod")
-                    elif (target["type"]=="structure" and target.get("prefab") in CAMP_STRUCTURES
-                          and camp_anchor_available(place_catalog)):
-                        raise ValueError("Camp structure requires target.placement:{anchor_id:building:<GUID>,radius:10}; query_places and bind the camp anchor before building")
-                    if target["type"] == "refuel":
-                        error = (refuel_error(target, place_catalog) or
-                                 ("Refueling requires updated Mod telemetry" if not context.get("refueling", {}).get("available") else ""))
-                        if error:
-                            raise ValueError(error)
-                    if target["type"] in PLACE_TARGETS:
-                        _, error = target_progress(target, place_catalog)
-                        if error:
-                            raise ValueError("Place goal has no observed destination: " + error)
-                    if target.get("recipe_id"):
-                        recipe = catalog.get(target["recipe_id"], {})
-                        if (recipe.get("legacy") or not recipe.get("supported") or recipe.get("product") != target.get("prefab")
-                                or bool(recipe.get("placement")) != (target["type"] == "structure")):
-                            raise ValueError("Goal does not match a supported observed recipe")
-                # Catch patch/retained-goal conflicts while the model can still
-                # repair this response, rather than failing at adoption later.
-                merge_goals(context.get("current_task_board") or context.get("previous_task_board"), plan)
-                return plan
-            except (ValueError, TypeError) as exc:
-                reason = f"invalid_json_or_plan:{type(exc).__name__}:{str(exc)[:1200]}"
-        else:
-            reason = f"finish_reason={finish_reason} content_chars={len(content)}"
-        record_plan_error(day, "response_validation", reason)
-        retryable = finish_reason in {"stop", "length", "insufficient_system_resource", "aborted"}
-        if failures == 0 and retryable:
-            failures += 1
-            print(f"daily_plan_retry day={day} reason={reason} attempt=2/2")
-            if finish_reason == "stop" and content:
-                body["messages"].append({"role":"assistant", "content":content})
-            body["messages"].append({"role":"user", "content":
-                "Your last reply could not be accepted: " + reason +
-                ". Correct this error using the latest game snapshot above and return a valid nonempty priority task_board JSON. "
-                "Keep the merged board within six tasks; preserve useful unfinished goals and explicitly cancel obsolete ones. "
-                "Do not repeat an invalid reply or silently remove unfinished goals."})
-            continue
-        raise RuntimeError(
-            f"DeepSeek planning response unusable: {reason} "
-            f"completion_tokens={completion_tokens}"
-        )
-    raise RuntimeError("DeepSeek planning retry exhausted")
+        body["tools"] = [tool for tool in (RECIPE_TOOL, PLACE_TOOL, MAP_TOOL, STORAGE_TOOL, MEALS_TOOL)
+                         if tool["function"]["name"] in functions]
+    def validate_response(raw, map_seen):
+        plan = validate_agent_response(raw, day, context)
+        if plan.get("kind") == "agent_reply":
+            return plan
+        world_map = (context.get("_map_context") or {}).get("world_map")
+        if plan.get("camp_site"):
+            accepted_board = context.get("current_task_board") or context.get("previous_task_board") or {}
+            if not map_seen and camp_site_requires_map(plan["camp_site"], accepted_board.get("camp_site")):
+                raise ValueError("Call query_map before first camp selection or changing camp_site primary/backup coordinates; unchanged accepted coordinates need no repeat image")
+            observed_point(plan["camp_site"],world_map)
+            if plan["camp_site"].get("backup"):
+                observed_point(plan["camp_site"]["backup"],world_map)
+        for task in plan["tasks"]:
+            if task.get("timing_error"):
+                continue
+            target = task["target"]
+            if target["type"] == "move_to":
+                observed_point(target,world_map)
+            if target.get("placement"):
+                placement_area(target["placement"],{"places":place_catalog})
+                if not context.get("control",{}).get("placement_constraints"):
+                    raise ValueError("Placement constraints require updated Mod")
+            elif (target["type"]=="structure" and target.get("prefab") in CAMP_STRUCTURES
+                  and camp_anchor_available(place_catalog)):
+                raise ValueError("Camp structure requires target.placement:{anchor_id:building:<GUID>,radius:10}; query_places and bind the camp anchor before building")
+            if target["type"] == "refuel":
+                error = (refuel_error(target, place_catalog) or
+                         ("Refueling requires updated Mod telemetry" if not context.get("refueling", {}).get("available") else ""))
+                if error:
+                    raise ValueError(error)
+            if target["type"] in CAMP_TARGETS:
+                error = camp_error(target, {"camp_work": camp_catalog, "places": place_catalog})
+                if error:
+                    raise ValueError(error)
+                if target["type"] == "ignite_tree" and not any(
+                        row.get("guid") == target["tree_guid"] and row.get("status") == "ignitable"
+                        for row in camp_catalog.get("trees", [])):
+                    raise ValueError("Ignition requires an observed ignitable tree")
+            if target.get("allow_ignite") and not (camp_catalog or {}).get("available"):
+                raise ValueError("Charcoal ignition requires updated Mod telemetry")
+            if target["type"] in PLACE_TARGETS:
+                _, error = target_progress(target, place_catalog)
+                if error:
+                    raise ValueError("Place goal has no observed destination: " + error)
+            if target.get("recipe_id"):
+                recipe = catalog.get(target["recipe_id"], {})
+                if (recipe.get("legacy") or not recipe.get("supported") or recipe.get("product") != target.get("prefab")
+                        or bool(recipe.get("placement")) != (target["type"] == "structure")):
+                    raise ValueError("Goal does not match a supported observed recipe")
+        # Catch patch/retained-goal conflicts while the model can still
+        # repair this response, rather than failing at adoption later.
+        merge_goals(context.get("current_task_board") or context.get("previous_task_board"), plan)
+        return plan
+    return request_json_plan(api_url, api_key, body, validate_response,
+                             functions=functions, map_images=map_images, cancel_event=cancel_event,
+                             on_error=lambda stage, detail: record_plan_error(day, stage, detail), day=day)
 
 
 def timed_request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
                        conversation: Optional[list[tuple[str, str]]] = None,
-                       reference: Optional[dict] = None) -> tuple:
+                       reference: Optional[dict] = None, cancel_event=None) -> tuple:
     """Measure the worker's request, excluding the JEV cycle's polling delay."""
     started_at = time.monotonic()
     try:
-        plan = request_plan(api_url, api_key, model, day, context, conversation, reference)
+        plan = request_plan(api_url, api_key, model, day, context, conversation, reference,
+                            **({"cancel_event": cancel_event} if cancel_event is not None else {}))
     except Exception as exc:
         return None, time.monotonic() - started_at, exc
     return plan, time.monotonic() - started_at, None
@@ -631,6 +577,66 @@ class DailyPlanner:
         self.goal_retry_at = 0.
         self.goal_terminal = None
         self.legacy_mode = False
+        self.autonomy_settings = None
+        self.cancel_event = None
+        self.hold_execution = False
+        self.instruction_finished = False
+        self.feedback = deque()
+
+    def queue_feedback(self, text, *, finish=False):
+        if text and (self.autonomy_settings or {}).get("mode"):
+            self.feedback.append({"text": text, "finish": finish,
+                "revision": self.autonomy_settings["revision"], "message_id": uuid.uuid4().hex})
+
+    def _accept_reply(self, result, state):
+        control = self.autonomy_settings or {}
+        # Recheck completion against the latest world, not just the request snapshot.
+        validate_agent_response(result, state["world"]["day"], {
+            "interaction": control, "current_task_board": self._board(state) if self.plan else None})
+        finish = control.get("mode") == "instruction" and (
+            result["outcome"] in {"completed", "blocked"} or self.plan is None)
+        self.queue_feedback(result["reply"], finish=finish)
+        self.hold_execution = finish
+        self.instruction_finished = finish
+        self.goal_replan_reason = None
+        self.goal_terminal = idle_review_marker(self._board(state)) if is_priority_board(self.plan) else None
+        print(f"agent_reply outcome={result['outcome']} finish={finish} revision={control.get('revision')}")
+
+    def _update_autonomy(self, state):
+        control = autonomy.settings(state)
+        if control is None:
+            return True
+        previous = self.autonomy_settings
+        if control != previous:
+            self.autonomy_settings = deepcopy(control)
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            if self.future is not None:
+                self.future.cancel()
+            self.future = None
+            self.pending_user_message = self.pending_basis = self.pending_slot = None
+            self.requested_slot = None
+            self.goal_retry_at = 0.
+            self.goal_terminal = None
+            self.feedback.clear()
+            self.instruction_finished = False
+            goal_changed = control["goal"] != (previous or {}).get("goal")
+            messages = control.get("messages") or []
+            previous_messages = (previous or {}).get("messages") or []
+            message_changed = bool(messages and (not previous_messages or messages[-1]["id"] != previous_messages[-1]["id"]))
+            self.goal_replan_reason = "player_message" if message_changed else "long_term_goal_changed" if goal_changed else "autonomy_resumed"
+            self.hold_execution = message_changed or control.get("mode") == "instruction"
+            self.goals.pause_accounting()
+            if goal_changed:
+                self.plan = self.previous_board = None
+                self.conversation.clear()
+                self.goals = PriorityBoardExecutor()
+                self.sequence = SequenceExecutor()
+                self.legacy_mode = False
+            if message_changed and self.plan is not None and not is_priority_board(self.plan):
+                self.plan = self.previous_board = None
+                self.legacy_mode = False
+        return control["enabled"]
 
     def _board(self, state):
         if is_priority_board(self.plan):
@@ -703,6 +709,12 @@ class DailyPlanner:
         return self.update(state)
 
     def update(self, state: dict) -> Optional[dict]:
+        if not self._update_autonomy(state):
+            return None
+        control = self.autonomy_settings or {}
+        if self.instruction_finished or (control.get("mode") == "instruction" and not control.get("instruction")):
+            self.hold_execution = True
+            return None
         # The Mod normalizes Klei's researchlab to the public structure name.
         # An observed existing machine is also a verified milestone.
         if any(e.get("prefab") == "sciencemachine" for e in state.get("nearby", [])):
@@ -714,7 +726,7 @@ class DailyPlanner:
         if self.plan is None and self.future is not None and self.future.done():
             try:
                 pending = self.future.result()[0]
-                if pending is not None and not is_priority_board(pending):
+                if pending is not None and pending.get("kind") != "agent_reply" and not is_priority_board(pending):
                     self.legacy_mode = True
                     return self._legacy_update(state)
             except Exception:
@@ -739,7 +751,18 @@ class DailyPlanner:
                     and (basis[2] is None or state.get("observed_at", basis[2]) >= basis[2]))))
                 if not compatible:
                     raise ValueError("Planner snapshot belongs to a different/reset player session")
+                if result.get("kind") == "agent_reply":
+                    self._accept_reply(result, state)
+                    if user:
+                        self.conversation = deque(recent_exchanges([*self.conversation,
+                            (user, json.dumps(result, ensure_ascii=False))]), maxlen=PLAN_HISTORY_TURNS)
+                    view = self._board(state) if self.plan else None
+                    self._publish_board(view)
+                    return None if self.hold_execution else view
+                reply = result.get("reply")
                 result = merge_goals(self._board(state) or self.previous_board, result)
+                if reply:
+                    result["reply"] = reply
                 graph = state.get("navigation", {}).get("graph") or {}
                 known = {graph.get("current_node"), *(r.get("node_id") for r in graph.get("routes", []))}
                 if any(t["target"]["type"] in {"visit_region", "survey_region"} and t["target"]["node_id"] not in known for t in result["tasks"]):
@@ -747,6 +770,9 @@ class DailyPlanner:
                 self.board_revision += 1
                 result.update(board_id=f"{self.board_run_id}:{self.board_revision}", quarter=quarter + 1)
                 self.plan = result
+                self.hold_execution = False
+                if reply or (user and json.loads(user).get("replan_reason") == "player_message"):
+                    self.queue_feedback(reply or ("我会按这个安排执行：" + result["goal"])[:256])
                 new_batch = bool(user and json.loads(user).get("replan_reason") == "all_tasks_completed")
                 self.goals.adopt(result, new_batch=new_batch)
                 reviewed_reason = json.loads(user).get("replan_reason") if user else None
@@ -765,6 +791,8 @@ class DailyPlanner:
                 self.goal_replan_reason = "review_retry"
         view = self._board(state) if self.plan else None
         idle_reason = idle_review_reason(view)
+        if control.get("mode") == "instruction" and idle_reason == "all_tasks_completed":
+            self.hold_execution = True
         if idle_reason:
             marker = idle_review_marker(view)
             # The response to an idle-board review may intentionally keep waiting.
@@ -787,6 +815,12 @@ class DailyPlanner:
                 print(f"task_board_review_requested reason={self.goal_replan_reason}")
         else:
             self.goal_terminal = None
+        # A model may return another already-satisfied milestone instead of a
+        # final reply. Recheck after the normal backoff, rather than waiting a
+        # whole game quarter while instruction control is held.
+        if (control.get("mode") == "instruction" and idle_reason == "all_tasks_completed"
+                and self.future is None and self.goal_replan_reason is None and now >= self.goal_retry_at):
+            self.goal_replan_reason = "instruction_completion_check"
         reason = self.goal_replan_reason or ("quarter_review" if self.plan else "initial_plan")
         if self.future is None and now >= self.goal_retry_at and (self.requested_slot != slot or self.goal_replan_reason):
             context = planning_context(state, list(self.history))
@@ -798,13 +832,17 @@ class DailyPlanner:
             self.pending_user_message = snapshot_message(context)
             self.pending_basis = (state.get("player", {}).get("guid"), state.get("bridge", {}).get("session_id"), state.get("observed_at"))
             self.future = self.executor.submit(timed_request_plan, self.api_url, self.api_key, self.model, day,
-                                               context, list(self.conversation), reference)
+                                               context, list(self.conversation), reference, self._new_cancel_event())
             self.pending_slot = self.requested_slot = slot
             self.goal_replan_reason = None
             self.goal_retry_at = now + COMPLETION_REPLAN_INTERVAL
             print(f"daily_plan_requested day={day} quarter={quarter + 1}/4 reason={reason} knowledge_chars={len(reference['dst_knowledge'])} history_turns={len(self.conversation)}")
         self._publish_board(view)
-        return view
+        return None if self.hold_execution else view
+
+    def _new_cancel_event(self):
+        self.cancel_event = threading.Event()
+        return self.cancel_event
 
     def _legacy_update(self, state: dict) -> Optional[dict]:
         """Poll without waiting; keep active sequences, replan on terminal progress."""
@@ -962,4 +1000,6 @@ class DailyPlanner:
             self.failure_count = 0
 
     def close(self) -> None:
+        if self.cancel_event is not None:
+            self.cancel_event.set()
         self.executor.shutdown(wait=False, cancel_futures=True)

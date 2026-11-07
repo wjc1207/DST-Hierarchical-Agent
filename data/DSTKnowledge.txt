@@ -22,6 +22,11 @@ Survival and reserves:
 - A hunger goal is about observed hunger, not simply picking up one food item.
   Food on the ground is not carried food. Use currently supported safe-food
   actions; do not assume every edible-looking item is supported or safe.
+- Standing near a campfire or fire pit does not restore health. Light and warmth
+  can prevent further damage from darkness and cold. For low health, avoid
+  further damage and seek a supported healing action or food known to restore
+  health. Verify an actual health increase; restoring hunger or staying at home
+  does not establish healing. Never schedule a stay by the fire to regain health.
 
 Light:
 - Day, dusk and night are distinct phases. Dusk alone is not a reason to stop
@@ -36,6 +41,11 @@ Light:
 - Fuel consumption and night length can vary with weather, seasons, settings and
   modifiers. Phase/progress alone does not establish exact remaining night time
   or effective lighting duration. Respect the runtime's current lighting rules.
+- A lit Campfire (campfire) or Fire Pit (firepit) provides local light and heat
+  and can cook one raw food item at a time. Use observed fire and fuel state:
+  a Campfire disappears after burning out, while a stone Fire Pit remains and
+  can be relit. Excess heat can injure the player; respect thermal limits when
+  approaching or adding fuel.
 
 Resources and tools:
 - A recipe being craftable does not mean its tool is already carried. Work needs
@@ -60,6 +70,17 @@ Crafting and technology:
   reachable site clear of relevant hazards and combustible surroundings.
 - Materials consumed or a build request sent are not proof of completion. Use
   observed outputs, constructed entities and execution results.
+
+Camp storage and meals:
+- A Chest (treasurechest) stores items for later retrieval. Find the intended
+  chest with query_places, then inspect it before relying on its contents.
+  query_storage reports observed slots; a closed or unobserved chest has
+  unknown contents. Stored items are separate from carried supplies.
+- A Crock Pot (cookpot) combines four ingredients into a prepared dish.
+  Use query_meals for supported ingredient combinations. Budget for gathering,
+  loading and cooking, then return to harvest the finished dish. A dish in
+  the pot is not carried food, and harvesting it does not count as eating.
+  Use query_recipes for Chest and Crock Pot construction requirements.
 
 Places and exploration:
 - Buildings are remembered instances; use their queried IDs rather than invented

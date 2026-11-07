@@ -17,6 +17,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from common import timing_log as timing
+from common import autonomy
 from mcp_agent.daily_planner import DailyPlanner, DEFAULT_API_URL as DS_URL, DEFAULT_MODEL as DS_MODEL
 from mcp_agent.navigation_intents import ExplorationExecutor, dispatch_for_navigation, local_candidates
 from common.config import load_dotenv, resolve_env_path
@@ -78,6 +79,8 @@ class MCPAgent:
         self.goal_gap_marker = None
         self.goal_light = None
         self.active_policy = None
+        self.autonomy_revision = None
+        self.active_autonomy_revision = None
 
     def measured_decision(self, request_id, submitted_at, metadata, state, criteria, plan):
         # ContextVars are intentionally NOT copied from the async host into this
@@ -228,6 +231,28 @@ class MCPAgent:
             self.record(status, state)
         with timing.span("planner.update"):
             self.plan = self.planner.update(state) if self.planner else None
+        control_revision = autonomy.revision(state)
+        if control_revision != self.autonomy_revision:
+            self.autonomy_revision = control_revision
+            self.active_policy = None
+            self.goal_actions.clear()
+            self.sequence_actions.clear()
+            self.goal_gap_marker = self.goal_light = self.deferred_safety = None
+            if self.planner:
+                self.goals = getattr(self.planner, "goals", self.goals)
+                self.sequence = getattr(self.planner, "sequence", self.sequence)
+        if isinstance(self.planner, DailyPlanner):
+            while self.planner.feedback:
+                message = self.planner.feedback[0]
+                if message["revision"] != control_revision:
+                    self.planner.feedback.popleft()
+                    continue
+                try:
+                    await self.rpc("send_agent_feedback", **message)
+                except MCPRejected as exc:
+                    print(f"agent_feedback_pending error={exc}")
+                    break
+                self.planner.feedback.popleft()
         if state["player"].get("vitals", {}).get("dead"):
             raise PlayerDead("player is dead")
         return packet
@@ -287,6 +312,12 @@ class MCPAgent:
                     timing.annotate(outcome="executed" if result["status"] == "completed" else result["status"],
                                     action_reason=result.get("reason"))
                     return
+                if (not autonomy.enabled(packet["state"]) or
+                        autonomy.revision(packet["state"]) != self.active_autonomy_revision):
+                    if result["status"] != "cancel_requested":
+                        await self.rpc("cancel_action", action_id=self.active_id)
+                    await asyncio.sleep(self.poll)
+                    continue
                 if self.active_policy and result["status"] != "cancel_requested":
                     current_ids = self.goals.timed_task_ids(self.plan,packet["state"])
                     area = self.goals.residence
@@ -348,6 +379,7 @@ class MCPAgent:
             arguments["placement"] = copy.deepcopy(goal_task["target"]["placement"])
         result = await self.rpc("start_action", **arguments)
         self.active_id, self.active_started = result["action_id"], time.monotonic()
+        self.active_autonomy_revision = autonomy.revision(packet["state"])
         self.active_policy = policy
         if sequence_step is not None:
             self.sequence_actions[self.active_id] = (self.sequence.identity, sequence_step)
@@ -362,6 +394,7 @@ class MCPAgent:
 
     async def choose_local(self, packet, handoff="local"):
         state = packet["state"]
+        request_revision = autonomy.revision(state)
         _, local = local_candidates({}, packet["actions"])
         criteria = {k: a.get("description", k) for k, a in local.items()}
         if set(local) == {"wait"} or not local:
@@ -391,6 +424,10 @@ class MCPAgent:
             while not self.pending.done():
                 await asyncio.sleep(self.poll)
                 packet = await self.observe()
+                if not autonomy.enabled(packet["state"]) or autonomy.revision(packet["state"]) != request_revision:
+                    self.pending.cancel()
+                    self.pending = None
+                    return None, packet
             self.drain_request_timings()
             measured = self.request_timings.get(self.pending_request_id)
             if measured:
@@ -398,6 +435,8 @@ class MCPAgent:
                              result_ready_to_notice_ms=round(max(0, (time.perf_counter()-measured["finished_at"])*1000), 3))
             result = self.pending.result()
         await self.observe()
+        if not autonomy.enabled(self.packet["state"]) or autonomy.revision(self.packet["state"]) != request_revision:
+            return None, self.packet
         choice = result["answer"]["choice"]
         if choice not in criteria:
             raise RuntimeError("JEV returned a choice outside the requested options")
@@ -417,7 +456,23 @@ class MCPAgent:
         if self.active_id:
             await self.wait_action()
             return False
+        if not autonomy.enabled(state):
+            self.goals.pause_accounting()
+            if self.execute and self.auto_enabled:
+                await self.sync_board(None, False)
+            timing.annotate(outcome="skipped", decision_source="autonomy_disabled")
+            await asyncio.sleep(self.poll)
+            return False
         if await self.handle_thermal(packet):
+            return False
+        if isinstance(self.planner, DailyPlanner) and self.planner.hold_execution:
+            self.goals.pause_accounting()
+            if self.execute and self.auto_enabled:
+                await self.sync_board(None, False)
+            if await self.handle_safety(packet, self.goals, "replanning_safety"):
+                return False
+            timing.annotate(outcome="skipped", decision_source="dialogue_waiting")
+            await asyncio.sleep(self.poll)
             return False
         if is_priority_board(self.plan):
             # New host-side scheduling must not race a previously uploaded Lua board.
@@ -678,12 +733,15 @@ class MCPAgent:
             return
         self.goals.pause_accounting()
         reason = "no_tasks" if not self.plan.get("tasks") else self.goals.reason or "no_feasible_action_or_route"
-        if reason in {"residence_holding", "refuel_settling", "maintenance_holding"}:
+        if reason in {"residence_holding", "refuel_settling", "maintenance_holding", "charcoal_burning"}:
             timing.annotate(decision_source="residence_idle" if reason=="residence_holding" else reason,goal_reason=reason)
             await asyncio.sleep(self.poll)
             return
         if reason == "waiting_for_start":
             timing.annotate(goal_reason=reason)
+            if (packet["state"].get("autonomy") or {}).get("mode") == "instruction":
+                await asyncio.sleep(self.poll)
+                return
             await self.run_local_control(packet,planning_gap=True)
             return
         marker = (self.board_id(self.plan), reason)
@@ -706,6 +764,9 @@ class MCPAgent:
         if first_gap:
             print(f"task_board_handoff reason={reason} controller=jev_planning_gap")
         timing.annotate(goal_reason=reason)
+        if (packet["state"].get("autonomy") or {}).get("mode") == "instruction":
+            await asyncio.sleep(self.poll)
+            return
         await self.run_local_control(packet, planning_gap=True)
 
     async def shutdown(self):

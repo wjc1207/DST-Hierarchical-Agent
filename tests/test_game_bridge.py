@@ -380,11 +380,21 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from mcp import Client
         from mcp_server.mcp_server import create_server
         bridge = GameBridge(TOKEN)
-        bridge.exchange({"token": TOKEN, "session_id": "offline", "sequence": 1, "state": state()})
+        snapshot = state()
+        snapshot["camp_work"] = {
+            "fixtures": [{"building_id": "building:10", "phase": "closed", "contents_known": False}],
+            "meals": [{"product": "meatballs", "ingredients": ["meat", "berries", "berries", "berries"]}],
+        }
+        bridge.exchange({"token": TOKEN, "session_id": "offline", "sequence": 1, "state": snapshot})
         async with Client(create_server(bridge), read_timeout_seconds=3) as client:
             result = await client.list_tools()
             self.assertEqual({t.name for t in result.tools}, {"get_state", "get_available_actions", "start_action",
-                "get_action_status", "cancel_action", "submit_task_board", "query_recipes", "query_places", "move_to", "add_fuel"})
+                "get_action_status", "cancel_action", "submit_task_board", "query_recipes", "query_places",
+                "query_storage", "query_meals", "move_to", "add_fuel", "send_agent_feedback"})
+            storage = await client.call_tool("query_storage", {"building_id": "building:10"})
+            self.assertFalse(storage.structured_content["fixtures"][0]["contents_known"])
+            meals = await client.call_tool("query_meals", {"product": "meatballs"})
+            self.assertEqual(meals.structured_content["meals"][0]["product"], "meatballs")
             response = await client.call_tool("get_available_actions", {})
             self.assertFalse(response.is_error)
             data = response.structured_content

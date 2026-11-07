@@ -1,5 +1,5 @@
 -- Run from the project root: fengari tests/exploration_spec.lua
-package.path = "./scripts/?.lua;" .. package.path
+package.path = "./mods/jev_dst_agent/scripts/?.lua;" .. package.path
 local E = require("jev_exploration")
 local X = require("jev_execution")
 local passed = 0
@@ -39,8 +39,8 @@ local function search(m, candidates, safe)
 end
 
 test("the complete Mod and metadata compile", function()
-    assert(loadfile("modmain.lua"))
-    assert(loadfile("modinfo.lua"))
+    assert(loadfile("mods/jev_dst_agent/modmain.lua"))
+    assert(loadfile("mods/jev_dst_agent/modinfo.lua"))
 end)
 
 test("path lookahead skips a nearby grid root behind the player", function()
@@ -311,8 +311,11 @@ local function simulated_mod(passable, topology, terrain, entities, bridge_confi
             return require(name)
         end,
         print=function(value) table.insert(errors,value) end,
-    },{__index=_G})
-    local native=assert(loadfile("modmain.lua","t",env))()
+    },{__index=function(_,key)
+        -- DST exposes protected calls through GLOBAL, not as mod globals.
+        if key~="pcall" then return _G[key] end
+    end})
+    local native=assert(loadfile("mods/jev_dst_agent/modmain.lua","t",env))()
     -- Test-only aliases preserve existing native-action scenarios, not key events.
     handlers={KEY_F2=native.emit_state,KEY_F4=native.cancel,
         KEY_KP_MULTIPLY=native.craft_torch,KEY_KP_DIVIDE=native.equip_torch,
@@ -329,6 +332,33 @@ local function simulated_mod(passable, topology, terrain, entities, bridge_confi
     end
     return sample, G.TheWorld, G, handlers, function() sim_init(); return captured end, function() return captured end, native
 end
+
+test("real Mod reports main inventory capacity and replicated stack headroom",function()
+    local sample,_,G=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    local function item(guid,prefab,count,maximum)
+        local replica={}
+        if count then
+            replica.stackable={StackSize=function() return count end,MaxSize=function() return maximum end}
+        end
+        return {GUID=guid,prefab=prefab,replica=replica,IsValid=function() return true end,
+            HasTag=function() return false end}
+    end
+    local items={}
+    local inventory={GetItems=function() return items end,GetNumSlots=function() return 8 end,
+        GetEquips=function() return {hands=item(15,"axe")} end,GetOverflowContainer=function() end}
+    G.ThePlayer.replica.inventory=inventory
+    assert(sample(0,0).player.inventory.free_slots==nil,"a replica awaiting sync must not look empty")
+    inventory.classified={}
+    items={[2]=item(10,"log",13,20),[3]=item(11,"rocks",40,40),[5]=item(12,"pickaxe"),
+        [6]=item(13,"cutgrass",60,40),[8]=item(14,"twigs",2,math.huge)}
+    local observed=sample(0,0).player.inventory
+    assert(observed.total_slots==8 and observed.used_slots==5 and observed.free_slots==3)
+    assert(#observed.equipped==1 and observed.items[1].slot==2)
+    assert(observed.items[1].max_stack_size==20 and observed.items[1].stack_space==7)
+    assert(observed.items[2].stack_space==0 and observed.items[3].max_stack_size==1)
+    assert(observed.items[3].stack_space==0 and observed.items[4].stack_space==0)
+    assert(observed.items[5].stack_unlimited and observed.items[5].max_stack_size==nil)
+end)
 
 test("real Mod keeps escape routes for observed targeted hostiles beyond twelve units",function()
     local x,targeted,blocked=11.9,true,false
@@ -999,12 +1029,14 @@ test("native navigation completes a detour through another room without returnin
     m.graph_edges={BT={{a_id="B",b_id="T",ax=-236,az=524,bx=-236,bz=528}},
         AB={{a_id="START",b_id="B",ax=-228,az=504,bx=-224,bz=504}}}
     local x,z,point=-222,504,nil
+    G.ThePlayer._jev_autonomy={enabled=true,revision=0}
     local executor=N.new({stop=function() E.pause_route(m) end,issue=function(_,a)
         assert(a.mode=="graph" and a.entrance and a.source_node_id)
         E.commit_route(m,a.source_node_id,a.node_id,a.gateway_id,a.next_node_id,G.GetTime(),x,z,a.remaining_distance,a.entrance)
         point=a.awaiting_region and nil or {x=a.x,z=a.z}
     end})
-    assert(executor:start({action_id="transit",choice="travel_region_T",navigation_targets={}},sample(x,z),G.GetTime()))
+    assert(executor:start({action_id="transit",choice="travel_region_T",navigation_targets={},
+        autonomy_revision=0},sample(x,z),G.GetTime()))
     local visited_transit=false
     for i=1,100 do
         if point then
@@ -1040,6 +1072,7 @@ test("real Mod HTTP callback contains native dispatch exceptions instead of cras
         Transform={GetWorldPosition=function() return 1,0,0 end}}
     local _,world,G,handlers,start,captured=simulated_mod(function() return true end,function() return "A" end,
         function() return 2 end,{plant},cfg)
+    G.ThePlayer._jev_autonomy={enabled=true,revision=0}
     local ticks,callback={},nil
     world.IsValid=function() return true end
     world.DoTaskInTime=function(_,delay,fn) fn() end
@@ -1055,7 +1088,8 @@ test("real Mod HTTP callback contains native dispatch exceptions instead of cras
     start(); assert(ticks[0.2])
     ticks[0.2](); local sent=captured(); assert(callback and sent.token==cfg.token)
     cfg.reply={server_id="s",session_id=sent.session_id,sequence=sent.sequence,board_revision=0,
-        command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_grass",action={guid=22}}}
+        command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_grass",action={guid=22},
+            autonomy_revision=0}}
     assert(pcall(function() callback("{}",true,200) end),"asynchronous native errors escaped into the game")
     handlers.KEY_F2()
     assert(captured().bridge.action_report.status=="failed")
@@ -1070,6 +1104,7 @@ test("real Mod defers busy or cooling-down pickup and preserves native client RP
             Transform={GetWorldPosition=function() return 1,0,0 end}}
         local _,world,G,handlers,start,captured=simulated_mod(function() return true end,
             function() return "A" end,function() return 2 end,{item},cfg)
+        G.ThePlayer._jev_autonomy={enabled=true,revision=0}
         local ticks,callback={},nil
         local clock,busy,ready,issued,rpcs,picker_calls=0,true,false,0,0,0
         world.IsValid=function() return true end
@@ -1099,7 +1134,8 @@ test("real Mod defers busy or cooling-down pickup and preserves native client RP
         G.TheSim.QueryServer=function(_,url,fn) callback=fn end
         start(); ticks[0.2](); local sent=captured()
         cfg.reply={server_id="s",session_id=sent.session_id,sequence=sent.sequence,board_revision=0,
-            command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_log",action={guid=22}}}
+            command={session_id=sent.session_id,operation="start",action_id="a",choice="collect_log",action={guid=22},
+                autonomy_revision=0}}
         callback("{}",true,200)
         assert(issued==0 and picker_calls==0,"busy must defer pickup without an exception")
         busy=false; clock=0.3; ticks[0.2]()
@@ -1334,6 +1370,22 @@ test("daylight torch maintenance runs idle, retries replication and leaves other
     s.player.inventory.equipped={{prefab="axe"}}; executor:tick(s,5,true); assert(#calls==2)
     s.player.inventory.equipped={{prefab="torch"}}; s.player.vitals.dead=true
     executor:tick(s,6,true); assert(#calls==2,"dead players cannot unequip")
+end)
+
+test("ignition equipment survives daylight cleanup through the action handoff",function()
+    local s=bridge_state(); local calls={}
+    local executor=N.new({stop=function() end,issue=function(id) calls[#calls+1]=id; return true end})
+    s.world.phase="day"
+    local a={kind="equip_torch",ignition_torch=true,torch_guid=40,planner_only=true}
+    s.camp_work={options={equip_ignition_torch=a}}
+    assert(executor:start({action_id="ignite-equip",choice="equip_ignition_torch",action=a},s,1))
+    s.player.inventory.equipped={{prefab="torch"}}
+    executor:tick(s,2,true)
+    assert(executor.report.status=="completed" and #calls==1)
+    executor:tick(s,3,true)
+    assert(#calls==1,"normal cleanup must let the ignition command claim the torch")
+    executor:tick(s,14,true)
+    assert(calls[2]=="unequip_torch","an abandoned ignition request still releases the torch")
 end)
 
 test("dawn torch maintenance preserves a running escape and explicit unequip ownership",function()
@@ -1909,6 +1961,7 @@ test("real researchlab entities and recipe IDs map through native construction a
         local entities={}
         local sample,_,G,_,_,_,mod=simulated_mod(function() return true end,function() return "A" end,
             function() return 2 end,entities)
+        G.ThePlayer._jev_autonomy={enabled=true,revision=0}
         local buffered=mode=="buffered"
         local calls={buffer=0,place=0,queries={}}
         G.DEGREES=math.pi/180
@@ -1941,7 +1994,7 @@ test("real researchlab entities and recipe IDs map through native construction a
         local s=sample(0,0)
         assert(s.crafting.sciencemachine and N.available(s).build_sciencemachine)
         assert(calls.queries.researchlab and not calls.queries.sciencemachine)
-        assert(executor:start({action_id=mode,choice="build_sciencemachine"},s,1))
+        assert(executor:start({action_id=mode,choice="build_sciencemachine",autonomy_revision=0},s,1))
         assert(calls.callback and calls.buffer==(mode=="fresh" and 1 or 0))
         executor:tick(sample(0,0),2); assert(executor.active,"buffered recipe alone is not construction success")
         calls.callback(); assert(calls.place==1)
@@ -1952,7 +2005,7 @@ test("real researchlab entities and recipe IDs map through native construction a
         assert(#built.nearby==1 and built.nearby[1].prefab=="sciencemachine")
         assert(built.nearby[1].game_prefab=="researchlab","retain the real observed ID for diagnostics")
         executor:tick(built,4); assert(executor.report.status=="completed")
-        executor:set_board({kind="task_board",tasks={{id="science",priority=1,depends_on={},
+        executor:set_board({kind="task_board",autonomy_revision=0,tasks={{id="science",priority=1,depends_on={},
             target={type="structure",prefab="sciencemachine"}}}},1)
         entities[1]=nil
         assert(not executor:board_choice(sample(0,0),5),"completed real researchlab must not be rebuilt")
@@ -1964,8 +2017,9 @@ test("Lua board recognizes a manually built researchlab through normalized obser
         HasTag=function() return false end,Transform={GetWorldPosition=function() return 1,0,0 end}}
     local sample=simulated_mod(function() return true end,function() return "A" end,function() return 2 end,{entity})
     local s=sample(0,0); local executor=native_test()
+    s.autonomy={enabled=true,revision=0}
     s.crafting.sciencemachine=true
-    executor:set_board({kind="task_board",tasks={{id="science",priority=1,depends_on={},
+    executor:set_board({kind="task_board",autonomy_revision=0,tasks={{id="science",priority=1,depends_on={},
         target={type="structure",prefab="sciencemachine"}}}},1)
     assert(not executor:board_choice(s,1),"a real observed machine already satisfies the board")
     s.nearby={}; assert(not executor:board_choice(s,2),"manual observation also latches the milestone")
@@ -2433,6 +2487,7 @@ end)
 
 test("real Mod keeps a valid recipe placement site while the player drifts",function()
     local sample,_,G=simulated_mod(function() return true end,function() return "A" end,function() return 2 end)
+    G.ThePlayer._jev_autonomy={enabled=true,revision=0}
     local recipe={name="firepit",product="firepit",placer="firepit_placer",ingredients={},level={}}
     G.AllRecipes={firepit=recipe};G.GetValidRecipe=function(id) return G.AllRecipes[id] end
     G.STRINGS={NAMES={}};G.DEGREES=math.pi/180
@@ -2455,7 +2510,7 @@ test("real Mod keeps a valid recipe placement site while the player drifts",func
     local replacement=assert(N.available(s).recipe_firepit)
     assert(replacement.x~=first.x,"blocked placement must be reselected")
     local x=N.new({issue=function() error("stale site issued") end,stop=function() end})
-    assert(not x:start({action_id="stale-site",choice="recipe_firepit",action=first},s,0))
+    assert(not x:start({action_id="stale-site",choice="recipe_firepit",action=first,autonomy_revision=0},s,0))
     assert(x.report.reason=="target_changed")
 end)
 

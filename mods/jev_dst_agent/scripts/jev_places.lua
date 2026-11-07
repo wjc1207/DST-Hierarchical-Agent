@@ -150,6 +150,8 @@ function M.actions(places)
         a.kind="explore"; a.planner_only=true; a[field]=target.id
         if field=="building_id" and (target.prefab=="campfire" or target.prefab=="firepit") then
             a.refuel_approach=true
+        elseif field=="building_id" and (target.prefab=="cookpot" or target.prefab=="treasurechest") then
+            a.camp_approach=true
         end
         a.description="Travel to remembered "..(field=="home_id" and "home" or target.prefab)
         result[id]=a

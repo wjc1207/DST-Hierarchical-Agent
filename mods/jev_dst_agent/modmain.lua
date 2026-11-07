@@ -6,6 +6,7 @@ local tree_work = require("jev_tree_work")
 local execution_observer = require("jev_execution")
 local recipes = require("jev_recipes")
 local refueling = require("jev_refueling")
+local camp_work = require("jev_camp_work")
 local placement = require("jev_placement")
 local thermal = require("jev_thermal")
 local places = require("jev_places")
@@ -13,6 +14,9 @@ local coordinates = require("jev_coordinates")
 local performance = require("jev_performance")
 local G = GLOBAL
 local protected_call = G.pcall
+local autonomy = require("jev_autonomy")
+local has_camp_cooking, camp_cooking = protected_call(require,"cooking")
+if not has_camp_cooking then camp_cooking=nil end
 local measurement = require("jev_timing")
 -- GetTime() is simulation ticks and cannot measure work inside one frame.
 local measurement_clock = G.walltime or G.GetTimeRealSeconds
@@ -213,9 +217,23 @@ local function item_record(item, slot)
         return nil
     end
 
-    local count = 1
-    if item.replica ~= nil and item.replica.stackable ~= nil then
-        count = safe_call(function() return item.replica.stackable:StackSize() end, 1)
+    local stack = item.replica and item.replica.stackable
+    local stack_count = stack and safe_call(function() return stack:StackSize() end, nil)
+    local max_stack_size
+    local stack_space
+    local stack_unlimited
+    if stack then
+        local maximum = safe_call(function() return stack:MaxSize() end, nil)
+        if maximum == math.huge then
+            stack_unlimited = true
+        elseif type(maximum) == "number" and maximum >= 1 then
+            max_stack_size = maximum
+            if type(stack_count) == "number" then
+                stack_space = math.max(0, maximum - stack_count)
+            end
+        end
+    else
+        max_stack_size, stack_space = 1, 0
     end
 
     local durability_percent = nil
@@ -245,7 +263,10 @@ local function item_record(item, slot)
         slot = slot,
         guid = item.GUID,
         prefab = item.prefab or "unknown",
-        count = count,
+        count = stack_count or 1,
+        max_stack_size = max_stack_size,
+        stack_space = stack_space,
+        stack_unlimited = stack_unlimited,
         durability_percent = durability_percent ~= nil and round(durability_percent, 3) or nil,
         max_uses = TOOL_MAX_USES[item.prefab or ""],
         weapon = weapon,
@@ -260,14 +281,24 @@ local function read_inventory(player)
         return result
     end
 
-    local items = safe_call(function() return inventory:GetItems() end, {}) or {}
-    for slot, item in pairs(items) do
+    local items = safe_call(function() return inventory:GetItems() end, nil)
+    for slot, item in pairs(items or {}) do
         local record = item_record(item, slot)
         if record ~= nil then
             table.insert(result.items, record)
         end
     end
     table.sort(result.items, function(a, b) return a.slot < b.slot end)
+
+    -- An uninitialized remote replica returns an empty item table before sync.
+    if items and (inventory.classified or (player.components and player.components.inventory)) then
+        local total = safe_call(function() return inventory:GetNumSlots() end, nil)
+        if type(total) == "number" and total >= #result.items and total < math.huge then
+            result.total_slots = total
+            result.used_slots = #result.items
+            result.free_slots = total - result.used_slots
+        end
+    end
 
     local equips = safe_call(function() return inventory:GetEquips() end, {}) or {}
     for equip_slot, item in pairs(equips) do
@@ -1665,13 +1696,15 @@ local function make_place_router(player, navigation, observed_only)
         end
         if not best then return {status="blocked",reason="no_safe_approach_path"} end
         local fire_approach=not home and (target.prefab=="campfire" or target.prefab=="firepit")
-        local arrival_radius=fire_approach and 0.25 or (target.arrival_radius or (home and 1.5 or 1))
+        local container_approach=not home and (target.prefab=="treasurechest" or target.prefab=="cookpot")
+        local precise=fire_approach or container_approach
+        local arrival_radius=precise and 0.25 or (target.arrival_radius or (home and 1.5 or 1))
         if best.collect_path.distance<=arrival_radius then return {status="arrived"} end
         local waypoint=best.collect_path.waypoint
         local length=math.sqrt((waypoint.x-px)^2+(waypoint.z-pz)^2)
         local scale=length>0 and math.min(1,NAV_LEG_DISTANCE/length) or 0
         return {status="ready",distance=best.collect_path.distance,action={mode="place",node_id=target.node_id,
-            x=px+(waypoint.x-px)*scale,z=pz+(waypoint.z-pz)*scale,arrival=fire_approach and 0.2 or 0.4}}
+            x=px+(waypoint.x-px)*scale,z=pz+(waypoint.z-pz)*scale,arrival=precise and 0.2 or 0.4}}
     end
     return route
 end
@@ -1751,6 +1784,7 @@ local function make_state(player, timings)
     local state =
     {
         schema = 10,
+        autonomy = autonomy.snapshot(player),
         observed_at = round(G.GetTime(), 3),
         telemetry = { on_demand = true, native_tick_interval = 0.2, cancel_work = true, placement_constraints = true },
         player =
@@ -1852,7 +1886,7 @@ local function make_state(player, timings)
             if entity:HasTag("prototyper") or entity.prefab=="researchlab" or entity.prefab=="researchlab2" then
                 capabilities[#capabilities+1]="technology"
             end
-            if entity:HasTag("cooker") then capabilities[#capabilities+1]="cooking" end
+            if entity:HasTag("cooker") or entity.prefab=="cookpot" then capabilities[#capabilities+1]="cooking" end
             if entity:HasTag("_container") then capabilities[#capabilities+1]="storage" end
             if entity.prefab=="campfire" or entity.prefab=="firepit" then capabilities[#capabilities+1]="lighting" end
             buildings[#buildings+1]={guid=entity.GUID,prefab=entity.prefab,x=ex,z=ez,capabilities=capabilities,
@@ -1866,6 +1900,9 @@ local function make_state(player, timings)
         return refueling.scan(G,player,nearby,function(target) return refuel_safe(player,target) end)
     end)
 
+    state.camp_work=sample("camp_work_ms",function()
+        return camp_work.scan(G,player,state,building_memory,camp_cooking)
+    end)
     state.world_map=coordinates.snapshot(get_navigation_memory(G.TheWorld),NAV_CELL_SIZE)
     return state
 end
@@ -2232,6 +2269,8 @@ end
 
 local SAFE_FOOD_PRIORITY =
 {
+    "meatballs",
+    "ratatouille",
     "cookedmeat",
     "cookedsmallmeat",
     "berries_cooked",
@@ -2515,18 +2554,20 @@ local function build_science_machine(build_area)
     end)
 end
 
-local function equip_torch()
+local function equip_torch(ignition_guid)
     local player = G.ThePlayer
     if player == nil or not player:IsValid() then
         print("[JEV_DST_ACTION_ERROR]equip_torch:no_local_player")
         return
     end
-    if G.TheWorld == nil or not G.TheWorld.state.isnight then
+    local world=G.TheWorld and G.TheWorld.state
+    if not world or (ignition_guid and world.phase~="day" and world.phase~="dusk")
+        or (not ignition_guid and not world.isnight) then
         print("[JEV_DST_ACTION_ERROR]equip_torch:not_night")
         return
     end
     local v={};thermal.read_vitals(G,player,v)
-    if has_nearby_lit_fire(player, 8) and not (thermal.hot(v) or player._jev_cooling_active) then
+    if not ignition_guid and has_nearby_lit_fire(player, 8) and not (thermal.hot(v) or player._jev_cooling_active) then
         print("[JEV_DST_ACTION_ERROR]equip_torch:lit_fire_nearby")
         return
     end
@@ -2539,6 +2580,7 @@ local function equip_torch()
 
     local torch = inventory:FindItem(function(item)
         return item ~= nil and item:IsValid() and item.prefab == "torch"
+            and (not ignition_guid or item.GUID==ignition_guid)
     end)
     if torch == nil then
         print("[JEV_DST_ACTION_ERROR]equip_torch:no_torch")
@@ -2549,6 +2591,7 @@ local function equip_torch()
     -- is an action-system auto-equip helper and does not directly equip here.
     inventory:UseItemFromInvTile(torch)
     print("[JEV_DST_ACTION]equip_torch:requested guid=" .. tostring(torch.GUID))
+    return true
 end
 
 local function unequip_torch()
@@ -2736,6 +2779,14 @@ start_bridge = function(player)
         if action.kind == "collect" then return collect_native(action)
         elseif action.kind == "explore" or action.kind == "flee_from_nearest_hostile" or action.kind == "cool_down" then walk(action)
         elseif action.kind == "chop_nearest_tree" then
+            if action.charcoal_work then
+                local target=G.Ents and G.Ents[action.guid]
+                if not target or not target:IsValid() or not target:HasTag("burnt")
+                    or target:HasTag("fire") or not target:HasTag("CHOP_workable") then
+                    executor:finish("failed","charcoal_tree_changed")
+                    return false
+                end
+            end
             perform_work_action(G.ACTIONS.CHOP,"CHOP_workable","axe",action.guid)
         elseif action.kind == "mine_nearest_rock" then
             perform_work_action(G.ACTIONS.MINE,"MINE_workable","pickaxe",action.guid)
@@ -2751,6 +2802,15 @@ start_bridge = function(player)
             return success
         elseif action.kind == "add_fuel" then
             local ok,reason=refueling.issue(G,player,action,function(target) return refuel_safe(player,target) end)
+            if not ok then executor:finish("failed",reason) end
+            return ok
+        elseif action.ignition_torch then
+            local ok=equip_torch(action.torch_guid)
+            if not ok then executor:finish("failed","ignition_torch_unavailable") end
+            return ok
+        elseif camp_work.kinds[action.kind] then
+            local ok,reason=camp_work.issue(G,player,action,places.memory(G.TheWorld,player.GUID),camp_cooking,
+                function(target) return refuel_safe(player,target) end)
             if not ok then executor:finish("failed",reason) end
             return ok
         elseif action.kind == "craft" or action.kind == "place" then
@@ -2777,6 +2837,11 @@ start_bridge = function(player)
         available=native.available,
         state=function(timings) return make_state(player,timings) end,
         alive=function() return player:IsValid() and player == G.ThePlayer end,
+        feedback=function(message)
+            autonomy.apply_feedback(player,message,function(text)
+                return autonomy.send_chat(G,player,text,message.finish)
+            end)
+        end,
         request=function(url,payload,callback,receipt)
             receipt=receipt or {}
             local encode_at=measurement_clock and measurement_clock()
@@ -2808,6 +2873,10 @@ start_bridge = function(player)
             if not ok then receipt.done=true; receipt.http_status=0; callback(nil,false,0) end
         end,
     },executor)
+    autonomy.get(player).on_change=function(reason)
+        if executor.active then executor:finish("interrupted",reason) end
+        executor.board_paused=true
+    end
     player._jev_bridge_tick = player:DoPeriodicTask(0.2,function()
         if bridge_client then
             local ok, reason = protected_call(function() bridge_client:tick() end)
@@ -2836,6 +2905,10 @@ local function try_start_telemetry(player)
     player._jev_dst_started = true
     print("[JEV_DST]local_player_ready prefab=" .. tostring(player.prefab))
     start_telemetry(player)
+end
+
+if AddClassPostConstruct then
+    require("jev_autonomy_ui").install(G,AddClassPostConstruct)
 end
 
 AddPlayerPostInit(function(player)

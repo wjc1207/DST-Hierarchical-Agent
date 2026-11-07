@@ -16,6 +16,31 @@ from test_game_bridge import TOKEN, state
 
 
 class TransportTests(unittest.TestCase):
+    def test_game_chat_response_uses_utf8_not_unsupported_unicode_escapes(self):
+        with self.fake_http_peer() as (bridge, server, _records):
+            snapshot = state()
+            snapshot["autonomy"] = {"enabled": True, "revision": 1, "mode": "instruction",
+                                    "instruction": "做火把", "messages": [{"id": 1, "text": "做火把"}]}
+            def exchange(sequence):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/v1/exchange",
+                    data=json.dumps({"token": TOKEN, "session_id": "utf8-chat", "sequence": sequence,
+                                     "state": snapshot}, ensure_ascii=False).encode("utf-8"),
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    body = response.read()
+                    self.assertEqual(int(response.headers["Content-Length"]), len(body))
+                    self.assertEqual(response.headers.get_content_charset(), "utf-8")
+                    return body
+            exchange(1)
+            text = '先采草和树枝，再做火把。你好，"饥荒"！🌲'
+            bridge.send_agent_feedback(text, 1, "utf8-reply")
+            raw = exchange(2)
+            self.assertIn("先采草和树枝".encode("utf-8"), raw)
+            self.assertIn("🌲".encode("utf-8"), raw)
+            self.assertNotIn(b"\\u", raw)
+            self.assertEqual(json.loads(raw)["agent_feedback"][0]["text"], text)
+
     @contextlib.contextmanager
     def fake_http_peer(self):
         records = []

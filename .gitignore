@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 logs/
 .venv-mcp/
-scripts/jev_bridge_config.lua
+mods/jev_dst_agent/scripts/jev_bridge_config.lua
+mods/jev_ai_companion/scripts/jev_companion_config.lua
+dist/
 .vscode/

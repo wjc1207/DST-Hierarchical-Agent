@@ -1,5 +1,5 @@
 -- Offline recipe/native-executor regression: lua tests/recipes_spec.lua
-package.path="./scripts/?.lua;"..package.path
+package.path="./mods/jev_dst_agent/scripts/?.lua;"..package.path
 local R=require("jev_recipes")
 local N=require("jev_native_executor")
 local passed=0

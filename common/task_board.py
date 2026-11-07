@@ -5,7 +5,8 @@ import copy
 import math
 import re
 import unicodedata
-from common.places import PLACE_TARGETS, target_progress
+from common.places import HOME_ANCHOR_UNAVAILABLE, PLACE_TARGETS, target_progress
+from common.camp_work import CAMP_TARGETS, SAFE_MEALS, validate_target as validate_camp_target, target_error as camp_error
 from common.refueling import validate_target as validate_refuel, target_error as refuel_error, maintenance_state as fire_maintenance_state
 from common.placement import validate as validate_placement, progress as placement_progress
 from common.task_timing import validate_timing, reached, TERMINAL_TASKS, number
@@ -47,7 +48,7 @@ INVENTORY_TARGET_PREFABS = frozenset({
     "ice", "redgem", "bluegem", "purplegem", "thulecite", "thulecite_pieces",
     "petals", "berries", "berries_cooked", "berries_juicy", "berries_juicy_cooked",
     "carrot", "carrot_cooked", "seeds", "seeds_cooked", "meat", "smallmeat",
-    "cookedmeat", "cookedsmallmeat", "axe", "pickaxe", "torch",
+    "cookedmeat", "cookedsmallmeat", "axe", "pickaxe", "torch", *SAFE_MEALS,
 })
 INVENTORY_PREFAB_ALIASES = {"logs": "log"}
 
@@ -81,7 +82,7 @@ def text(value, limit=120):
     return " ".join(value.split())[:limit] if isinstance(value, str) else ""
 
 
-def validate_board(raw: dict, day: int) -> dict:
+def validate_board(raw: dict, day: int, *, target_validator=None) -> dict:
     tasks = raw.get("tasks")
     if not isinstance(tasks, list) or not 1 <= len(tasks) <= MAX_TASKS:
         raise ValueError("Task board requires 1-6 tasks")
@@ -103,58 +104,68 @@ def validate_board(raw: dict, day: int) -> dict:
             raise ValueError("Task requires a machine-checkable target")
         kind = target.get("type")
         cleaned = {"type": kind}
-        if "placement" in target:
-            if kind != "structure":
-                raise ValueError("Placement applies only to structure targets")
-            cleaned["placement"] = validate_placement(target["placement"])
-        if kind in {"inventory", "known_regions"}:
-            count = target.get("count")
-            if type(count) is not int or not 1 <= count <= 1000:
-                raise ValueError("Task count must be 1-1000")
-            cleaned["count"] = count
-        if kind in {"inventory", "structure"}:
-            recipe_id = target.get("recipe_id")
-            if recipe_id is not None:
-                if not isinstance(recipe_id, str) or not re.fullmatch(r"[a-z0-9_]{1,100}", recipe_id):
-                    raise ValueError("Invalid recipe ID")
-                cleaned["recipe_id"] = recipe_id
-            prefab = (normalize_inventory_prefab(target.get("prefab")) if kind == "inventory" and recipe_id is None
-                      else text(target.get("prefab"), 60))
-            if not re.fullmatch(r"[a-z0-9_]{1,60}", prefab):
-                raise ValueError("Invalid task prefab")
-            if kind == "structure" and recipe_id is None and prefab not in {"campfire", "firepit", "sciencemachine"}:
-                raise ValueError("Unsupported structure task")
-            cleaned["prefab"] = prefab
-        elif kind == "refuel":
-            cleaned.update(validate_refuel(target))
-        elif kind == "move_to":
-            cleaned.update(validate_point(target))
-        elif kind in PLACE_TARGETS:
-            field = {"visit_building": "building_id", "set_home": "anchor_id", "return_home": "home_id", "stay_home": "home_id"}[kind]
-            value = target.get(field)
-            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_:.-]{1,100}", value):
-                raise ValueError("Place target requires an observed " + field)
-            if kind == "set_home" and not re.fullmatch(r"building:[0-9]+", value):
-                raise ValueError("Set home requires a building:<GUID> anchor")
-            cleaned[field] = value
-            if kind == "stay_home":
-                radius = target.get("radius", 12)
-                if type(radius) not in {int, float} or not math.isfinite(radius) or not 6 <= radius <= 30:
-                    raise ValueError("stay_home radius must be 6-30 world units")
-                cleaned["radius"] = radius
-        elif kind == "hunger_ratio":
-            ratio = target.get("at_least")
-            if type(ratio) not in {int, float} or not math.isfinite(ratio) or not 0 < ratio <= 1:
-                raise ValueError("Invalid hunger target")
-            cleaned["at_least"] = float(ratio)
-        elif kind in {"visit_region", "survey_region"}:
-            cleaned["node_id"] = text(target.get("node_id"), 160)
-            if not cleaned["node_id"]:
-                raise ValueError("Visit task requires a known node ID")
-            if kind == "survey_region":
-                cleaned["cells"] = survey_cells(target)
-        elif kind != "known_regions":
-            raise ValueError("Unsupported task target type")
+        if target_validator is not None:
+            cleaned = target_validator(target)
+        else:
+            if "placement" in target:
+                if kind != "structure":
+                    raise ValueError("Placement applies only to structure targets")
+                cleaned["placement"] = validate_placement(target["placement"])
+            if kind in {"inventory", "known_regions"}:
+                count = target.get("count")
+                if type(count) is not int or not 1 <= count <= 1000:
+                    raise ValueError("Task count must be 1-1000")
+                cleaned["count"] = count
+            if kind in {"inventory", "structure"}:
+                recipe_id = target.get("recipe_id")
+                if recipe_id is not None:
+                    if not isinstance(recipe_id, str) or not re.fullmatch(r"[a-z0-9_]{1,100}", recipe_id):
+                        raise ValueError("Invalid recipe ID")
+                    cleaned["recipe_id"] = recipe_id
+                prefab = (normalize_inventory_prefab(target.get("prefab")) if kind == "inventory" and recipe_id is None
+                          else text(target.get("prefab"), 60))
+                if not re.fullmatch(r"[a-z0-9_]{1,60}", prefab):
+                    raise ValueError("Invalid task prefab")
+                if kind == "structure" and recipe_id is None and prefab not in {"campfire", "firepit", "sciencemachine"}:
+                    raise ValueError("Unsupported structure task")
+                cleaned["prefab"] = prefab
+                if "allow_ignite" in target:
+                    if kind != "inventory" or prefab != "charcoal" or type(target["allow_ignite"]) is not bool:
+                        raise ValueError("allow_ignite is only valid for charcoal inventory goals")
+                    if target["allow_ignite"]:
+                        cleaned["allow_ignite"] = True
+            elif kind in CAMP_TARGETS:
+                cleaned.update(validate_camp_target(target))
+            elif kind == "refuel":
+                cleaned.update(validate_refuel(target))
+            elif kind == "move_to":
+                cleaned.update(validate_point(target))
+            elif kind in PLACE_TARGETS:
+                field = {"visit_building": "building_id", "set_home": "anchor_id", "return_home": "home_id", "stay_home": "home_id"}[kind]
+                value = target.get(field)
+                if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_:.-]{1,100}", value):
+                    raise ValueError("Place target requires an observed " + field)
+                if kind == "set_home" and not re.fullmatch(r"building:[0-9]+", value):
+                    raise ValueError("Set home requires a building:<GUID> anchor")
+                cleaned[field] = value
+                if kind == "stay_home":
+                    radius = target.get("radius", 12)
+                    if type(radius) not in {int, float} or not math.isfinite(radius) or not 6 <= radius <= 30:
+                        raise ValueError("stay_home radius must be 6-30 world units")
+                    cleaned["radius"] = radius
+            elif kind == "hunger_ratio":
+                ratio = target.get("at_least")
+                if type(ratio) not in {int, float} or not math.isfinite(ratio) or not 0 < ratio <= 1:
+                    raise ValueError("Invalid hunger target")
+                cleaned["at_least"] = float(ratio)
+            elif kind in {"visit_region", "survey_region"}:
+                cleaned["node_id"] = text(target.get("node_id"), 160)
+                if not cleaned["node_id"]:
+                    raise ValueError("Visit task requires a known node ID")
+                if kind == "survey_region":
+                    cleaned["cells"] = survey_cells(target)
+            elif kind != "known_regions":
+                raise ValueError("Unsupported task target type")
         dependencies = task.get("depends_on", [])
         if (not isinstance(dependencies, list) or len(dependencies) > MAX_TASKS
                 or any(not isinstance(d, str) for d in dependencies)):
@@ -199,7 +210,7 @@ def validate_board(raw: dict, day: int) -> dict:
                                           if isinstance(v, str)] if isinstance(raw.get("replan_if", []), list) else []}
 
 
-def board_view(board: dict, state: dict, *, verified_structures=None) -> dict:
+def board_view(board: dict, state: dict, *, verified_structures=None, target_evaluator=None, completed_task_ids=()) -> dict:
     """Re-evaluate a copy, including for predictive JEV input; never fake progress."""
     result = copy.deepcopy(board)
     inventory = state.get("player", {}).get("inventory", {})
@@ -234,10 +245,16 @@ def board_view(board: dict, state: dict, *, verified_structures=None) -> dict:
         target, current, needed, known = task["target"], 0, 1, True
         kind = target["type"]
         missing_reason = "required telemetry missing"
-        if kind == "inventory":
+        if target_evaluator is not None:
+            current, needed, known, missing_reason = target_evaluator(target, state)
+        elif kind == "inventory":
             current, needed = counts.get(target["prefab"], 0), target["count"]
             if target.get("recipe_id"):
                 current = state.get("recipe_inventory", {}).get(target["prefab"], current)
+        elif kind in CAMP_TARGETS:
+            needed = target.get("count", 1)
+            missing_reason = camp_error(target, state)
+            known = not missing_reason
         elif kind == "refuel":
             needed = target.get("at_least",target.get("count"))
             missing_reason = (refuel_error(target, state.get("places")) or
@@ -250,6 +267,10 @@ def board_view(board: dict, state: dict, *, verified_structures=None) -> dict:
                 missing_reason = reason
         elif kind in PLACE_TARGETS:
             done, reason = target_progress(target, state.get("places"))
+            if kind == "set_home" and reason == HOME_ANCHOR_UNAVAILABLE:
+                # No route can restore a missing site ID. DeepSeek must choose a new anchor.
+                task.update(status="failed", blocked_reason=reason, progress={"current": 0, "required": 1})
+                continue
             current, known = (0 if kind == "stay_home" else int(done)), not bool(reason)
             if reason:
                 missing_reason = reason
@@ -298,10 +319,11 @@ def board_view(board: dict, state: dict, *, verified_structures=None) -> dict:
         if not known:
             task["status"] = "blocked"
     by_id = {task["id"]: task for task in result["tasks"]}
+    confirmed = set(completed_task_ids)
     for _ in result["tasks"]:
         for task in result["tasks"]:
-            waiting = [d for d in task["depends_on"] if by_id[d]["status"] != "done"]
-            if task["status"] not in TERMINAL_TASKS | {"scheduled"} and waiting:
+            waiting = [d for d in task["depends_on"] if d not in confirmed and by_id[d]["status"] != "done"]
+            if task["status"] not in {"failed", "expired", "scheduled"} and waiting:
                 task["status"], task["blocked_reason"] = "blocked", "dependencies: " + ",".join(waiting)
     for task in result["tasks"]:
         if expired:

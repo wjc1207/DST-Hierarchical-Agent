@@ -1,6 +1,6 @@
 # Persistent priority goals and source navigation
 
-[中文使用说明](MCP.md) · [English setup](MCP.EN.md)
+[中文使用说明](MCP.md) · [English setup](MCP.EN.md) · [Camp interactions](CAMP_WORK.md)
 
 ## Model contract
 
@@ -174,7 +174,10 @@ always outrank a retained room-prior intent. `search_spent` is per attempt;
 If no task can currently advance, the host immediately requests evaluation.
 With unfinished focus, it retains control (`focus_pending`) and checks safety
 while waiting for review/retry; without focus, JEV can take temporary local
-control. Exact-choice failure pauses also apply during temporary control.
+control. A set-home task whose building ID is missing from the current building
+memory or confirmed destroyed fails and releases its focus. A remembered building
+that is merely out of sight remains a valid target, and missing place telemetry
+does not invalidate it. Exact-choice failure pauses also apply during temporary control.
 Missing paths are not completion.
 
 ## Asynchronous review

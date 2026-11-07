@@ -14,7 +14,7 @@ EXPLORATION_RESOURCE_PREFABS = set(COLLECT_PRODUCTS) | {
     "charcoal", "marble", "moonrocknugget", "berries", "berries_juicy", "berries_juicy_cooked",
     "carrot", "carrot_planted", "seeds", "petals",
 }
-SAFE_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "berries_juicy_cooked",
+SAFE_FOOD_PREFABS = ("meatballs", "ratatouille", "cookedmeat", "cookedsmallmeat", "berries_cooked", "berries_juicy_cooked",
                      "carrot_cooked", "berries", "berries_juicy", "carrot", "seeds_cooked", "seeds")
 RAW_COOKABLE_FOOD_PREFABS = ("meat", "smallmeat", "berries", "berries_juicy", "carrot")
 MINE_PRODUCTS = {"rock1": {"rocks", "flint", "nitre"}, "rock2": {"rocks", "flint", "goldnugget"},

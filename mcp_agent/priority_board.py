@@ -11,6 +11,9 @@ from common.placement import resolve as placement_area, inside as inside_placeme
 from common.refueling import has_fuel
 from common.thermal import refuel_pause, heat_risk
 from common.places import PLACE_TARGETS
+from common.camp_work import CAMP_TARGETS
+from common.companion_transfer import COUNTED_TARGETS as COMPANION_TRANSFERS
+from mcp_agent import camp_execution
 from common.coordinates import move_action, validate_point
 from common.game_rules import WORK_PRODUCTS, SAFETY_INTERRUPTS, SAFE_FOOD_PREFABS
 from common.task_board import validate_board, board_view, focus_scope, MAX_TASKS
@@ -22,6 +25,7 @@ from mcp_agent.maintenance import is_maintenance, update_maintenance
 from mcp_agent.navigation_intents import dispatch_for_navigation, FOOD_SEARCH_PRODUCT
 
 SEARCH_RETRY_SECONDS = 15
+TRANSFER_TARGETS = {"deposit", "withdraw"} | COMPANION_TRANSFERS
 
 
 def is_priority_board(board):
@@ -54,15 +58,15 @@ def idle_review_marker(view):
                         for t in view.get("tasks", [])))
 
 
-def validate_goals(raw, day):
+def validate_goals(raw, day, *, target_validator=None):
     if not isinstance(raw, dict):
         raise ValueError("Priority board must be an object")
-    clean = validate_board(raw, day)
+    clean = validate_board(raw, day, target_validator=target_validator)
     for task, source in zip(clean["tasks"], raw["tasks"]):
         target = task["target"]
-        if target["type"] == "inventory" and target["prefab"] in {"torch", "axe", "pickaxe"} and target["count"] != 1:
+        if target_validator is None and target["type"] == "inventory" and target["prefab"] in {"torch", "axe", "pickaxe"} and target["count"] != 1:
             raise ValueError("Native crafting offers one carried tool/torch, not reserve stock")
-        if target["type"] == "structure" and target["prefab"] == "firepit" and not target.get("recipe_id"):
+        if target_validator is None and target["type"] == "structure" and target["prefab"] == "firepit" and not target.get("recipe_id"):
             raise ValueError("Building firepit is not supported")
         for key, default, low, high in (("search_budget_seconds", 120, 10, 600),
                                          ("search_budget_distance", 240, 8, 2000)):
@@ -93,7 +97,7 @@ def task_signature(task):
 
 
 def progress_signatures_match(left, right):
-    """Quantity/schedule reviews cannot erase a verified fuel addition in flight."""
+    """Quantity/schedule reviews preserve counted operations for the same task."""
     if left == right:
         return True
     try:
@@ -101,11 +105,13 @@ def progress_signatures_match(left, right):
         targets = [value.get("target", value) for value in targets]
     except (ValueError, TypeError, AttributeError):
         return False
-    return (all(target.get("type") == "refuel" for target in targets)
-            and all(targets[0].get(k) == targets[1].get(k) for k in ("building_id", "fuel_prefab")))
+    if all(target.get("type") == "refuel" for target in targets):
+        return all(targets[0].get(k) == targets[1].get(k) for k in ("building_id", "fuel_prefab"))
+    return (targets[0].get("type") in TRANSFER_TARGETS
+            and all(targets[0].get(k) == targets[1].get(k) for k in ("type", "building_id", "container_guid", "prefab")))
 
 
-def merge_goals(previous, incoming):
+def merge_goals(previous, incoming, *, target_validator=None):
     """Reviews are patches: omission never silently cancels existing unfinished goals."""
     result = copy.deepcopy(incoming)
     if not is_priority_board(previous) or previous.get("status") == "completed":
@@ -114,7 +120,7 @@ def merge_goals(previous, incoming):
              if t["id"] not in incoming.get("cancel_task_ids", [])}
     for task in result["tasks"]:
         # Preserve stable identity if the planner renamed an otherwise identical goal.
-        same = next((old for old in tasks.values() if task["target"]["type"] != "refuel"
+        same = next((old for old in tasks.values() if task["target"]["type"] not in TRANSFER_TARGETS | {"refuel"}
                      and task_signature(old) == task_signature(task)
                      and not (task["target"]["type"] in PLACE_TARGETS | {"move_to"} and old.get("status") == "done")), None)
         if same and task["id"] not in tasks:
@@ -139,13 +145,15 @@ def merge_goals(previous, incoming):
         raise ValueError(f"Merged task board has {len(tasks)} tasks (maximum {MAX_TASKS}); "
                          f"retained IDs: {', '.join(tasks)}. Explicitly cancel obsolete unfinished tasks with cancel_task_ids.")
     # Never adopt a merge that introduces unknown dependencies, cycles or >6 tasks.
-    return {**validate_goals(result, incoming["day"]),
+    return {**validate_goals(result, incoming["day"], target_validator=target_validator),
             **{k: incoming[k] for k in ("board_id", "quarter") if k in incoming}}
 
 
 class PriorityBoardExecutor:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, *, target_evaluator=None, progress_evaluator=None):
         self.clock = clock
+        self.target_evaluator = target_evaluator
+        self.progress_evaluator = progress_evaluator
         self.records = {}
         self.refuel_totals = {}
         self.selected = None
@@ -166,9 +174,15 @@ class PriorityBoardExecutor:
         if new_batch:
             fuel_totals = self.refuel_totals
             latest = self.latest_observed_state
-            self.__init__(self.clock)
+            transfers = {}
+            for identity, record in self.records.items():
+                signature = json.loads(record["signature"])
+                if signature.get("target", signature).get("type") in TRANSFER_TARGETS:
+                    transfers[identity] = record
+            self.__init__(self.clock, target_evaluator=self.target_evaluator, progress_evaluator=self.progress_evaluator)
             self.refuel_totals = fuel_totals
             self.latest_observed_state = latest
+            self.records = transfers
         for task in board["tasks"]:
             record = self._record(task)
             revision = (task.get("reason", ""), task.get("search_budget_seconds"), task.get("search_budget_distance"))
@@ -201,6 +215,8 @@ class PriorityBoardExecutor:
                 record.pop("maintenance",None)
                 record["done"] = False
         record["signature"] = signature
+        if task["target"]["type"] in TRANSFER_TARGETS:
+            record["done"] = not record.get("camp_error") and record.get("camp_count", 0) >= task["target"]["count"]
         if task["target"]["type"] == "refuel":
             total = self._refuel_total(task["id"],task["target"])
             record["fuel_added"] = total["added"]
@@ -216,6 +232,20 @@ class PriorityBoardExecutor:
 
     def _restart_search(self, record):
         record.update(seconds=0., distance=0., blocked="", retry_at=None, attempt=record["attempt"] + 1)
+
+    def resume_local_work(self, task_id):
+        """A fresh local opportunity can release exhausted search budgets on any backend."""
+        record = self.records.get(task_id)
+        if record and record.get("blocked") == "search_budget_exhausted" and not record["done"]:
+            self._restart_search(record)
+            return True
+        return False
+
+    def suspend_search(self, task_id):
+        record = self.records[task_id]
+        record["blocked"] = "search_budget_exhausted"
+        if record.get("retry_at") is None:
+            record.update(retry_at=self.clock()+SEARCH_RETRY_SECONDS, recovery_pending=True)
 
     @staticmethod
     def eligible_tasks(view):
@@ -240,7 +270,8 @@ class PriorityBoardExecutor:
                     self.stale_observations_ignored += 1
                 else:
                     self.latest_observed_state = state
-        result = board_view(board, state)
+        result = board_view(board, state, target_evaluator=self.target_evaluator,
+                            completed_task_ids={task["id"] for task in board["tasks"] if self._record(task).get("done")})
         now, position = self.clock(), state.get("player", {}).get("position")
         emergency = heat_risk(state) or any(e.get("activeThreat") for e in state.get("nearby", []))
         if self.navigation and self.selected in self.records and self.last_tick is not None and not emergency:
@@ -293,6 +324,18 @@ class PriorityBoardExecutor:
                 else:
                     task.update(status="blocked",blocked_reason="observed map cell count unavailable",
                                 progress={"current":0,"required":required})
+            if record.get("camp_error"):
+                task.update(status="failed", blocked_reason=record["camp_error"])
+            elif self.progress_evaluator is not None and (task["status"] != "blocked" or (
+                    task.get("blocked_reason", "").startswith("dependencies:") and
+                    all(self.records.get(d, {}).get("done") for d in task["depends_on"]))):
+                self.progress_evaluator(task, record, state)
+            elif task["target"]["type"] in CAMP_TARGETS and (task["status"] != "blocked" or (
+                    task.get("blocked_reason", "").startswith("dependencies:") and
+                    all(self.records.get(d, {}).get("done") for d in task["depends_on"]))):
+                if task["status"] == "blocked":
+                    task.update(status="ready", blocked_reason="")
+                camp_execution.progress(task, record, state)
             if task["status"] == "done" and not predicted:
                 record["done"] = True
             elif task["status"] == "done" and predicted and not record["done"]:
@@ -304,10 +347,8 @@ class PriorityBoardExecutor:
                 task.update(status="done", blocked_reason="")
             elif (record["seconds"] >= task.get("search_budget_seconds", 120)
                   or record["distance"] >= task.get("search_budget_distance", 240)):
-                record["blocked"] = "search_budget_exhausted"
-                if record.get("retry_at") is None:
-                    record.update(retry_at=now + SEARCH_RETRY_SECONDS, recovery_pending=True)
-            if record["blocked"] and not record["done"]:
+                self.suspend_search(task["id"])
+            if record["blocked"] and not record["done"] and task["status"] not in TERMINAL_TASKS:
                 task.update(status="blocked", blocked_reason=record["blocked"])
             task["search_spent"] = {"seconds": round(record["seconds"], 2), "distance": round(record["distance"], 2)}
             task["search_retry"] = {"attempt": record["attempt"],
@@ -367,6 +408,8 @@ class PriorityBoardExecutor:
             return [(k, a) for k, a in actions.items() if a.get("planner_only")
                     and a.get(field) == target[field]
                     and a.get("kind") == ("set_home" if target["type"] == "set_home" else "explore")]
+        if target["type"] in CAMP_TARGETS:
+            return camp_execution.choices(task, actions, state or {})
         if target["type"] == "refuel":
             choices = [(k,a) for k,a in actions.items() if a.get("kind")=="add_fuel"
                        and a.get("building_id")==target["building_id"] and a.get("fuel_prefab")==target["fuel_prefab"]
@@ -385,9 +428,18 @@ class PriorityBoardExecutor:
         if target["type"] == "inventory":
             product = target["prefab"]
             candidates = [(k, a) for k, a in actions.items() if a.get("kind") == "collect" and a.get("product", a.get("prefab")) == product]
+            if product == "charcoal":
+                chops = [(k, a) for k, a in actions.items() if a.get("charcoal_work")]
+                if candidates or chops or not target.get("allow_ignite"):
+                    return candidates or chops
+                if camp_execution.burning(state or {}):
+                    return []
+                return [(k, a) for k, a in actions.items() if a.get("kind") == "ignite_tree" or a.get("ignition_torch")]
             if product in WORK_PRODUCTS:
                 kind, sources = WORK_PRODUCTS[product]
-                candidates += [(k, a) for k, a in actions.items() if a.get("kind") == kind and a.get("prefab") in sources]
+                candidates += [(k, a) for k, a in actions.items() if a.get("kind") == kind
+                               and a.get("prefab") in sources and not a.get("charcoal_work")
+                               and a.get("tree_stage") != "burnt"]
             candidates += [(k, a) for k, a in actions.items()
                            if a.get("kind") == "craft" and a.get("product") == product
                            and (not target.get("recipe_id") or a.get("recipe_id") == target["recipe_id"])]
@@ -451,7 +503,7 @@ class PriorityBoardExecutor:
                     and not record["done"] and any(a.get("kind") != "explore"
                         and (task["id"], key, a.get("guid")) not in self.paused
                         for key, a in self.local_choices(task, actions, state))):
-                self._restart_search(record)
+                self.resume_local_work(task["id"])
                 resumed = True
         if resumed:
             view = self.view(board, state)
@@ -482,7 +534,7 @@ class PriorityBoardExecutor:
         # A refuel task owns its trip to the exact fire, not just a trip home.
         # During residence, actions were already filtered by the whole-path bound.
         for task in ready:
-            if task["target"]["type"] != "refuel":
+            if task["target"]["type"] not in CAMP_TARGETS | {"refuel"}:
                 continue
             routes = [(k,a) for k,a in self.local_choices(task,actions,state)
                       if a.get("kind")=="explore" and (task["id"],k,a.get("guid")) not in self.paused]
@@ -518,7 +570,7 @@ class PriorityBoardExecutor:
                     self.navigation_mode,self.last_tick=action.get("mode"),now
                     return task,key,action
                 continue
-            if target["type"] in PLACE_TARGETS:
+            if target["type"] in PLACE_TARGETS | CAMP_TARGETS:
                 routes = [(k, a) for k, a in self.local_choices(task, actions, state)
                           if a.get("kind") == "explore" and (task["id"], k, a.get("guid")) not in self.paused]
                 if routes:
@@ -526,6 +578,8 @@ class PriorityBoardExecutor:
                     self.selected, self.navigation = task["id"], True
                     self.navigation_mode, self.last_tick = action.get("mode"), now
                     return task, key, action
+                continue
+            if target.get("allow_ignite") and camp_execution.burning(state):
                 continue
             if target.get("recipe_id") or target["type"] not in {"inventory", "hunger_ratio", "visit_region", "survey_region", "known_regions"} or target.get("prefab") in {"torch", "axe", "pickaxe"}:
                 continue
@@ -553,6 +607,9 @@ class PriorityBoardExecutor:
         if any(t["target"]["type"]=="refuel" and refuel_pause(t["target"],state)=="fuel_settling" for t in ready):
             self.reason="refuel_settling"
             return None
+        if any(t["target"].get("allow_ignite") for t in ready) and camp_execution.burning(state):
+            self.reason = "charcoal_burning"
+            return None
         if not ready and any(t["status"]=="maintaining" for t in view["tasks"]):
             self.reason="maintenance_holding"
             return None
@@ -566,6 +623,15 @@ class PriorityBoardExecutor:
         return None
 
     def on_result(self, task_id, choice, action, status, reason, navigator, state):
+        record = self.records.get(task_id)
+        if record:
+            signature = json.loads(record["signature"])
+            target = signature.get("target", signature)
+            if target["type"] in CAMP_TARGETS and status == "completed":
+                camp_execution.on_completed(target, record, action, reason, state)
+            elif isinstance(reason, str) and reason.startswith("camp_effect_unconfirmed:"):
+                record["camp_error"] = "action issued but effect unconfirmed; inspect before retrying"
+                reason = reason.split(":", 1)[1]
         if status == "completed" and action.get("kind") == "add_fuel":
             record = self.records.get(task_id)
             if record:

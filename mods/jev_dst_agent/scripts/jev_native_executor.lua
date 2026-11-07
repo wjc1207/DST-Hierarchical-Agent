@@ -3,6 +3,7 @@ local M = {}
 local tree_work=require("jev_tree_work")
 local recipes=require("jev_recipes")
 local refueling=require("jev_refueling")
+local camp_work=require("jev_camp_work")
 local placement=require("jev_placement")
 local thermal=require("jev_thermal")
 local places=require("jev_places")
@@ -15,7 +16,7 @@ local loose={twigs=true,cutgrass=true,flint=true,log=true,rocks=true,goldnugget=
     berries=true,berries_juicy=true,carrot=true,seeds=true,petals=true,ice=true,redgem=true,bluegem=true,
     purplegem=true,thulecite=true,thulecite_pieces=true,berries_cooked=true,berries_juicy_cooked=true,
     carrot_cooked=true,seeds_cooked=true,meat=true,smallmeat=true,cookedmeat=true,cookedsmallmeat=true}
-local cooked={cookedmeat=true,cookedsmallmeat=true,berries_cooked=true,berries_juicy_cooked=true,
+local cooked={meatballs=true,ratatouille=true,cookedmeat=true,cookedsmallmeat=true,berries_cooked=true,berries_juicy_cooked=true,
     carrot_cooked=true,seeds_cooked=true}
 local raw={meat=true,smallmeat=true,berries=true,berries_juicy=true,carrot=true,seeds=true}
 local safe_raw={berries=true,berries_juicy=true,carrot=true,seeds=true}
@@ -86,6 +87,10 @@ local function different(a,b)
 end
 
 local function can_interact(target,action)
+    if action.kind=="ignite_tree" then
+        local path=target.collect_path or {}
+        return target.distance<=3 and path.status=="ready" and (path.reason==nil or path.reason=="direct")
+    end
     if drops[action.kind] then
         -- GetActionButtonAction(force_target) selects work within six units.
         -- Its target-based BufferedAction/locomotor owns the final approach and
@@ -249,6 +254,7 @@ function M.available(s,blocked_escapes,now)
         end
     end
     for id,action in pairs(refueling.actions(s)) do result[id]=action end
+    for id,action in pairs((s.camp_work or {}).options or {}) do result[id]=action end
     for id,action in pairs(recipes.actions(s.recipes)) do result[id]=action end
     for id,action in pairs(places.actions(s.places)) do
         if action.kind~="explore" or not night or torch then result[id]=action end
@@ -279,7 +285,9 @@ local function goal_action_available(s,targets,available)
         if t.type=="inventory" and count(s,t.prefab)<t.count then
             for id,a in pairs(available) do
                 if (a.kind=="collect" and (a.product or a.prefab)==t.prefab) or id=="craft_"..t.prefab or (a.kind=="craft" and a.product==t.prefab and (not t.recipe_id or a.recipe_id==t.recipe_id))
-                    or (t.prefab=="log" and a.kind=="chop_nearest_tree" and log_trees[a.prefab])
+                    or (t.prefab=="log" and a.kind=="chop_nearest_tree" and log_trees[a.prefab]
+                        and not a.charcoal_work and a.tree_stage~="burnt")
+                    or (t.prefab=="charcoal" and (a.charcoal_work or (t.allow_ignite and (a.kind=="ignite_tree" or a.ignition_torch))))
                     or (a.kind=="mine_nearest_rock" and (mine_products[a.prefab] or {})[t.prefab]) then return true end
             end
         elseif t.type=="structure" then
@@ -328,7 +336,10 @@ function M.new(adapter)
             self:finish("interrupted","residence_boundary")
             return false
         end
-        return adapter.issue(choice,action)
+        local accepted=adapter.issue(choice,action)
+        if accepted and run and run==self.active and camp_work.kinds[action.kind] then run.camp_issued=true end
+        if accepted and action.ignition_torch then self.ignition_torch_until=self.last_now+12 end
+        return accepted
     end
     local function remember_command(id)
         if self.command_ids[id] then return end
@@ -350,6 +361,13 @@ function M.new(adapter)
         if adapter.now then self.last_now=adapter.now() end
         adapter.stop()
         local run=self.active
+        if run.ignition_confirmed and status=="completed" then reason="tree_ignited" end
+        if run.action.kind=="ignite_tree" then self.ignition_torch_until=nil end
+        if run.camp_issued and status~="completed"
+            and (run.action.kind=="store_item" or run.action.kind=="take_item" or run.action.kind=="start_meal"
+                or run.action.kind=="harvest_meal" or run.action.kind=="ignite_tree") then
+            reason="camp_effect_unconfirmed:"..tostring(reason or status)
+        end
         if status=="completed" and run.action.kind=="build_sciencemachine" then self.science_machine_built=true end
         self.report={action_id=run.id,choice=run.choice,status=status,reason=reason or "",
             started_at=run.started,confirmed_started_at=run.confirmed_started_at,
@@ -436,6 +454,16 @@ function M.new(adapter)
         run.stage="loot"; run.loot_phase=true; run.loot_settle_until=now+1
         run.work_origin=run.work_origin or run.origin
     end
+    function self:ignition_retreat(run,s,now)
+        local route=(s.thermal or {}).route
+        local action=route and {kind="cool_down",x=route.x,z=route.z,planner_only=true}
+        if not action or not adapter.cooling_safe or not adapter.cooling_safe(action) then return false end
+        run.action=action
+        run.last_position={x=s.player.position.x,z=s.player.position.z}
+        run.progress_at=now
+        local accepted=self:issue("cool_down",action)
+        return accepted~=false and self.active==run
+    end
     function self:start(command,s,now,board)
         self.last_now=now
         self.state=s;self.issue_blocked=false
@@ -447,6 +475,10 @@ function M.new(adapter)
             return false
         end
         local requested=command.action or {}
+        if s.autonomy then
+            if not s.autonomy.enabled then return reject("autonomy_disabled") end
+            if command.autonomy_revision~=s.autonomy.revision then return reject("autonomy_settings_changed") end
+        end
         if (s.player.vitals or {}).dead then return reject("player_dead") end
         if threat(s) and command.choice~="flee_from_nearest_hostile" then
             return reject("targeted_by_hostile")
@@ -505,10 +537,11 @@ function M.new(adapter)
         if command.action and (a.guid~=requested.guid or (a.node_id~=requested.node_id and command.choice~="move_to")
             or (requested.kind and a.kind~=requested.kind) or (requested.prefab and a.prefab~=requested.prefab)
             or (requested.mode and a.mode~=requested.mode and command.choice~="move_to")
-            or a.refuel_approach~=requested.refuel_approach
+            or a.refuel_approach~=requested.refuel_approach or a.camp_approach~=requested.camp_approach
             or a.fuel_guid~=requested.fuel_guid or a.fuel_prefab~=requested.fuel_prefab
             or a.ratio_refuel~=requested.ratio_refuel
             or (a.kind=="add_fuel" and a.native_action~=requested.native_action)
+            or ((camp_work.kinds[a.kind] or a.charcoal_work or a.ignition_torch) and not camp_work.same(a,requested))
             or a.recipe_id~=requested.recipe_id
             or a.building_id~=requested.building_id or a.home_id~=requested.home_id or a.anchor_id~=requested.anchor_id
             or (a.kind=="set_home" and not places.home_point_matches(a,requested))
@@ -538,6 +571,7 @@ function M.new(adapter)
             harvest_inventory_before=harvest and count(s,a.product) or nil,
             origin={x=position.x,z=position.z},resources=types(s),board=board,task_id=command.task_id,
             navigation_targets=requested.navigation_targets,
+            autonomy_revision=s.autonomy and s.autonomy.revision,
             residence=requested.residence,placement=build_area,
             last_position={x=position.x,z=position.z},progress_at=now,
             known_nodes=((s.navigation or {}).graph or {}).known_nodes or 0,
@@ -558,9 +592,10 @@ function M.new(adapter)
             end
         end
         for _,e in ipairs(s.recipe_entities or {}) do self.active.preexisting[e.guid]=true end
-        if a.kind=="collect" or drops[a.kind] then
+        if a.kind=="collect" or drops[a.kind] or a.kind=="ignite_tree" then
             self:issue_target(self.active,s,command.choice,a,nil)
-        elseif a.kind=="eat_safe_food" and fire(s,true) and total(s,raw)>0 then
+        elseif a.kind=="eat_safe_food" and fire(s,true) and total(s,raw)>0
+            and count(s,"meatballs")==0 and count(s,"ratatouille")==0 then
             self.active.stage="cook_before_eat"; self:issue("cook_food",{kind="cook_food"})
         elseif a.kind~="wait" then self:issue(command.choice,a) end
         return true
@@ -576,12 +611,18 @@ function M.new(adapter)
         self.state=s
         for key,until_time in pairs(self.paused) do if until_time<=now then self.paused[key]=nil end end
         local run=self.active
+        if s.autonomy and (not s.autonomy.enabled or (run and run.autonomy_revision~=s.autonomy.revision)) then
+            if run then self:finish("interrupted",s.autonomy.enabled and "autonomy_settings_changed" or "autonomy_disabled") end
+            return
+        end
         -- Daylight fuel saving is executor maintenance, including while idle
         -- or fleeing. Preserve the current action/report and never stop movement.
         -- Craft cleanup and explicit unequip already own their replication wait.
         if control_enabled~=false and s.world.phase=="day" and not s.player.vitals.dead
             and count(s,"torch",true)>0
-            and not (run and (run.action.kind=="craft_torch" or run.action.kind=="unequip_torch")) then
+            and now>=(self.ignition_torch_until or 0)
+            and not (run and (run.action.kind=="craft_torch" or run.action.kind=="unequip_torch"
+                or run.action.kind=="ignite_tree" or run.action.ignition_torch)) then
             if now>=(self.daylight_cleanup_after or 0) then
                 self.daylight_cleanup_after=now+1
                 self:issue("unequip_torch",{kind="unequip_torch",automatic_reason="daylight"})
@@ -625,6 +666,14 @@ function M.new(adapter)
                 self.report.start_source=run.start_source
             end
         end
+        if a.kind=="ignite_tree" and run.camp_issued and camp_work.verify(a,b,s)=="tree_ignited" then
+            run.ignition_confirmed=true
+            self.ignition_torch_until=nil
+            run.deadline=math.max(run.deadline,now+8)
+            if (s.thermal or {}).flame_danger and not threat(s)
+                and self:ignition_retreat(run,s,now) then return end
+            self:finish("completed","tree_ignited");return
+        end
         local cooling=a.kind=="cool_down"
         local heat_risk=thermal.hot(s.player.vitals) or (s.thermal or {}).active
         if heat_risk and not cooling and a.kind~="flee_from_nearest_hostile"
@@ -652,7 +701,11 @@ function M.new(adapter)
             if distance(run.last_position,s.player.position)>=0.15 then
                 run.last_position={x=s.player.position.x,z=s.player.position.z};run.progress_at=now
             elseif now-run.progress_at>=1 then self:finish("failed","movement_stalled");return end
-            if distance(s.player.position,a)<=0.3 then self:finish("completed","cooling_step_completed");return end
+            if distance(s.player.position,a)<=0.3 then
+                if run.ignition_confirmed and (s.thermal or {}).flame_danger
+                    and self:ignition_retreat(run,s,now) then return end
+                self:finish("completed","cooling_step_completed");return
+            end
             if now>=run.deadline then self:finish("failed","verification_timeout");return end
             return
         end
@@ -677,6 +730,10 @@ function M.new(adapter)
                     reason="critical_"..name; break
                 end
             end
+        end
+        if run.camp_issued then
+            local outcome=camp_work.verify(a,b,s)
+            if outcome then self:finish("completed",outcome);return end
         end
         if reason then self:finish("interrupted",reason); return end
         if now>=run.deadline then self:finish("failed","verification_timeout"); return end
@@ -921,8 +978,10 @@ function M.new(adapter)
         if done then self:finish("completed","observed_effect") end
     end
     function self:board_choice(s,now)
+        if s.autonomy and not s.autonomy.enabled then return end
         local board=self.board
         if not board then return end
+        if s.autonomy and board.autonomy_revision~=s.autonomy.revision then return end
         -- Match the planner's verified Science Machine milestone; leaving its
         -- visibility must not make a completed construction task build it again.
         for _,e in ipairs(s.nearby or {}) do
@@ -971,10 +1030,11 @@ function M.new(adapter)
                 if goal.type=="inventory" then
                     matches=(a.kind=="collect" and a.product==goal.prefab) or id=="craft_"..goal.prefab
                         or (a.kind=="craft" and a.product==goal.prefab and a.recipe_id==goal.recipe_id)
-                        or (a.kind=="chop_nearest_tree" and goal.prefab=="log" and log_trees[a.prefab])
+                        or (a.kind=="chop_nearest_tree" and goal.prefab=="log" and log_trees[a.prefab]
+                            and not a.charcoal_work and a.tree_stage~="burnt")
                         or (a.kind=="mine_nearest_rock" and (mine_products[a.prefab] or {})[goal.prefab])
                 elseif goal.type=="hunger_ratio" then matches=id=="eat_safe_food"
-                elseif goal.type=="visit_building" then matches=a.building_id==goal.building_id
+                elseif goal.type=="visit_building" then matches=a.kind=="explore" and a.building_id==goal.building_id
                 elseif goal.type=="return_home" then matches=a.home_id==goal.home_id
                 elseif goal.type=="set_home" then matches=(a.kind=="set_home" and a.anchor_id==goal.anchor_id)
                     or (a.kind=="explore" and a.building_id==goal.anchor_id)
@@ -990,7 +1050,7 @@ function M.new(adapter)
         if self.active or self.board_paused or not self.board or not self.board.auto_execute then return end
         local id,a,task=self:board_choice(s,now)
         if id then self:start({action_id="board:"..self.board_revision..":"..now,
-            choice=id,action=a,task_id=task},s,now,true) end
+            choice=id,action=a,task_id=task,autonomy_revision=self.board.autonomy_revision},s,now,true) end
     end
     return self
 end

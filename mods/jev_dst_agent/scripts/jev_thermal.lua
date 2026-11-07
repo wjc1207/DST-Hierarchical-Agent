@@ -1,5 +1,8 @@
 -- Native temperature and observable fire facts; bounded, illuminated cooling steps.
 local M={}
+-- Vanilla medium/large propagators deal contact fire damage within three units.
+local FLAME_DAMAGE_RANGE=3
+local FLAME_MARGIN=1
 local function finite(n) return type(n)=="number" and n==n and math.abs(n)<1000000 end
 local function safe(fn, fallback)
     local ok,value=pcall(fn);if ok and value~=nil then return value end;return fallback
@@ -102,7 +105,15 @@ function M.route_safe(G,player,point,segment)
     local initial=nearest(x,z)
     for step=1,math.ceil(length*2) do
         local f=step/math.max(1,math.ceil(length*2))
-        if nearest(x+(point.x-x)*f,z+(point.z-z)*f)<initial-0.05 then return false end
+        local sx,sz=x+(point.x-x)*f,z+(point.z-z)*f
+        if nearest(sx,sz)<initial-0.05 then return false end
+        for _,source in ipairs(sources) do
+            if source.flame_radius then
+                local before=(x-source.x)^2+(z-source.z)^2
+                local minimum=math.min(before,source.flame_radius^2)
+                if (sx-source.x)^2+(sz-source.z)^2<minimum-0.05 then return false end
+            end
+        end
     end
     if G.TheWorld and G.TheWorld.state.isnight and not portable(player,G) then
         local cutoff=math.max(0.15,(G.TUNING or {}).DARK_CUTOFF or 0.1)
@@ -126,16 +137,30 @@ function M.sample(G,player,v,nearby,segment)
     elseif finite(v.temperature) and finite(v.heat_recovery_threshold) and v.temperature<=v.heat_recovery_threshold then active=false
     elseif not finite(v.temperature) and v.overheating~=true then active=false end
     player._jev_cooling_active=active
-    local result={available=finite(v.temperature),active=active,status=active and "cooling" or "safe"}
-    if not active then return result end
     local px,_,pz=player.Transform:GetWorldPosition()
     local sources={}
+    local flame_danger=false
+    local spring=G.TheWorld and G.TheWorld.state.isspring
+    local factor=spring and (G.TUNING or {}).SPRING_FIRE_RANGE_MOD or 1
+    if not finite(factor) or factor<1 then factor=1 end
+    local flame_radius=FLAME_DAMAGE_RANGE*factor+FLAME_MARGIN
     for _,e in ipairs(nearby or {}) do
-        if (e.prefab=="campfire" or e.prefab=="firepit") and e.lit==true then
-            sources[#sources+1]={x=px+e.dx,z=pz+e.dz}
+        local campfire=e.prefab=="campfire" or e.prefab=="firepit"
+        local burning=false
+        for _,tag in ipairs(e.tags or {}) do if tag=="fire" then burning=true;break end end
+        if finite(e.dx) and finite(e.dz) then
+            if not campfire and burning then
+                sources[#sources+1]={x=px+e.dx,z=pz+e.dz,flame_radius=flame_radius}
+                if e.dx^2+e.dz^2<flame_radius^2 then flame_danger=true end
+            elseif active and campfire and e.lit==true then
+                sources[#sources+1]={x=px+e.dx,z=pz+e.dz}
+            end
         end
     end
     player._jev_cooling_sources=sources
+    local result={available=finite(v.temperature) or flame_danger,active=active or flame_danger,
+        flame_danger=flame_danger,status=(active or flame_danger) and "cooling" or "safe"}
+    if not result.active then return result end
     local function distance(x,z)
         local nearest=math.huge
         for _,f in ipairs(sources) do nearest=math.min(nearest,(x-f.x)^2+(z-f.z)^2) end
@@ -154,7 +179,8 @@ function M.sample(G,player,v,nearby,segment)
                 and M.route_safe(G,player,point,segment) then result.route=point;score=value end
         end
     end end
-    result.reason=result.route and "move_away_from_heat" or "no_safe_lit_cooling_route"
+    result.reason=result.route and (flame_danger and "move_away_from_flames" or "move_away_from_heat")
+        or "no_safe_lit_cooling_route"
     return result
 end
 return M
