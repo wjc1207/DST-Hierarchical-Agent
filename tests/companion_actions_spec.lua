@@ -1,4 +1,4 @@
-package.path="./mods/jev_ai_companion/scripts/?.lua;"..package.path
+package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 local Native=require("jev_companion_actions")
 local Server=require("jev_companion_server")
 local passed=0

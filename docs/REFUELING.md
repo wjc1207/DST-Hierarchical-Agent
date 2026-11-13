@@ -75,7 +75,7 @@ DeepSeek 可向营火 `campfire` 和石头火堆 `firepit` 添加指定数量的
 同步 Python、`scripts/jev_thermal.lua`、`scripts/jev_refueling.lua`、原生执行器、执行观察器和
 驻留边界模块后，重新进入世界并重启 Python 控制程序。
 
-离线验证：`python run_tests.py`；Lua 新增 `tests/refueling_spec.lua`，覆盖原生兼容性、
+离线验证：`python python/run_tests.py`；Lua 新增 `tests/refueling_spec.lua`，覆盖原生兼容性、
 湿燃料、熄灭火堆、背包材料、目标变化、完成校验、取消和驻留边界。另有真实模组
 到达距离回归及 Python“靠近后连续添两份”的完整控制循环测试。实机还需确认
 服务器复制延迟下的添燃料及重新点火效果。

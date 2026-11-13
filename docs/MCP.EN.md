@@ -5,17 +5,17 @@
 The control path is: **AI host → STDIO MCP server → authenticated loopback HTTP → client Mod**.
 The server does not tail game logs, simulate input or call model APIs. Lua reports
 legal actions, executes them natively and verifies effects. The included external
-host, `mcp_agent/mcp_agent.py`, connects DeepSeek/JEV to this path. The keyboard runner has been removed; model calls use an independent API client.
+host, `python/mcp_agent/mcp_agent.py`, connects DeepSeek/JEV to this path. The keyboard runner has been removed; model calls use an independent API client.
 
 ## Setup
 
-Copy `mods/jev_dst_agent` from the repository into the game's `mods` directory.
+Copy `mods/dst_player_agent` from the repository into the game's `mods` directory.
 Use Python 3.11+ and run the following from the project folder. Adjust `$dstMods` to match your installation.
 
 ```powershell
-python -m pip install -r requirements-mcp.txt
+python -m pip install -r python/requirements-mcp.txt
 $dstMods = "C:\Program Files (x86)\Steam\steamapps\common\Don't Starve Together\mods"
-python .\mcp_server\mcp_server.py --configure-only --write-mod-config (Join-Path $dstMods "jev_dst_agent\scripts\jev_bridge_config.lua")
+python .\python\mcp_server\mcp_server.py --configure-only --write-mod-config (Join-Path $dstMods "dst_player_agent\scripts\jev_bridge_config.lua")
 ```
 
 The configure command saves the local token at `logs/mcp_bridge.json` and writes
@@ -23,9 +23,9 @@ matching bridge settings into the installed mod. Keep model API keys in the
 repository's local `.env`. Re-enter the world and start the service from the same
 project and token path.
 When upgrading, preserve the existing token/configuration, update Python
-files (including both `mcp_server/` and `mcp_agent/`), Mod entry files and `scripts/` (including
+files (including both `python/mcp_server/` and `python/mcp_agent/`), Mod entry files and `scripts/` (including
 `jev_timing.lua`), then re-enter the world to load 1.8.6.
-Upgrading from a complete 1.8.5 installation requires `mcp_agent/`, `mcp_server/`,
+Upgrading from a complete 1.8.5 installation requires `python/mcp_agent/`, `python/mcp_server/`,
 `scripts/jev_bridge.lua` and `modinfo.lua`;
 restart the Python host and reload the world. Preserve installed credentials
 and generated configuration.
@@ -35,7 +35,7 @@ The updated autonomous host requires protocol 4 and rejects older Mod snapshots.
 Update both sides together; measurement version remains 1.
 
 Science Machine mapping updates require `modmain.lua` and
-`mcp_agent/daily_planner.py`, followed by a world reload and Python-host restart.
+`python/mcp_agent/daily_planner.py`, followed by a world reload and Python-host restart.
 Public goals/actions keep `sciencemachine` / `build_sciencemachine`; the Mod uses
 `researchlab` for native recipes/entities and retains it in `game_prefab` on the
 normalized observation. No task-board or action-name migration is required.
@@ -46,7 +46,7 @@ Stop bridge-only instances, probes and other same-port clients.
 Using the Python environment with MCP dependencies installed, run:
 
 ```powershell
-python .\mcp_agent\mcp_agent.py --loop --execute
+python .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
 The host launches its own STDIO service and loads existing `.env` model settings.
@@ -61,8 +61,8 @@ is disabled. If Codex MCP, a probe, `--bridge-only` or another service already
 owns 8765, startup prints `mcp_startup_error bridge_port_unavailable
 address=127.0.0.1:8765` and exits with code 2 before observation retries. It does
 not attach to or terminate the existing process. Stop the old client/service
-before launching `mcp_agent/mcp_agent.py`; a client-managed service may respawn if only its
-process is killed. Update both `mcp_server/` and `mcp_agent/`;
+before launching `python/mcp_agent/mcp_agent.py`; a client-managed service may respawn if only its
+process is killed. Update both `python/mcp_server/` and `python/mcp_agent/`;
 the Mod and existing token configuration are unchanged.
 
 - DeepSeek maintains persistent priority goals, dependencies and search budgets,
@@ -96,10 +96,10 @@ The keyboard runner and its predictive buffer have been removed.
 
 ## Priority goals and resource navigation (1.8.7)
 
-Server files (entry point, bridge and HTTP instrumentation) live in `mcp_server/`.
-The automatic host and connectivity probe live in `mcp_agent/`. Models and search intents live in `mcp_agent/`; shared rules in `common/`; knowledge assets in `data/`. `.env`, `logs/` and the installed
+Server files (entry point, bridge and HTTP instrumentation) live in `python/mcp_server/`.
+The automatic host and connectivity probe live in `python/mcp_agent/`. Models and search intents live in `python/mcp_agent/`; shared rules in `python/common/`; knowledge assets in `data/`. `.env`, `logs/` and the installed
 Lua bridge token/config keep their existing locations. Update existing MCP client
-launch configurations to `mcp_server/mcp_server.py`. From the project root,
+launch configurations to `python/mcp_server/mcp_server.py`. From the `python/` directory,
 `python -m mcp_server` and `python -m mcp_agent` are also supported.
 
 DeepSeek returns `tasks`, validated as `schema=2, execution_policy=priority_goals`.
@@ -154,8 +154,8 @@ executor does not invent missing-tool/recipe subtasks; the plan must include
 prerequisites explicitly. Each native command still uses an original MCP
 observation and Lua verification; this is not a blind batch of key presses.
 
-Update the new `mcp_agent/action_sequence.py` and changed `mcp_agent/daily_planner.py`, `mcp_agent/mcp_agent.py`,
-`mcp_agent/navigation_intents.py`, `mcp_agent/jev_client.py` and `data/DSTKnowledge.txt`, then restart Python.
+Update the new `python/mcp_agent/action_sequence.py` and changed `python/mcp_agent/daily_planner.py`, `python/mcp_agent/mcp_agent.py`,
+`python/mcp_agent/navigation_intents.py`, `python/mcp_agent/jev_client.py` and `data/DSTKnowledge.txt`, then restart Python.
 The Lua protocol remains 4; existing `submit_task_board` tools are kept for older
 clients. Pure semantic sequences remain MCP-compatible, without keyboard fallbacks.
 
@@ -168,7 +168,7 @@ Configure any STDIO MCP host using the Python that has the dependencies installe
   "mcpServers": {
     "dst": {
       "command": "python",
-      "args": ["C:/path/to/jev_dst_agent/mcp_server/mcp_server.py"]
+      "args": ["C:/path/to/DST-Hierarchical-Agent/python/mcp_server/mcp_server.py"]
     }
   }
 }
@@ -176,7 +176,7 @@ Configure any STDIO MCP host using the Python that has the dependencies installe
 
 The host manages that process. Do not start a second instance on the same port.
 
-Alternatively, `python mcp_agent/mcp_probe.py` starts a temporary service and checks the real
+Alternatively, `python python/mcp_agent/mcp_probe.py` starts a temporary service and checks the real
 game connection through MCP without any third-party host. It waits for the Mod,
 prints state/actions and exits, sending no game action by default. An explicit
 `--execute-choice wait` tests one offered action. Do not run the probe alongside
@@ -185,7 +185,7 @@ Only MCP uses stdout; diagnostics use stderr. The internal bridge binds solely t
 `127.0.0.1:8765`. Regenerate Mod configuration after changing `--port`.
 `--config` selects an existing token file. No model key is required.
 
-For connectivity testing only, run `python mcp_server/mcp_server.py --bridge-only`; this does
+For connectivity testing only, run `python python/mcp_server/mcp_server.py --bridge-only`; this does
 not start MCP or send game actions. The Mod's enabled message alone is not proof
 of connectivity: check `state.bridge.connected`. Stop this instance before
 connecting an MCP host. Disabling the bridge does not enable another control transport.
@@ -204,8 +204,11 @@ connecting an MCP host. Disabling the bridge does not enable another control tra
   an unoffered action or suppress safety/region/path interruptions.
 - `get_action_status(action_id)`: state, reason and connectivity.
 - `cancel_action(action_id)`: request cancellation; wait for Lua acknowledgement.
-- `submit_task_board(board, observation_id, auto_execute=false)`: validated board;
-  local automation requires explicit opt-in. Resubmit with false to pause.
+- `submit_task_board(board)`: validate and merge a batch into the Python scheduler.
+- `get_task_board()`: read task IDs, progress, blocked reasons and active action.
+- `submit_task(task)`: add a single flat task.
+- `update_task(task_id, changes)`: patch an existing task by ID.
+- `delete_task(task_id)`: remove a task and request cancellation of its active action.
 
 Read facts/actions, submit with the observation ID, then poll. States are queued,
 running, cancel_requested, completed, failed, interrupted and cancelled. Reobserve
@@ -216,9 +219,7 @@ the original target instead of replacing it with a fresh same-named action. Lua
 validates that target against current facts. Up to 128 observations are retained;
 heartbeat sequence changes alone do not invalidate a decision.
 
-An enabled automatic board reserves ownership even between local actions. Pause it
-by resubmitting with `auto_execute=false`, then wait for Lua to stop its active
-action before submitting manual commands.
+A running board owns the actor. Let its tasks finish or delete them, then wait for any cancellation acknowledgement before submitting manual actions.
 
 ## Scope
 
@@ -254,7 +255,7 @@ persists across resource-event yields and excludes model/local-work waits; see
 [navigation recovery](GOAL_NAVIGATION.md#search-bounds-and-recovery).
 
 The full DFS/BFS selector and failed-source memory have not moved into Lua: the
-host uses `mcp_agent/navigation_intents.py` for destination scheduling, not keyboard control. Attacking/weapon equipment, automatic tool prerequisite solving
+host uses `python/mcp_agent/navigation_intents.py` for destination scheduling, not keyboard control. Attacking/weapon equipment, automatic tool prerequisite solving
 and Alchemy Engine actions are not offered. Missing/unsupported board goals yield
 to the host; Lua does not call models itself. Arbitrary code, paths and custom
 coordinates are not tools.
@@ -484,7 +485,7 @@ the world; no new MCP tool or separate model decision is required per fruit.
 
 ## Tests
 
-`python run_tests.py` runs offline regressions. With the optional SDK installed,
+`python python/run_tests.py` runs offline regressions. With the optional SDK installed,
 `python -m unittest discover -s tests -p test_game_bridge.py -v` additionally tests
 real MCP discovery, a STDIO subprocess and loopback HTTP with a simulated Lua peer.
 Without the SDK those integration cases are skipped. Lua tests are included in

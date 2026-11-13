@@ -1,4 +1,4 @@
-package.path="./mods/jev_dst_agent/scripts/?.lua;"..package.path
+package.path="./mods/dst_player_agent/scripts/?.lua;"..package.path
 local P=require("jev_placement")
 local N=require("jev_native_executor")
 local R=require("jev_recipes")

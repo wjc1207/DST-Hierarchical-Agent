@@ -1,4 +1,4 @@
-package.path="./mods/jev_ai_companion/scripts/?.lua;"..package.path
+package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 local Presentation=require("jev_companion_presentation")
 local World=require("jev_companion_world")
 local passed=0

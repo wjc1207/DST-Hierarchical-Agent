@@ -36,7 +36,7 @@
 
 ## 实测
 
-安装新版伙伴模组后重进世界，重启本机 `python mcp_agent/companion_agent.py --execute`，用 `/buddy summon` 绑定伙伴。可依次测试：
+安装新版伙伴模组后重进世界，重启本机 `python python/mcp_agent/companion_agent.py --execute`，用 `/buddy summon` 绑定伙伴。可依次测试：
 
 ```text
 /buddy do 做一把斧头，砍树收集3个木头，然后回来

@@ -103,15 +103,15 @@ DeepSeek 可按需调用规划查询工具 `query_map`，查看模组已观察�
 
 ## 安装与验证
 
-更新 Python、`modmain.lua` 和 `scripts/`，新增 `common/coordinates.py`、
-`mcp_agent/map_view.py`、`scripts/jev_coordinates.lua`。使用同一个 Python 环境安装
-`requirements-mcp.txt`，其中 Pillow 用于 PNG 绘制。重新进入世界并重启控制循环。
+更新 Python、`modmain.lua` 和 `scripts/`，新增 `python/common/coordinates.py`、
+`python/mcp_agent/map_view.py`、`scripts/jev_coordinates.lua`。使用同一个 Python 环境安装
+`python/requirements-mcp.txt`，其中 Pillow 用于 PNG 绘制。重新进入世界并重启控制循环。
 
 默认 `deepseek-flash` 官方接口支持 `user` 消息中的 `image_url` 图片块：
 [DeepSeek Vision 文档](https://api-docs.deepseek.com/guides/vision/)。自定义模型／代理也
 必须支持该格式；不支持图片时会报告请求错误，不会声称看过地图或静默换模型。
 
-离线验证：`python run_tests.py`；Lua 回归新增 `tests/coordinates_spec.lua`，并扩展
+离线验证：`python python/run_tests.py`；Lua 回归新增 `tests/coordinates_spec.lua`，并扩展
 `tests/exploration_spec.lua` 的真实模组路线及地图重同步测试。实机仍需验证模型选址、
 长距离多区域路径、碰撞及实际地图信息密度。
 

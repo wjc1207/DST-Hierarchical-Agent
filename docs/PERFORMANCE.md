@@ -43,9 +43,9 @@
 
 ## 更新与验证
 
-同步更新 `modmain.lua`、`modinfo.lua`、`scripts/jev_recipes.lua`、`scripts/jev_bridge.lua`、新增的 `scripts/jev_performance.lua`，以及 Python 的 `mcp_server/game_bridge.py` 和 `mcp_server/transport_metrics.py`。重新进入世界并重启 Python，不覆盖 `.env`、桥接令牌或旧日志。
+同步更新 `modmain.lua`、`modinfo.lua`、`scripts/jev_recipes.lua`、`scripts/jev_bridge.lua`、新增的 `scripts/jev_performance.lua`，以及 Python 的 `python/mcp_server/game_bridge.py` 和 `python/mcp_server/transport_metrics.py`。重新进入世界并重启 Python，不覆盖 `.env`、桥接令牌或旧日志。
 
-Python 回归：`python run_tests.py`。Lua 回归包括 `tests/performance_spec.lua`、`tests/recipes_spec.lua`、`tests/places_spec.lua`、`tests/exploration_spec.lua`。
+Python 回归：`python python/run_tests.py`。Lua 回归包括 `tests/performance_spec.lua`、`tests/recipes_spec.lua`、`tests/places_spec.lua`、`tests/exploration_spec.lua`。
 
 尚需新一轮实机测试确认 FPS 改善幅度。建议在同一存档、同一地点和显示设置下采集数分钟，比较平均 FPS、最大帧间隔以及 `recipes_ms`、`places_ms`、`navigation_ms` 和编码耗时。
 
@@ -61,4 +61,4 @@ Python 回归：`python run_tests.py`。Lua 回归包括 `tests/performance_spec
 
 服务端声明支持时，客户端只发送变化条目与删除列表，附带基准版本。服务器基准不匹配、重启或更换世界时请求完整重同步。传输行对象不可变，库存变化不会导致全部 974 条记录重新编码；旧服务端仍使用完整目录兼容路径。
 
-本轮额外需同步 Python 的 `common/recipes.py`、`mcp_agent/daily_planner.py`、`mcp_server/mcp_server.py`，以及更新后的 `mcp_server/game_bridge.py`、`modmain.lua`、`scripts/jev_bridge.lua`、`scripts/jev_recipes.lua`。重新进入世界并重启控制程序，实测 FPS 日志后才能评价改善幅度。
+本轮额外需同步 Python 的 `python/common/recipes.py`、`python/mcp_agent/daily_planner.py`、`python/mcp_server/mcp_server.py`，以及更新后的 `python/mcp_server/game_bridge.py`、`modmain.lua`、`scripts/jev_bridge.lua`、`scripts/jev_recipes.lua`。重新进入世界并重启控制程序，实测 FPS 日志后才能评价改善幅度。

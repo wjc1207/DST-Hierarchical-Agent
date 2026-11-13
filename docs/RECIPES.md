@@ -72,4 +72,4 @@ DeepSeek 请求中注册同名只读 function tool，以该次规划的不可变
 
 升级需同时更新 Python、`modmain.lua` 和 `scripts/`（新增 `jev_recipes.lua`），重新进入世界并重启控制循环。桥接协议仍为 4，保留 `.env`、桥接令牌与安装目录原有 `jev_bridge_config.lua`。
 
-离线验证：`python run_tests.py`；Lua 回归运行 `tests/recipes_spec.lua` 及 `tests/exploration_spec.lua`。尚需在真实游戏中验证原型制作、背包复制时序和建筑放置表现。
+离线验证：`python python/run_tests.py`；Lua 回归运行 `tests/recipes_spec.lua` 及 `tests/exploration_spec.lua`。尚需在真实游戏中验证原型制作、背包复制时序和建筑放置表现。

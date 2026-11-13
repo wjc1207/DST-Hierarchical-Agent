@@ -119,7 +119,7 @@ Python 筛选动作，MCP 用当前家复核中心位置，Lua 再检查目标�
 使用 Python MCP 优先级主循环执行。外部 `submit_task_board` 可以提交并查询任务
 错误，但原生 `auto_execute=true` 不支持定时／驻留看板，会明确拒绝，避免提前执行。
 
-同步 Python、`common/task_timing.py`、`common/residence.py`、`mcp_agent/residence.py`、
+同步 Python、`python/common/task_timing.py`、`python/common/residence.py`、`python/mcp_agent/residence.py`、
 `scripts/jev_residence.lua` 及更新的 Lua 文件，重新进入世界并重启 Python。
 驻留动作要求 Lua 上报 `residence_constraints=true`，旧版本不能默默忽略边界。
 本版计时状态保存在当前 Python 控制会话内；重启控制循环后不自动恢复已累计的停留

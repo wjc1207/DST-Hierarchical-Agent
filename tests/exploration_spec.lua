@@ -1,5 +1,5 @@
 -- Run from the project root: fengari tests/exploration_spec.lua
-package.path = "./mods/jev_dst_agent/scripts/?.lua;" .. package.path
+package.path = "./mods/dst_player_agent/scripts/?.lua;" .. package.path
 local E = require("jev_exploration")
 local X = require("jev_execution")
 local passed = 0
@@ -39,8 +39,8 @@ local function search(m, candidates, safe)
 end
 
 test("the complete Mod and metadata compile", function()
-    assert(loadfile("mods/jev_dst_agent/modmain.lua"))
-    assert(loadfile("mods/jev_dst_agent/modinfo.lua"))
+    assert(loadfile("mods/dst_player_agent/modmain.lua"))
+    assert(loadfile("mods/dst_player_agent/modinfo.lua"))
 end)
 
 test("path lookahead skips a nearby grid root behind the player", function()
@@ -315,7 +315,7 @@ local function simulated_mod(passable, topology, terrain, entities, bridge_confi
         -- DST exposes protected calls through GLOBAL, not as mod globals.
         if key~="pcall" then return _G[key] end
     end})
-    local native=assert(loadfile("mods/jev_dst_agent/modmain.lua","t",env))()
+    local native=assert(loadfile("mods/dst_player_agent/modmain.lua","t",env))()
     -- Test-only aliases preserve existing native-action scenarios, not key events.
     handlers={KEY_F2=native.emit_state,KEY_F4=native.cancel,
         KEY_KP_MULTIPLY=native.craft_torch,KEY_KP_DIVIDE=native.equip_torch,

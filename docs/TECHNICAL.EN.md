@@ -10,26 +10,28 @@ control transport. There is no retained keyboard runner.
 ## Package boundaries
 
 ```text
-mcp_agent/   Models, planning, persistent goals, search intents, probe
-mcp_server/  MCP tools, state cache, action ownership and loopback HTTP
-common/      Snapshot rules, board contracts, config paths and timing
-scripts/     Lua perception, pathfinding, native execution and live validation
-data/        DSTKnowledge.txt and generated worldgen resource priors
-tests/       Current MCP/shared-rule regression tests and Lua checks
-tools/       Klei resource extraction
-docs/        Technical documentation
+python/
+  mcp_agent/   Models, planning, persistent goals, search intents, probe
+  mcp_server/  MCP tools, state cache, action ownership and loopback HTTP
+  common/      Snapshot rules, board contracts, config paths and timing
+  tests/       Python regression tests
+  tools/       Resource extraction, icons and mod packaging
+mods/          Lua entry points and runtime files for both mods
+data/          DSTKnowledge.txt and generated worldgen resource priors
+tests/         Lua regression tests
+docs/          Technical documentation
 ```
 
-The root retains Mod entry points, READMEs, requirements and the test runner.
+Requirements and the Python test runner live under `python/`.
 `.env`, `logs/` and the installed bridge token/config retain their locations.
 
-- `mcp_agent/daily_planner.py`: DeepSeek needs, priorities, dependencies and reviews.
-- `mcp_agent/jev_client.py`: bounded local choices for safety and planning gaps.
-- `mcp_agent/priority_board.py`: visible-first scheduling and search budgets.
-- `mcp_agent/navigation_intents.py`: source/region destinations and unknown-branch
+- `python/mcp_agent/daily_planner.py`: DeepSeek needs, priorities, dependencies and reviews.
+- `python/mcp_agent/jev_client.py`: bounded local choices for safety and planning gaps.
+- `python/mcp_agent/priority_board.py`: visible-first scheduling and search budgets.
+- `python/mcp_agent/navigation_intents.py`: source/region destinations and unknown-branch
   search. It chooses only navigation options already offered by Lua.
-- `mcp_agent/model_state.py`: the same fact projection for both models.
-- `common/game_rules.py`: supplied snapshot facts without OS input.
+- `python/mcp_agent/model_state.py`: the same fact projection for both models.
+- `python/common/game_rules.py`: supplied snapshot facts without OS input.
 - `modmain.lua` and `scripts/jev_exploration.lua`: passability, frontiers, obstacle
   avoidance, safe movement legs and continuous native movement.
 - `scripts/jev_native_executor.lua`: live legality, approach, collection/crafting,
@@ -130,13 +132,13 @@ not change later cooking approach behavior or identify the cause of health loss.
 From the project root:
 
 ```powershell
-python .\mcp_agent\mcp_probe.py
-python .\mcp_agent\mcp_agent.py --loop --execute
+python .\python\mcp_agent\mcp_probe.py
+python .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
-The host starts its own `mcp_server/mcp_server.py`. Stop other same-port services
+The host starts its own `python/mcp_server/mcp_server.py`. Stop other same-port services
 and Codex's DST MCP connection first. `python -m mcp_agent` and
-`python -m mcp_server` also work from the root.
+`python -m mcp_server` also work from the `python/` directory.
 
 Credentials stay in root `.env`; `--env` selects another existing file. Bridge
 credentials stay in `logs/mcp_bridge.json` and installed
@@ -148,12 +150,12 @@ Plans use `logs/task_board.json[l]`. Timing uses `logs/mcp_timing.jsonl` and
 `logs/mcp_transport.jsonl`. MCP reads never poll `client_log.txt`. The Mod's old
 keypad/function-key action entry points are removed; use MCP `cancel_action`.
 
-Upgrade `mcp_agent/`, `mcp_server/`, `common/`, `data/`, Mod entry points and
+Upgrade `python/mcp_agent/`, `python/mcp_server/`, `python/common/`, `data/`, Mod entry points and
 `scripts/`; preserve `.env`, logs and generated bridge credentials. Re-enter the
 world and restart Python. Never overwrite installed credentials with another copy.
 
 ## Tests
 
-Run `python run_tests.py` for fake-model/game and local protocol checks without
+Run `python python/run_tests.py` for fake-model/game and local protocol checks without
 real model calls or game inputs. Fengari runs `tests/exploration_spec.lua`;
 Lua checks call native handles directly without keyboard handlers.

@@ -1,4 +1,4 @@
-package.path="./mods/jev_ai_companion/scripts/?.lua;"..package.path
+package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 local Names=require("jev_companion_roster")
 local Server=require("jev_companion_team_server")
 local Client=require("jev_companion_team_client")
@@ -10,6 +10,7 @@ local function fixture()
     function w:actor(id,userid)
         local a={GUID=id,userid=userid,x=0,z=0,valid=true,components={}}
         function a:IsValid() return self.valid end
+        function a:Remove() self.valid=false end
         function a:HasTag() return false end
         self.ents[id]=a;return a
     end
@@ -39,8 +40,30 @@ test("mentions resolve exact owner-local names, multiple targets and all; unknow
     ids=Names.resolve("@小威 @二号 回来",roster);assert(#ids==2)
     ids=Names.resolve("@全体 停止",roster);assert(#ids==2)
     assert(not Names.resolve("@陌生人 采草",roster))
-    assert(not Names.name("全体") and not Names.name("bad name") and not Names.name("@小威"))
+    assert(not Names.name("全体") and not Names.name("自己") and not Names.name("bad name") and not Names.name("@小威"))
     assert(Names.name("小威"))
+end)
+test("delete clears a dead or released actor, leaves other slots, and rejects a stale delete",function()
+    local w=fixture()
+    w.client:summon("一号")
+    w.client:summon("二号")
+    local first,second=w:record("buddy1").buddy,w:record("buddy2").buddy
+    first.dead=true
+    local drops=0
+    second.components.inventory={DropEverything=function() drops=drops+1 end}
+    local row=w.client:panel_state().roster[1]
+    w.client:delete(row)
+    assert(not first:IsValid() and second:IsValid() and not w.client.children.buddy1)
+    assert(#w.client.roster==1 and w.client.roster[1].id=="buddy2")
+    w.client:summon("一号")
+    local replacement=w:record("buddy1").buddy
+    w.client:delete(row)
+    assert(replacement:IsValid() and #w.client.roster==2)
+    w.client:command("release @二号")
+    local released=w.client:panel_state().roster[2]
+    assert(not released.bound and second:IsValid())
+    w.client:delete(released)
+    assert(not second:IsValid() and drops==1 and replacement:IsValid())
 end)
 test("two named summons create two real actors and repeated summons reuse their exact slots",function()
     local w=fixture();w.client:command("summon 小威");w.client:command("summon 二号")
@@ -78,7 +101,7 @@ end)
 test("no mention targets the whole bound team and native all-stop works without a model",function()
     local w=fixture();w.client:command("summon 小威");w.client:command("summon 二号")
     w.client:command("do 一起收集材料");assert(w:record("buddy1").revision==1 and w:record("buddy2").revision==1)
-    w.client.listening=true;w.client:chat("@全体 停止")
+    w.client:command("stop @全体")
     assert(w:record("buddy1").mode=="stay" and w:record("buddy2").mode=="stay")
     assert(not w.client.children.buddy1.control.enabled and not w.client.children.buddy2.control.enabled)
 end)
@@ -201,13 +224,45 @@ test("chat listening routes only addressed requests and mirrors the slash toggle
     w.client:command("ai")
     assert(w.client:panel_state().listening)
     local before=#w.sent
-    assert(not w.client:chat("大家好") and not w.client:chat("@其他玩家 你好") and #w.sent==before)
-    assert(w.client:chat("@小威 采草") and w:record("buddy1").revision==1 and w:record("buddy2").revision==0)
-    assert(w.client:chat("@all 停止") and w:record("buddy2").revision==1)
+    assert(not w.client:chat("大家好") and not w.client:chat("@其他玩家 你好")
+        and not w.client:chat("@自己 采草") and #w.sent==before)
+    assert(w.client:chat("@小威 采草") and w:record("buddy1").revision==0 and w:record("buddy2").revision==0)
+    assert(w.client.children.buddy1.control.dialogue_revision==1)
+    assert(not w.client.children.buddy2.control.enabled)
+    w.client:command("stop @all")
+    assert(w:record("buddy2").revision==1)
     w.client:set_listening(false)
     assert(not w.client:panel_state().listening and not w.client:chat("@小威 采草"))
     w.client:command("do @小威 采草")
     assert(w.client.children.buddy1.control.enabled and not w.client.children.buddy2.control.enabled)
+end)
+
+test("dialogue preserves native work and rejects stale finish feedback",function()
+    local w=fixture();w.client:command("summon 小威");w.client:command("auto 维持营地补给")
+    w.client:set_listening(true)
+    local c=w.client.children.buddy1
+    c:send("collect",{target_guid=99})
+    local record=w:record("buddy1")
+    local active,revision,sent=record.active,record.revision,#w.sent
+    assert(w.client:chat("@小威 采了几根草？"))
+    local dialogue=c.control.dialogue_revision
+    assert(record.active==active and record.revision==revision and #w.sent==sent)
+    assert(c.control.mode=="autonomous" and c.control.goal=="维持营地补给")
+    assert(w.client:chat("@小威 停止"))
+    c:feedback({id="stale",revision=revision,dialogue_revision=dialogue,finish=true,text="旧回复"})
+    assert(record.active==active and #w.sent==sent)
+    w.client:command("stop @小威")
+    assert(not record.active and record.revision==revision+1 and not c.control.enabled)
+end)
+test("an idle conversation reply preserves the buddy's current movement mode",function()
+    local w=fixture();w.client:command("summon 小威");w.client:command("stay @小威")
+    w.client:set_listening(true);assert(w.client:chat("@小威 你好"))
+    local c=w.client.children.buddy1
+    local revision=c.control.revision
+    c:feedback({id="hello",revision=revision,dialogue_revision=c.control.dialogue_revision,
+        finish=true,keep_mode=true,text="你好！"})
+    assert(w:record("buddy1").mode=="stay" and c.control.revision==revision and not c.control.enabled)
+    assert(#w.speeches==1 and w.speeches[1].text=="你好！")
 end)
 
 test("server validates names and isolates owner identities even when slot IDs match",function()
@@ -230,6 +285,25 @@ test("a heartbeat or new message for one actor cannot keep or cancel another act
     w.time=4;w.client.children.buddy2:send("state")
     w.time=5.2;w.server:tick()
     assert(w:record("buddy1").lease_expired and not w:record("buddy2").lease_expired)
+end)
+test("search does not yield for a resource another teammate is working on",function()
+    local w=fixture()
+    w.env.search_point=function(_,args) return {x=args.x,z=args.z} end
+    w.env.search_found=function(_,products,claimed)
+        assert(products[1]=="cutgrass")
+        return not claimed[99]
+    end
+    w.env.search_arrived=function() return false end
+    w.client:command("summon 小威");w.client:command("summon 二号")
+    w.client.children.buddy2:send("collect",{target_guid=99})
+    w.client.children.buddy1:send("search",{point_id="4:0",x=16,z=0,products={"cutgrass"},timeout_seconds=2})
+    local record=w:record("buddy1")
+    local search=assert(record.active)
+    w.server:tick()
+    assert(record.active==search and search.last.status=="running")
+    w.client:command("stop @二号")
+    w.time=w.time+.3;w.server:tick()
+    assert(not record.active and search.last.reason=="resource_found")
 end)
 test("shared building facts retain provenance and are not another actor's inventory or technology",function()
     local a={_jev_companion_places={rows={},order={}}};local b={_jev_companion_places={rows={},order={}}}

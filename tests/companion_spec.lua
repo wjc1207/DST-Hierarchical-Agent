@@ -1,4 +1,4 @@
-package.path="./mods/jev_ai_companion/scripts/?.lua;"..package.path
+package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 local S=require("jev_companion_server")
 local C=require("jev_companion_client")
 local passed=0
@@ -51,6 +51,25 @@ test("follow is local behavior, arrival needs no model calls",function()
     local w=world();w:request("bind");w.player.x=10;w:step()
     assert(w.moves==1 and w.buddy.dest.x==10)
     w.buddy.x=8;w:step();assert(not w.buddy.dest)
+end)
+
+test("an enemy target interrupts native work and gates it until the escape clears",function()
+    local w=world();w:request("bind")
+    local threats={}
+    w.env.threats=function() return threats end
+    w.env.escape_point=function() return {id="away",x=16,z=0} end
+    assert(w:request("collect",{target_guid=99}).status=="running")
+    local collect=w.last
+    threats={{guid=3,prefab="tallbird"}}
+    w:step(.25)
+    local record=w.server.owners.A
+    assert(collect.last.status=="interrupted" and collect.last.reason=="enemy_targeting")
+    assert(record.escape and w.buddy.dest.x==16)
+    assert(w:request("collect",{target_guid=99}).reason=="enemy_targeting")
+    threats={}
+    w:step(.5);assert(record.escape)
+    w:step(1.1);assert(not record.escape and not w.buddy.dest)
+    assert(w:request("collect",{target_guid=99}).status=="running" and w.collections==2)
 end)
 
 test("distant owners can direct local work and be followed without a distance cap",function()
@@ -183,7 +202,7 @@ local function client_world()
     function w:bind() self.client:command("bind");self:receive(#self.wire,"completed",1,0) end
     return w
 end
-test("chat raises control revision, stops first and preserves the original instruction",function()
+test("explicit instruction raises control revision and preserves the original instruction",function()
     local w=client_world();w:bind();w.client:command("do 收集三根草")
     assert(w.wire[#w.wire].op=="intent" and w.client.control.enabled)
     w:receive(#w.wire,"completed",2,1)
@@ -327,8 +346,8 @@ test("Mod entry wires slash commands, real actor snapshots and compliant local H
         AddClassPostConstruct=function(name,fn) hooks[name]=fn end,AddSimPostInit=function(fn) init=fn end},{__index=_G})
     env.AddPrefabPostInit=function(name,fn) assert(name=="wilson");fn(buddy) end
     local chunk
-    if setfenv then chunk=assert(loadfile("mods/jev_ai_companion/modmain.lua"));setfenv(chunk,env)
-    else chunk=assert(loadfile("mods/jev_ai_companion/modmain.lua","t",env)) end
+    if setfenv then chunk=assert(loadfile("mods/dst_buddy_agent/modmain.lua"));setfenv(chunk,env)
+    else chunk=assert(loadfile("mods/dst_buddy_agent/modmain.lua","t",env)) end
     chunk();init()
     local text,forwarded="/buddy bind",0
     local screen={chat_edit={GetString=function() return text end},Run=function() forwarded=forwarded+1 end}

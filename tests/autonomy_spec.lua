@@ -1,4 +1,4 @@
-package.path="./mods/jev_dst_agent/scripts/?.lua;"..package.path
+package.path="./mods/dst_player_agent/scripts/?.lua;"..package.path
 local A=require("jev_autonomy")
 local N=require("jev_native_executor")
 local B=require("jev_bridge")
@@ -30,48 +30,40 @@ test("goal parser accepts quoted Unicode text and rejects malformed or executabl
     assert(not A.parse("大家回家吧") and not A.parse("/help") and not A.parse("goalkeeper"))
 end)
 
-test("HUD toggle and chat hook update the same local state without broadcasting commands",function()
+test("player chat is opt-in, uses an exact mention and keeps goal commands",function()
     local hooks,messages={},{}
     local player={IsValid=function() return true end}
-    local G={ThePlayer=player,UIFONT="font",ChatHistory={SendCommandResponse=function(_,msg) messages[#messages+1]=msg end}}
-    local changed={}
-    A.get(player).on_change=function(reason) changed[#changed+1]=reason end
-    local fake_button={}
-    for _,method in ipairs({"SetPosition","SetFont","SetTextSize","Show","Hide","StartUpdating"}) do
-        fake_button[method]=function() end
-    end
-    function fake_button:SetText(value) self.label=value end
-    function fake_button:SetTooltip(value) self.tooltip=value end
-    function fake_button:SetOnClick(callback) self.click=callback end
-    local mode_button={}
-    setmetatable(mode_button,{__index=fake_button})
-    package.loaded["widgets/textbutton"]=function(name) return name=="JEVAutonomy" and fake_button or mode_button end
+    local G={ThePlayer=player,ChatHistory={SendCommandResponse=function(_,msg) messages[#messages+1]=msg end}}
+    local state=A.get(player)
+    local input,forwarded="",0
+    local screen={chat_edit={GetString=function() return input end},Run=function() forwarded=forwarded+1 end,
+        _jev_companion_accepts_chat=function(text) return text:match("^@小威 ")~=nil end}
     require("jev_autonomy_ui").install(G,function(name,fn) hooks[name]=fn end)
-    hooks["widgets/controls"]({topleft_root={AddChild=function(_,child) return child end}})
-    assert(fake_button.label=="自主模式：关闭")
-    fake_button.click()
-    assert(A.get(player).enabled and fake_button.label=="自主模式：开启")
-    local input,forwarded='goal("建造烹饪锅")',0
-    local screen={chat_edit={GetString=function() return input end},Run=function() forwarded=forwarded+1 end}
     hooks["screens/chatinputscreen"](screen)
+
+    input="@自己 做一把火把";screen:Run()
+    assert(forwarded==1 and not state.listening and not state.enabled and state.revision==0)
+    state.listening=true
     screen:Run()
-    assert(forwarded==0 and A.get(player).goal=="建造烹饪锅" and changed[2]=="autonomy_goal_changed")
-    local revision=A.get(player).revision
+    assert(forwarded==2 and not state.enabled and state.revision==0 and #messages==1)
+    input='goal("建造烹饪锅")';screen:Run()
+    assert(forwarded==2 and state.goal=="建造烹饪锅" and not state.enabled)
+    local revision=state.revision
     input='goal("broken"';screen:Run()
-    assert(A.get(player).revision==revision and A.get(player).goal=="建造烹饪锅")
-    input="普通聊天";screen:Run();assert(forwarded==1 and changed[3]=="player_message")
-    fake_button.click()
-    assert(not A.get(player).enabled and A.get(player).goal=="建造烹饪锅")
-    assert(changed[4]=="autonomy_disabled")
-    mode_button.click()
-    assert(A.get(player).mode=="instruction" and not A.get(player).enabled)
-    fake_button.click()
-    input="收集五个木头";screen:Run()
-    assert(A.get(player).enabled and A.get(player).instruction==input)
-    assert(forwarded==2)
-    local rev=A.get(player).revision
-    input="/help";screen:Run();assert(forwarded==3 and A.get(player).revision==rev)
-    input="停止";screen:Run();assert(not A.get(player).enabled and A.get(player).revision==rev+1)
+    assert(state.revision==revision and state.goal=="建造烹饪锅")
+
+    A.set_mode(player,"instruction")
+    revision=state.revision
+    for _,text in ipairs({"普通聊天","/help","@自己人 你好","@小威 砍树","@all 停止"}) do
+        input=text;screen:Run()
+    end
+    assert(forwarded==7 and state.revision==revision and not state.enabled)
+    input="@自己 收集五个木头";screen:Run()
+    assert(forwarded==8 and state.enabled and state.instruction=="收集五个木头")
+    input="@自己 停止";screen:Run()
+    assert(forwarded==9 and not state.enabled and state.paused and state.revision==revision+2)
+    A.set_enabled(player,true)
+    assert(state.enabled and not state.paused and state.instruction=="收集五个木头")
 end)
 
 test("chat interruptions retain the original request until completion and reject stale feedback",function()

@@ -26,4 +26,4 @@ DS 和 JEV 提示明确：普通站在火边不会自动回血。应结合真实
 
 `logs/mcp_timing.jsonl` 每轮记录 `temperature`、`overheating`、`freezing`、`heat_warning_threshold`、`thermal_status`、`thermal_reason` 和最多四个附近火源的 `fire_state`。温度不可读时为 null。传输性能日志增加 `thermal_ms` 和 `refueling_ms`，用于观察新增检查开销。
 
-更新 Lua 和 Python 后，需要重新进入世界并重启 Python 控制程序。离线测试包括 `tests/thermal_spec.lua` 和 `tests/test_thermal.py`；实机仍需检查火焰动画复制、夜间照明边缘与降温效果。
+更新 Lua 和 Python 后，需要重新进入世界并重启 Python 控制程序。离线测试包括 `tests/thermal_spec.lua` 和 `python/tests/test_thermal.py`；实机仍需检查火焰动画复制、夜间照明边缘与降温效果。

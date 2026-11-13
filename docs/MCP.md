@@ -23,35 +23,35 @@ Python MCP 服务（工具、状态缓存、动作队列）
 Lua Mod（可用动作、原生执行、结果验证、事件中断）
 ```
 
-Python 不再读取游戏日志或模拟键鼠；Lua 主动异步交换消息。MCP 服务本身不调用模型，不需要模型密钥。项目自带的外部控制程序 `mcp_agent/mcp_agent.py` 负责 DeepSeek/JEV 调用和自动循环，也可以替换成其他 MCP 客户端。旧键鼠控制链已删除；模型调用由独立客户端模块实现。
+Python 不再读取游戏日志或模拟键鼠；Lua 主动异步交换消息。MCP 服务本身不调用模型，不需要模型密钥。项目自带的外部控制程序 `python/mcp_agent/mcp_agent.py` 负责 DeepSeek/JEV 调用和自动循环，也可以替换成其他 MCP 客户端。旧键鼠控制链已删除；模型调用由独立客户端模块实现。
 
-服务端文件放在 `mcp_server/`（入口、`game_bridge.py`、`transport_metrics.py`），客户端文件放在 `mcp_agent/`（自动循环、连接检查器）。模型和搜索意图均在 `mcp_agent/`，共享规则在 `common/`，知识与资源表在 `data/`。Python 读取仓库的 `.env` 和 `logs/`，游戏读取已安装模组中的 `scripts/jev_bridge_config.lua`。也可以从项目根目录使用 `python -m mcp_server`、`python -m mcp_agent`。
+服务端文件放在 `python/mcp_server/`（入口、`game_bridge.py`、`transport_metrics.py`），客户端文件放在 `python/mcp_agent/`（自动循环、连接检查器）。模型和搜索意图均在 `python/mcp_agent/`，共享规则在 `python/common/`，知识与资源表在 `data/`。Python 读取仓库的 `.env` 和 `logs/`，游戏读取已安装模组中的 `scripts/jev_bridge_config.lua`。也可以在 `python/` 目录运行 `python -m mcp_server` 或 `python -m mcp_agent`。
 
 ## 安装与连接
 
-先将仓库的 `mods/jev_dst_agent` 复制到游戏的 `mods` 目录。需要 Python 3.11+，在项目目录运行以下命令，并将 `$dstMods` 改为实际安装位置。
+先将仓库的 `mods/dst_player_agent` 复制到游戏的 `mods` 目录。需要 Python 3.11+，在项目目录运行以下命令，并将 `$dstMods` 改为实际安装位置。
 
 ```powershell
-python -m pip install -r requirements-mcp.txt
+python -m pip install -r python/requirements-mcp.txt
 $dstMods = "C:\Program Files (x86)\Steam\steamapps\common\Don't Starve Together\mods"
-python .\mcp_server\mcp_server.py --configure-only --write-mod-config (Join-Path $dstMods "jev_dst_agent\scripts\jev_bridge_config.lua")
+python .\python\mcp_server\mcp_server.py --configure-only --write-mod-config (Join-Path $dstMods "dst_player_agent\scripts\jev_bridge_config.lua")
 ```
 
 配置命令在仓库的 `logs/mcp_bridge.json` 保存本机令牌，并把配套配置写入已安装模组。API 密钥保存在本机 `.env`。启动服务时使用同一项目和 `--config` 路径。
 
-升级时，从仓库的 `mods/jev_dst_agent/` 复制运行文件，并保留安装目录的 `scripts/jev_bridge_config.lua` 和原来的令牌。完整更新 Python（包括 `mcp_agent/`、`mcp_server/`）与 Mod 文件后，重新进入世界。桥接协议为 4，详细测量版本为 1。
+升级时，从仓库的 `mods/dst_player_agent/` 复制运行文件，并保留安装目录的 `scripts/jev_bridge_config.lua` 和原来的令牌。完整更新 Python（包括 `python/mcp_agent/`、`python/mcp_server/`）与 Mod 文件后，重新进入世界。桥接协议为 4，详细测量版本为 1。
 
 ## DeepSeek/JEV 自动循环
 
 先停止已有的 `--bridge-only`、检查器、其他同端口 MCP 服务及旧控制循环。在装有 MCP 依赖的同一个 Python 环境中运行：
 
 ```powershell
-python .\mcp_agent\mcp_agent.py --loop --execute
+python .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
 它自行启动 STDIO MCP 服务，读取现有 `.env` 的 `JEV_API_KEY`、`DEEPSEEK_API_KEY` 和模型配置。省略 `--execute` 只观察一次决策，不发游戏命令、不请求 DeepSeek 规划；`--no-planner` 禁用规划；`--env PATH`、`--config PATH` 可指定已有文件。没有 DeepSeek 密钥时保留 JEV 和执行器运行，不等待不存在的规划。
 
-自动循环与外部 MCP 客户端必须二选一占用桥接端口。启动时先检查端口，HTTP 服务绑定时再次执行原子独占检查（Windows 使用 `SO_EXCLUSIVEADDRUSE`，禁用端口复用）。已有 Codex MCP、检查器、`--bridge-only` 或其他服务占用 8765 时，程序输出 `mcp_startup_error bridge_port_unavailable address=127.0.0.1:8765` 并以状态码 2 退出，不进入断线重试、不自动连接旧服务，也不终止原进程。先停用旧客户端／服务，再启动 `mcp_agent/mcp_agent.py`；旧服务若由客户端管理，直接结束进程可能被客户端再次拉起。此端口检查的 Python 文件位于 `mcp_server/`、`mcp_agent/`；不改 Mod 或令牌。
+自动循环与外部 MCP 客户端必须二选一占用桥接端口。启动时先检查端口，HTTP 服务绑定时再次执行原子独占检查（Windows 使用 `SO_EXCLUSIVEADDRUSE`，禁用端口复用）。已有 Codex MCP、检查器、`--bridge-only` 或其他服务占用 8765 时，程序输出 `mcp_startup_error bridge_port_unavailable address=127.0.0.1:8765` 并以状态码 2 退出，不进入断线重试、不自动连接旧服务，也不终止原进程。先停用旧客户端／服务，再启动 `python/mcp_agent/mcp_agent.py`；旧服务若由客户端管理，直接结束进程可能被客户端再次拉起。此端口检查的 Python 文件位于 `python/mcp_server/`、`python/mcp_agent/`；不改 Mod 或令牌。
 
 | 组件 | 职责 |
 | --- | --- |
@@ -75,7 +75,7 @@ DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priorit
 
 每任务搜索预算默认 120 秒／240 单位，范围分别为 10–600 秒和 8–2000 单位，只在导航时累计；时间或距离任一达到上限都会进入 15 秒冷却，之后自动恢复搜索，新出现的可执行本地目标可提前恢复。重试保留探索及失败记忆，暂缓当前／原定来源区域 45 秒以尝试其他来源；日志 `search_retry` 记录轮次、冷却和累计成本。区域内搜索达到 30 秒或新增 256 面积时，降低该资源在该区域的优先级，不禁止其他资源或过境。普通路线失败暂停重试，不直接使整个任务失败；同一目标／目的地区域在 60 秒内连续入口失败两次后暂避该目的地 30 秒。新发现的具体资源位置优先于保留的区域先验意图；仅发现新区域不会停止看板行走。每 1/4 天后台复核并合并更新，遗漏不代表取消；使用 `cancel_task_ids` 明确取消。已完成任务锁存，不因材料被消耗而重启。跨季度回复按当前玩家会话及实际状态验证，不仅因为时间跨界而丢弃。
 
-完整 JSON 格式、约束、搜索预算和更新文件见 [Goal scheduling and navigation](GOAL_NAVIGATION.md)。请同步新增的 `mcp_agent/priority_board.py`、`mcp_agent/region_resources.py`、`data/worldgen_resources.json`、`scripts/jev_resource_memory.lua`，以及更新后的 Python 文件、`modmain.lua`、`scripts/jev_exploration.lua`、`scripts/jev_native_executor.lua` 和 `modinfo.lua`，重新进入世界并重启 Python。保留原 `.env`、桥接令牌和 `scripts/jev_bridge_config.lua`。协议仍为 4，不需要重新生成令牌。
+完整 JSON 格式、约束、搜索预算和更新文件见 [Goal scheduling and navigation](GOAL_NAVIGATION.md)。请同步新增的 `python/mcp_agent/priority_board.py`、`python/mcp_agent/region_resources.py`、`data/worldgen_resources.json`、`scripts/jev_resource_memory.lua`，以及更新后的 Python 文件、`modmain.lua`、`scripts/jev_exploration.lua`、`scripts/jev_native_executor.lua` 和 `modinfo.lua`，重新进入世界并重启 Python。保留原 `.env`、桥接令牌和 `scripts/jev_bridge_config.lua`。协议仍为 4，不需要重新生成令牌。
 
 ## DeepSeek 动作序列（旧版兼容）
 
@@ -113,18 +113,18 @@ DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priorit
 
 不会自动发明工具／配方前置任务；DeepSeek 必须明确把前置操作排在前面。暂时没有合法动作或失败／超时会停止这批并要求重规划，而不是偷偷执行后面的步骤。事件快照可能使验证晚一个上传周期，但不能靠预测状态完成步骤。计划内普通资源出现不触发 JEV；原生探索可能为资源事件返回控制，Python 会继续当前步而不调用模型。
 
-升级此旧版功能需要同步新增的 `mcp_agent/action_sequence.py` 及更新后的 `mcp_agent/daily_planner.py`、`mcp_agent/mcp_agent.py`、`mcp_agent/navigation_intents.py`、`mcp_agent/jev_client.py`、`data/DSTKnowledge.txt`，重启 Python。桥接协议仍为 4；此功能不修改 Lua 协议。这些纯语义序列仅保留 MCP 兼容，不包含键鼠路径。
+升级此旧版功能需要同步新增的 `python/mcp_agent/action_sequence.py` 及更新后的 `python/mcp_agent/daily_planner.py`、`python/mcp_agent/mcp_agent.py`、`python/mcp_agent/navigation_intents.py`、`python/mcp_agent/jev_client.py`、`data/DSTKnowledge.txt`，重启 Python。桥接协议仍为 4；此功能不修改 Lua 协议。这些纯语义序列仅保留 MCP 兼容，不包含键鼠路径。
 
 ## 其他 MCP 客户端与连接检查
 
-给自己的 MCP 客户端添加 STDIO 服务，`command` 使用安装了依赖的 Python，`args` 使用项目中 `mcp_server/mcp_server.py` 的绝对路径。已有客户端配置也必须更新此路径。例如：
+给自己的 MCP 客户端添加 STDIO 服务，`command` 使用安装了依赖的 Python，`args` 使用项目中 `python/mcp_server/mcp_server.py` 的绝对路径。已有客户端配置也必须更新此路径。例如：
 
 ```json
 {
   "mcpServers": {
     "dst": {
       "command": "python",
-      "args": ["C:/path/to/jev_dst_agent/mcp_server/mcp_server.py"]
+      "args": ["C:/path/to/DST-Hierarchical-Agent/python/mcp_server/mcp_server.py"]
     }
   }
 }
@@ -135,15 +135,15 @@ DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priorit
 不配置其他客户端也能先用项目自带的命令行检查器。它临时启动 MCP 服务、等待 Mod 连上、打印状态与合法动作，然后退出；默认不操作游戏：
 
 ```powershell
-python .\mcp_agent\mcp_probe.py
+python .\python\mcp_agent\mcp_probe.py
 ```
 
-看到 `connected` 和 `read_only: no game action sent` 才算整条链路连通。明确要测试一个动作时可用 `python .\mcp_agent\mcp_probe.py --execute-choice wait`；其他动作必须使用当时提供的名称。检查器退出会关闭临时服务，因此不要与其他 MCP 客户端或 `--bridge-only` 同时启动。
+看到 `connected` 和 `read_only: no game action sent` 才算整条链路连通。明确要测试一个动作时可用 `python .\python\mcp_agent\mcp_probe.py --execute-choice wait`；其他动作必须使用当时提供的名称。检查器退出会关闭临时服务，因此不要与其他 MCP 客户端或 `--bridge-only` 同时启动。
 
 先单独验证游戏连通性也可以运行：
 
 ```powershell
-python .\mcp_server\mcp_server.py --bridge-only
+python .\python\mcp_server\mcp_server.py --bridge-only
 ```
 
 这不会调用模型或控制角色。进入世界后日志应出现 `[JEV_DST_BRIDGE]enabled_loopback_http`；**这只代表 Mod 已启用，不证明网络已连通**。完整连接状态由 MCP `get_state` 的 `state.bridge.connected` 或 Mod 状态中的同名字段确认。连通性模式不提供 MCP；验证完 Ctrl+C 停止，再由 MCP 客户端启动正常服务。要恢复旧控制器，将安装的 `jev_bridge_config.lua` 的 `enabled` 改为 `false` 并重新进入世界。
@@ -166,11 +166,15 @@ python .\mcp_server\mcp_server.py --bridge-only
 | `start_action(choice, observation_id)` | 排队执行一个已提供动作；返回 `action_id`，不是完成证明 |
 | `get_action_status(action_id)` | 查询状态、原因及连接状态 |
 | `cancel_action(action_id)` | 请求取消，需等 Lua 确认，不提前声称已经停止 |
-| `submit_task_board(board, observation_id, auto_execute=false)` | 验证并替换看板；显式设 true 才允许 Lua 自动推进可见的本地任务 |
+| `submit_task_board(board)` | 批量合并任务，由 MCP 服务的 Python 调度器持续执行 |
+| `get_task_board()` | 查看任务 ID、进度、阻塞原因和当前动作 |
+| `submit_task(task)` | 加入一项扁平任务，例如 {type:collect,prefab:cutgrass,count:4} |
+| `update_task(task_id, changes)` | 修改指定任务的字段 |
+| `delete_task(task_id)` | 删除指定任务并取消其活动动作，检查依赖关系 |
 
 典型调用：读取状态 → 读取动作 → 用返回的 observation ID 选择动作 → 查询动作状态。状态包括 `queued`、`running`、`cancel_requested`、`completed`、`failed`、`interrupted`、`cancelled`。失败／中断后重新观察，不重放旧动作。
 
-自动看板启用期间保留执行器控制权，`busy` 包含这项占用。要手动提交动作，先重新提交 `auto_execute=false` 的看板并等 Lua 停止活动动作；不能让手动命令和后台看板竞争。
+运行中的看板持有角色执行权。任务完成或删除、活动动作停止后，可以使用单步工具。伙伴 MCP 提供同名任务工具，使用 buddy_id 定位角色，队伍批量提交使用按伙伴 ID 分组的 assignments。
 
 观察凭据最长有效 10 秒，绑定会话、玩家与当时提供的动作；掉血、阶段、库存及敌人变化不使其提前失效。服务仅验证连接新鲜度、凭据归属／期限、原动作白名单和单执行器占用；排队的是原目标，不用最新同名动作覆盖 GUID。Lua 用实时状态检查可行性和原目标身份，可拒绝过时意图；Python 不提前将“已排队”视为合法或完成。服务保留最多 128 个观察凭据，普通心跳序号增加不会单独推翻决策。
 
@@ -181,7 +185,7 @@ python .\mcp_server\mcp_server.py --bridge-only
 - 砍树／采矿与随后可见、可达的新掉落物收集，保守检查工具耐久。
 - 当前区域探索、寻找其他区域，以及沿 Mod 已报告路线前往已知区域；Lua 连续推进路段，资源产品集合变化且累计位移达到 4 单位时交回决策。光照、掉血、敌人等危险不等位移保底。
 - 基于可通行逃跑候选的有界撤离；“没有可见锁定敌人”不等于证明敌人已永久消除仇恨。
-- 看板默认只保存；显式启用后自动执行视野内的采集、制作、进食和建造任务。通过重新提交 `auto_execute=false` 的看板暂停；活动的看板动作会停止。
+- Python 后台推进已受理的任务。删除任务会请求停止该任务的活动动作。
 
 **尚未把完整 DFS/BFS 和历史来源失败记忆迁到 Lua**：自带控制程序暂时复用 Python 意图选择器，经 MCP 交给 Lua 行走，不依赖键鼠控制。攻击／装备武器、自动工具前置链尚未提供；炼金引擎等普通建筑可由通用配方动作执行，仍需显式规划材料和科技；Lua 看板遇到缺失来源／需导航／不支持的任务交回外部控制程序，而不是自己请求模型。可用动作不接受任意 Lua 代码、文件路径或自定义坐标。
 
@@ -279,12 +283,11 @@ Lua 复查路线、危险和照明。DS 的按需地图图片查询及建家流�
 [看图选址与前往坐标](MAP_SELECTION.md)。该能力保留 JEV 候选范围和建筑家锚点。
 
 任务开始时间和驻留使用 Python 优先级调度器，详见 [任务时间与驻留](TASK_TIME.md)。
-`submit_task_board` 返回单任务时间参数错误 `task_errors`；定时看板不能启用原生
-`auto_execute=true`。`start_action` 可附带 `residence={home_id,radius}`，由 MCP 绑定
+`submit_task_board` 返回单任务时间参数错误 `task_errors`；定时看板由 Python 执行。`start_action` 可附带 `residence={home_id,radius}`，由 MCP 绑定
 当前家的坐标，再由 Lua 复核每个动作步骤；需要 `residence_constraints=true` 能力。
 
 ```powershell
-python .\run_tests.py
+python .\python\run_tests.py
 python -m unittest discover -s tests -p test_game_bridge.py -v
 python -m unittest discover -s tests -p test_mcp_agent.py -v
 ```

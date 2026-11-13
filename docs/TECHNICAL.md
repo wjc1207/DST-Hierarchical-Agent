@@ -1,31 +1,33 @@
 # 技术说明（1.8.8，MCP-only）
 
-[项目首页](../README.md) · [English](TECHNICAL.EN.md)
+[项目首页](../README.md) · [English](TECHNICAL.EN.md) · [系统架构](ARCHITECTURE.md)
 
 当前只保留 MCP → Lua 原生执行。旧键鼠输入、窗口查找／聚焦、游戏日志轮询、预测动作缓冲及其专属测试已移除。游戏日志仍可用于人工排查，但不再作为 Python 的控制通道。
 
 ## 目录与职责
 
 ```text
-mcp_agent/   模型调用、规划、优先级看板、搜索意图、连接检查
-mcp_server/  MCP 工具、状态缓存、动作队列、本机 HTTP 桥接
-common/      游戏事实规则、看板格式、配置路径、时间测量
-scripts/     Lua 感知、地图寻路、原生执行、实时安全验证
-data/        DSTKnowledge.txt、Klei 区域资源配置快照
-tests/       当前 MCP、共享规则及 Lua 的离线回归
-tools/       从本地原版代码提取资源配置
-docs/        技术说明
+python/
+  mcp_agent/   模型调用、规划、优先级看板、搜索意图、连接检查
+  mcp_server/  MCP 工具、状态缓存、动作队列、本机 HTTP 桥接
+  common/      游戏事实规则、看板格式、配置路径、时间测量
+  tests/       Python 离线回归
+  tools/       资源提取、图标构建、模组打包
+mods/          两套模组的 Lua 入口与运行文件
+data/          DSTKnowledge.txt、Klei 区域资源配置快照
+tests/         Lua 离线回归
+docs/          技术说明
 ```
 
-根目录保留 Mod 入口、README、依赖文件和测试入口。`.env` 与 `logs/` 位置不变。
+Python 依赖清单和测试入口位于 `python/`。`.env` 与 `logs/` 位置不变。
 
 | 职责 | 实现 |
 | --- | --- |
-| 长期需求、优先级、依赖、预算、后台复核 | `mcp_agent/daily_planner.py` |
-| DS 规划空窗、安全变化时选择本地动作 | `mcp_agent/jev_client.py` |
-| 先完成可见任务，再为最高优先任务寻找来源 | `mcp_agent/priority_board.py` |
-| 选择搜索目标、区域目的地、已知来源／未知分支 | `mcp_agent/navigation_intents.py` |
-| 两个模型使用同一事实投影 | `mcp_agent/model_state.py` |
+| 长期需求、优先级、依赖、预算、后台复核 | `python/mcp_agent/daily_planner.py` |
+| DS 规划空窗、安全变化时选择本地动作 | `python/mcp_agent/jev_client.py` |
+| 先完成可见任务，再为最高优先任务寻找来源 | `python/mcp_agent/priority_board.py` |
+| 选择搜索目标、区域目的地、已知来源／未知分支 | `python/mcp_agent/navigation_intents.py` |
+| 两个模型使用同一事实投影 | `python/mcp_agent/model_state.py` |
 | 通行检查、区域内前沿、绕障、路线与连续移动 | `modmain.lua`、`scripts/jev_exploration.lua` |
 | 动作合法性、接近、采集／制作、验证和紧急中断 | `scripts/jev_native_executor.lua` |
 
@@ -74,11 +76,11 @@ DS 请求使用稳定的 `system` 前缀：规划规则、DSTKnowledge、完整 
 从项目根目录运行：
 
 ```powershell
-python .\mcp_agent\mcp_probe.py
-python .\mcp_agent\mcp_agent.py --loop --execute
+python .\python\mcp_agent\mcp_probe.py
+python .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
-自动循环自行启动 `mcp_server/mcp_server.py`，不要再运行同端口服务或 Codex 的 DST MCP 连接。工具契约见 [MCP 说明](MCP.md)。
+自动循环自行启动 `python/mcp_server/mcp_server.py`，不要再运行同端口服务或 Codex 的 DST MCP 连接。工具契约见 [MCP 说明](MCP.md)。
 
 - 模型密钥：根目录 `.env`，也可用 `--env` 指定。
 - 桥接令牌：`logs/mcp_bridge.json` 与安装的 `scripts/jev_bridge_config.lua`；升级保留原文件。
@@ -89,8 +91,8 @@ python .\mcp_agent\mcp_agent.py --loop --execute
 
 Python 通过 MCP 读取状态，不轮询 `client_log.txt`。Mod 日志是诊断，不是另一套控制接口。旧数字小键盘和 F 键动作入口也已移除，取消使用 MCP `cancel_action`。
 
-升级时复制 `mcp_agent/`、`mcp_server/`、`common/`、`data/`、Mod 入口和 `scripts/`，保留原配置和日志，重新进入世界并重启 Python。不要覆盖 `.env` 和生成的桥接配置。
+升级时复制 `python/mcp_agent/`、`python/mcp_server/`、`python/common/`、`data/`、Mod 入口和 `scripts/`，保留原配置和日志，重新进入世界并重启 Python。不要覆盖 `.env` 和生成的桥接配置。
 
 ## 测试
 
-运行 `python run_tests.py`。测试使用假模型、假游戏或本地协议模拟，不调用真实模型或操作游戏。Lua 检查可用 Fengari 运行 `tests/exploration_spec.lua`，直接调用原生动作句柄，不注册键盘事件。
+运行 `python python/run_tests.py`。测试使用假模型、假游戏或本地协议模拟，不调用真实模型或操作游戏。Lua 检查可用 Fengari 运行 `tests/exploration_spec.lua`，直接调用原生动作句柄，不注册键盘事件。

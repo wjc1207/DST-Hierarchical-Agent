@@ -263,7 +263,7 @@ types have no inferred resources. Always verify actual entities and safety.
 Regenerate after a game update (no Lua execution or model calls):
 
 ```powershell
-python tools/extract_worldgen_resources.py "C:/path/to/Don't Starve Together/data/databundles/scripts.zip"
+python python/tools/extract_worldgen_resources.py "C:/path/to/Don't Starve Together/data/databundles/scripts.zip"
 ```
 
 Logs: `TASK BOARD`, `task_board_action task=... priority=... choice=... reason=...`,
@@ -276,7 +276,7 @@ and `logs/task_board.json[l]`. Timing sources distinguish `goal_local`,
 marks a meaningful resource handoff. `navigation_review` / the timing event
 `navigation.review_requested` explain host-driven cancellation for board/budget updates.
 
-Upgrade the full project Python files (including `mcp_server/`, `mcp_agent/` and `common/`)
+Upgrade the full project Python files (including `python/mcp_server/`, `python/mcp_agent/` and `python/common/`)
 and the complete `data/` directory (knowledge and worldgen priors), plus Lua
 `modmain.lua`, `scripts/jev_exploration.lua`, `scripts/jev_native_executor.lua`,
 new `scripts/jev_resource_memory.lua`, and `modinfo.lua`. Re-enter the world and

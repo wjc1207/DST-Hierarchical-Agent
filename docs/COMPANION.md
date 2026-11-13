@@ -1,8 +1,8 @@
 # 服务端伙伴
 
-[完整使用说明](../mods/jev_ai_companion/README.md)。源码位于仓库的 `mods/jev_ai_companion/`，安装时复制到游戏的 `mods` 目录。
+[完整使用说明](../mods/dst_buddy_agent/README.md)。源码位于仓库的 `mods/dst_buddy_agent/`，安装时复制到游戏的 `mods` 目录。
 
-服务器只执行动作和回传状态，不调用模型。各玩家在自己的电脑运行 `mcp_agent/companion_agent.py --execute` 并使用自己的 DeepSeek Key。本机回环接口默认 8766，与旧玩家控制程序分开。
+服务器只执行动作和回传状态，不调用模型。各玩家在自己的电脑运行 `python/mcp_agent/companion_agent.py --execute` 并使用自己的 DeepSeek Key。本机回环接口默认 8766，与旧玩家控制程序分开。
 
 0.6.0 支持[两名伙伴与统一规划](COMPANION_TEAM.md)：`/buddy summon 一号`、`/buddy summon 二号`，通过 `@名字` 指定对象，或不带 @ 让统一规划器分工。名册由服务器返回，各伙伴复用共用任务层并行执行，指令只中断指定成员。需重进世界并重启 Python。
 

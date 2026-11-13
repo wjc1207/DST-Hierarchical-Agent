@@ -1,4 +1,4 @@
-package.path="./mods/jev_dst_agent/scripts/?.lua;"..package.path
+package.path="./mods/dst_player_agent/scripts/?.lua;"..package.path
 local camp=require("jev_camp_work")
 local count=0
 local function test(name,fn)

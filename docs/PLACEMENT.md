@@ -63,5 +63,5 @@ CLI 在任务下显示 `near building:<GUID> radius=10`。JEV 决策范围保持
 `auto_execute=true`。游戏状态必须上报 `telemetry.placement_constraints=true`，旧模组
 不能静默忽略约束。
 
-更新后需要重新进入世界并重启 Python。离线测试包括 `tests/test_placement.py` 和
+更新后需要重新进入世界并重启 Python。离线测试包括 `python/tests/test_placement.py` 和
 `tests/placement_spec.lua`；实机重点检查建筑与锚点的实际距离及边界无合法落点情况。

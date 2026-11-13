@@ -1,4 +1,4 @@
-package.path="./mods/jev_ai_companion/scripts/?.lua;"..package.path
+package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 local P=require("jev_companion_perception")
 local S=require("jev_companion_server")
 local passed=0
@@ -25,7 +25,7 @@ end
 test("perception exposes bounded local terrain and only walkable offered legs",function()
     local w=fixture();w.land=function(x) return x<=8 end
     local data=w.sensor.observe(w.actor,{})
-    assert(data.cell_size==4 and data.radius==20 and #data.cells<=81 and #data.points<=16)
+    assert(data.cell_size==4 and data.radius==20 and #data.cells<=81 and #data.points<=24)
     local water=false
     for _,cell in ipairs(data.cells) do if not cell.land then water=true end end
     assert(water and #data.points>0)
@@ -39,6 +39,44 @@ test("terrain sampling is cached but hazards are freshly checked",function()
     assert(not w.sensor.point(w.actor,{point_id="4:0",x=16,z=0}))
     local north=w.sensor.point(w.actor,{point_id="0:4",x=0,z=16});assert(north)
     w.now=3;w.sensor.observe(w.actor,{});assert(w.calls>calls)
+end)
+test("a short search leg reaches a corner that both longer rings miss",function()
+    local w=fixture()
+    w.land=function(x,z)
+        return math.abs(z)<=.5 and x>=0 and x<=4.5 or math.abs(x-4)<=.5 and z>=0 and z<=16.5
+    end
+    local data=w.sensor.observe(w.actor,{})
+    assert(#data.points==1 and data.points[1].id=="1:0")
+    assert(w.sensor.point(w.actor,{point_id="1:0",x=4,z=0}))
+    w.actor.x=1.8
+    assert(not w.sensor.arrived(w.actor,4,0))
+    w.actor.x=3.6
+    assert(w.sensor.arrived(w.actor,4,0))
+    assert(w.sensor.point(w.actor,{point_id="1:2",x=4,z=8}))
+end)
+test("a buddy inside a hazard can leave but cannot approach it or stop within it",function()
+    local w=fixture()
+    local fire=actor(2,-2,0);fire.tags.fire=true;w.entities={fire}
+    local data=w.sensor.observe(w.actor,w.entities)
+    assert(data.walkable_points>#data.points and #data.points>0)
+    assert(w.sensor.point(w.actor,{point_id="2:0",x=8,z=0}))
+    assert(not w.sensor.point(w.actor,{point_id="-2:0",x=-8,z=0}))
+    assert(not w.sensor.point(w.actor,{point_id="0:1",x=0,z=4}))
+end)
+test("an escape can move farther from a targeting enemy even when the corridor has no full exit leg",function()
+    local w=fixture()
+    w.land=function(x,z) return x>=0 and x<=4.5 and math.abs(z)<=.5 end
+    local bird=actor(2,-1,0);bird.prefab="tallbird";bird.tags.hostile=true
+    bird.components.combat={target=w.actor};w.entities={bird}
+    w.G.GetTime=w.env.now
+    assert(#w.sensor.observe(w.actor,w.entities).points==0)
+    local adapter=require("jev_companion_world").new(w.G)
+    local threats=adapter.threats(w.actor)
+    assert(#threats==1 and threats[1].prefab=="tallbird")
+    local escape=adapter.escape_point(w.actor,threats)
+    assert(escape and escape.x==4 and escape.z==0)
+    bird.components.combat.target=nil
+    assert(#adapter.threats(w.actor)==0)
 end)
 test("search point credentials cannot invent a landing point or cross a new obstacle",function()
     local w=fixture();w.sensor.observe(w.actor,{})
@@ -62,6 +100,7 @@ local function server_world()
         search_found=function(_,products) assert(products[1]=="cutgrass");return w.found end,
         move=function(_,x,z) w.moves=w.moves+1;w.destination={x=x,z=z};return true end,
         arrived=function(a,x,z) return a.x==x and a.z==z end}
+    w.env.search_arrived=P.new({},w.env).arrived
     w.server=S.new(w.env)
     function w:request(op,args,revision)
         self.seq=self.seq+1
@@ -82,6 +121,13 @@ test("search yields on resource discovery without claiming arrival or collected 
     assert(q.last.status=="completed" and q.last.reason=="resource_found" and w.stopped)
     assert(w.actor.x~=16)
 end)
+test("the executor waits to reach the search waypoint before settling the leg",function()
+    local w=server_world();w:request("search",w.args)
+    w.actor.x=14;w.time=.25;w.server:tick()
+    assert(w.last.last.status=="running")
+    w.actor.x=15.6;w.time=.5;w.server:tick()
+    assert(w.last.last.reason=="search_leg_arrived")
+end)
 test("search timeout and a newer intent both stop the native leg",function()
     local w=server_world();w:request("search",w.args);w.time=2.1;w.server:tick()
     assert(w.last.last.reason=="search_leg_timeout" and w.stopped)
@@ -94,6 +140,53 @@ test("invalid or stale search points never start movement",function()
     assert(w:request("search",w.args).reason=="search_point_unavailable" and w.moves==0)
     w.args.timeout_seconds=50
     assert(w:request("search",w.args).reason=="invalid_search" and w.moves==0)
+end)
+test("search ignores tool-gated products until a usable matching tool is carried",function()
+    local w=fixture()
+    local tools={}
+    w.actor.components.inventory={
+        FindItems=function(_,fn)
+            local matched={}
+            for _,item in ipairs(tools) do if fn(item) then matched[#matched+1]=item end end
+            return matched
+        end,
+        GetEquippedItem=function() return nil end,
+    }
+    w.G.ACTIONS={CHOP="CHOP",MINE="MINE"};w.G.EQUIPSLOTS={HANDS="hands"}
+    w.G.Ents={}
+    for i,prefab in ipairs({"twiggytree","rock1"}) do
+        local e=actor(10+i,2,0)
+        local action=prefab=="twiggytree" and "CHOP" or "MINE"
+        e.prefab=prefab
+        e.components.workable={CanBeWorked=function() return true end,GetWorkLeft=function() return 1 end,
+            GetWorkAction=function() return action end}
+        w.entities[#w.entities+1]=e;w.G.Ents[e.GUID]=e
+    end
+    local adapter=require("jev_companion_world").new(w.G)
+    local requested={"flint","twigs"}
+    assert(not adapter.search_found(w.actor,requested))
+
+    local uses,restricted=0,false
+    local axe=actor(3)
+    axe.components.tool={CanDoAction=function(_,action) return action=="CHOP" end}
+    axe.components.equippable={equipslot="hands",IsRestricted=function() return restricted end}
+    axe.components.finiteuses={GetPercent=function() return uses end}
+    tools[1]=axe
+    assert(not adapter.search_found(w.actor,requested))
+    uses,restricted=1,true
+    assert(not adapter.search_found(w.actor,requested))
+    restricted=false
+    assert(adapter.search_found(w.actor,requested))
+    assert(not adapter.search_found(w.actor,{"flint"}))
+    assert(not adapter.search_found(w.actor,{"twigs"},{[11]=true}))
+
+    tools[1]=nil
+    local loose=actor(20,3,0)
+    loose.prefab="flint"
+    loose.components.inventoryitem={canbepickedup=true,IsHeld=function() return false end}
+    w.entities[#w.entities+1]=loose;w.G.Ents[20]=loose
+    assert(adapter.search_found(w.actor,requested))
+    assert(not adapter.search_found(w.actor,{"log"}))
 end)
 test("resource perception retains rare products despite a crowded foreground",function()
     local w=fixture();local a=w.actor
@@ -114,5 +207,22 @@ test("resource perception retains rare products despite a crowded foreground",fu
     assert(#state.nearby==48 and not state.resources_complete and state.perception)
     local found=false;for _,row in ipairs(state.nearby) do if row.product=="cutgrass" then found=true end end
     assert(found)
+end)
+test("clock feedback uses actual phase durations and skips absent phases",function()
+    local w=fixture();local a=w.actor
+    a.components.health={currenthealth=150,maxhealth=150,IsDead=function() return false end}
+    a.components.inventory={FindItems=function() return {} end}
+    a.components.locomotor.GetRunSpeed=function() return 6 end
+    w.G.GetTime=function() return w.now end;w.G.Ents={[1]=a};w.G.ACTIONS={}
+    w.G.TUNING={SEG_TIME=30}
+    local data={cycles=2,phase="day",remainingtimeinphase=24,segs={day=13,dusk=0,night=3}}
+    w.G.TheWorld.net={components={clock={OnSave=function() return data end}}}
+    local adapter=require("jev_companion_world").new(w.G,nil,nil,function() return 0 end)
+    local state=adapter.snapshot(a,a,{})
+    assert(state.world.day==3 and state.world.phase=="day" and state.world.next_phase=="night")
+    assert(state.world.seconds_until_next_phase==24 and state.world.phase_duration_seconds.dusk==0)
+    assert(state.world.phase_duration_seconds.day==390 and state.buddy.run_speed==6)
+    data.segs={day=8,dusk=5,night=3}
+    assert(adapter.snapshot(a,a,{}).world.next_phase=="dusk")
 end)
 print("1.."..passed)

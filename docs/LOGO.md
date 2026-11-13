@@ -7,7 +7,7 @@
 - `modicon.xml`：图集定义，裁去四边各 1 像素。
 - `modinfo.lua`：通过 `icon_atlas` 和 `icon` 引用上述文件。
 - `assets/logo-character.png`：用户确认的透明角色源图，保持原图颜色。
-- `tools/build_modicon.py`：读取本机游戏底板、合成角色并生成 PNG、TEX 和 XML，不修改游戏安装目录。
+- `python/tools/build_modicon.py`：读取本机游戏底板、合成角色并生成 PNG、TEX 和 XML，不修改游戏安装目录。
 
 ## 重新生成
 
@@ -15,10 +15,10 @@
 
 ```powershell
 python -m pip install Pillow
-python tools/build_modicon.py --game-dir "C:/Program Files (x86)/Steam/steamapps/common/Don't Starve Together"
+python python/tools/build_modicon.py --game-dir "C:/Program Files (x86)/Steam/steamapps/common/Don't Starve Together"
 ```
 
-默认输出到仓库的 `mods/jev_dst_agent/`，尺寸为 256 × 256，可用 `--size 128` 或 `--size 512` 调整。`--character` 可指定新的透明角色源图，`--output-dir` 可指定预览目录。底板从游戏自己的 `data/databundles/images.zip` 读取，保留 Klei 的原始图案与颜色。
+默认输出到仓库的 `mods/dst_player_agent/`，尺寸为 256 × 256，可用 `--size 128` 或 `--size 512` 调整。`--character` 可指定新的透明角色源图，`--output-dir` 可指定预览目录。底板从游戏自己的 `data/databundles/images.zip` 读取，保留 Klei 的原始图案与颜色。
 
 替换图标后需要一并更新 PNG、TEX 和 XML，不能只将 PNG 重命名为 TEX。可使用 [KTools / ktech](https://github.com/nsimplex/ktools) 重新导出游戏纹理。图标引用格式见 [Klei 论坛图标说明](https://kleiforums.com/forums/topic/126518-guide-about-mod-icons/)。
 

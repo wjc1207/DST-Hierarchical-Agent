@@ -68,7 +68,7 @@ DeepSeek 使用同名只读 function tool 查询该次规划的不可变快照�
 
 同步更新 Python、`modmain.lua` 和 `scripts/`，其中新增 `jev_places.lua`。重新进入世界并重启控制循环，保留 `.env` 与桥接令牌配置。桥接协议仍为 4。
 
-Python：`python run_tests.py`。Lua：`tests/places_spec.lua`、`tests/recipes_spec.lua`、`tests/exploration_spec.lua`。离线模拟覆盖记忆、缺失复核、跨区域交接、隔水阻断、家变更、动作验证和 JEV 隔离；实际游戏的碰撞与长距离路径仍需实机验证。
+Python：`python python/run_tests.py`。Lua：`tests/places_spec.lua`、`tests/recipes_spec.lua`、`tests/exploration_spec.lua`。离线模拟覆盖记忆、缺失复核、跨区域交接、隔水阻断、家变更、动作验证和 JEV 隔离；实际游戏的碰撞与长距离路径仍需实机验证。
 
 
 火堆访问使用更严格的最终到达容差，确保角色进入添燃料范围。`refuel` 任务可自动
