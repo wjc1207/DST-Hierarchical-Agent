@@ -44,7 +44,7 @@
 冰箱时必须填写 `placement`，漏写会返回可修正的校验错误。营地营火也应填写；
 临时野外应急营火仍可不绑定。提示词要求优先复用范围内的火堆、安排添燃料。
 
-CLI 在任务下显示 `near building:<GUID> radius=10`。JEV 决策范围保持原样。
+CLI 在任务下显示 `near building:<GUID> radius=10`。
 
 ## MCP 与升级
 

@@ -141,7 +141,7 @@ class CycleTrace:
         }
         labels = {
             "observe": "cycle.observe", "planner": "planner.update",
-            "candidates": "decision.candidates", "jev": "decision.request",
+            "candidates": "decision.candidates",
             "prefetch_wait": "decision.prefetch_wait", "revalidate": "decision.revalidate",
             "action": "action.execute", "focus": "window.focus",
             "keys": "input.hold", "fresh_wait": "state.wait_fresh",

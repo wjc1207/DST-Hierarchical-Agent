@@ -1,6 +1,6 @@
 # 建筑记忆、前往建筑与家
 
-本功能供 DeepSeek 优先级看板和外部 MCP 客户端使用。新动作标记 `planner_only=true`，不进入 JEV 的候选或状态投影，也不进入规划空窗期的普通探索候选。
+本功能供 DeepSeek 优先级看板和外部 MCP 客户端使用。新动作标记 `planner_only=true`，通过地点查询和显式任务使用。
 
 ## 记忆范围
 
@@ -62,13 +62,13 @@ DeepSeek 使用同名只读 function tool 查询该次规划的不可变快照�
 
 配方缺科技时，DeepSeek 可先查询建筑，再安排 `visit_building`，然后安排制作。建筑访问完成只是一次到达经历，**不代表当前仍在科技范围内，也不会永久解锁配方**。制作前仍由原生配方条件重新检查；不从“曾经去过”推断当前科技满足。
 
-家是位置，不保证当前有光、有食物或安全。夜晚没有装备便携照明时，新地点导航不会允许角色离开火光；安全处置仍由现有 JEV 候选处理。普通可执行本地任务优先于地点长途行走，前往途中仍可因安全、任务更新或目标变化中断。
+家是位置，不保证当前有光、有食物或安全。夜晚没有装备便携照明时，新地点导航不会允许角色离开火光；安全处置仍由本地安全逻辑处理。普通可执行本地任务优先于地点长途行走，前往途中仍可因安全、任务更新或目标变化中断。
 
 ## 更新与验证
 
 同步更新 Python、`modmain.lua` 和 `scripts/`，其中新增 `jev_places.lua`。重新进入世界并重启控制循环，保留 `.env` 与桥接令牌配置。桥接协议仍为 4。
 
-Python：`python python/run_tests.py`。Lua：`tests/places_spec.lua`、`tests/recipes_spec.lua`、`tests/exploration_spec.lua`。离线模拟覆盖记忆、缺失复核、跨区域交接、隔水阻断、家变更、动作验证和 JEV 隔离；实际游戏的碰撞与长距离路径仍需实机验证。
+Python：`python python/run_tests.py`。Lua：`tests/places_spec.lua`、`tests/recipes_spec.lua`、`tests/exploration_spec.lua`。离线模拟覆盖记忆、缺失复核、跨区域交接、隔水阻断、家变更、动作验证；实际游戏的碰撞与长距离路径仍需实机验证。
 
 
 火堆访问使用更严格的最终到达容差，确保角色进入添燃料范围。`refuel` 任务可自动

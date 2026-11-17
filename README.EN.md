@@ -9,14 +9,14 @@ This repository contains two Don't Starve Together mods with a shared controller
 | DST Player Agent | AI controls your player character | [Player control quick start](#player-control-quick-start) |
 | DST Buddy Agent | Summon one or two AI companions | [Companion setup](mods/dst_buddy_agent/README.md) |
 
-An experimental Don't Starve Together agent. DeepSeek maintains prioritized resource goals. The executor completes visible tasks and searches for missing resources using Klei room-generation priors and observed map memory. Lua executes native actions and verifies effects; JEV handles emergencies and temporarily takes over during DeepSeek planning gaps. The long-term goal is an Alchemy Engine; Science Machine construction is currently supported.
+An experimental Don't Starve Together agent. DeepSeek maintains prioritized resource goals. The executor completes visible tasks and searches for missing resources using Klei room-generation priors and observed map memory. The MCP executor handles urgent safety actions. Lua executes native actions and verifies effects. The long-term goal is an Alchemy Engine; Science Machine construction is currently supported.
 
 Previous milestones: [survive the first night](https://bilibili.com/video/BV1aehE6DEji) · [build a Science Machine](https://www.bilibili.com/video/BV1mFaV6aEQ2)
 
 ## Player control quick start
 
 1. Copy `mods/dst_player_agent` from this repository into Don't Starve Together's `mods` directory. Enable **DST Player Agent** in the game's Mods menu and enter a local or private world.
-2. Copy `.env.example` to `.env` and fill in `JEV_API_KEY`. Add `DEEPSEEK_API_KEY` if you want periodic planning. Do not share or commit `.env`.
+2. Copy `.env.example` to `.env` and fill in `DEEPSEEK_API_KEY`. Do not share or commit `.env`.
 3. Complete [MCP bridge setup](docs/MCP.EN.md), then open PowerShell in the project folder, check connectivity and start the loop:
 
 ```powershell
@@ -28,7 +28,7 @@ The last command sends real game inputs; press `Ctrl+C` to stop. Omit `--execute
 
 ## Execution mode
 
-Priority goals use the DeepSeek/JEV autonomous loop over MCP, with native Lua
+Priority goals use the DeepSeek autonomous loop over MCP, with native Lua
 execution and effect verification instead of keyboard/mouse simulation. After
 [configuring the bridge](docs/MCP.EN.md) and updating the Mod, run:
 

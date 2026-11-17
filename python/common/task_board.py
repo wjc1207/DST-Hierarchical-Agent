@@ -214,7 +214,7 @@ def validate_board(raw: dict, day: int, *, target_validator=None) -> dict:
 
 
 def board_view(board: dict, state: dict, *, verified_structures=None, target_evaluator=None, completed_task_ids=()) -> dict:
-    """Re-evaluate a copy, including for predictive JEV input; never fake progress."""
+    """Re-evaluate a copy, including for predictive input; never fake progress."""
     result = copy.deepcopy(board)
     inventory = state.get("player", {}).get("inventory", {})
     counts = {}

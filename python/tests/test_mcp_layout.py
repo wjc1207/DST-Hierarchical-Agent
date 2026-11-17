@@ -54,7 +54,7 @@ class LayoutTests(unittest.TestCase):
         args = SimpleNamespace(port=8765, config=Path("unused.json"))
         with patch.object(mcp, "Client", side_effect=capture), patch.object(mcp_agent, "check_bridge_port"):
             with self.assertRaises(InspectedLaunch):
-                asyncio.run(mcp_agent.run(args, None, None))
+                asyncio.run(mcp_agent.run(args, None))
             with self.assertRaises(InspectedLaunch):
                 asyncio.run(mcp_probe.probe(args))
         for parameters in seen:

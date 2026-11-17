@@ -209,7 +209,7 @@ class SequenceExecutor:
             return min(candidates, key=lambda pair: (distances.get(pair[1].get("guid"), math.inf), pair[0]))[0]
         if operation in {"collect", "explore_other_region"}:
             # Reuse the existing verified graph/BFS/DFS navigator, but provide only
-            # THIS step as its goal. Resource-change yields do not invoke JEV.
+            # THIS step as its goal. Resource-change yields recheck the current step.
             from mcp_agent.navigation_intents import dispatch_for_navigation
             if operation == "collect":
                 goal = {"type": "inventory", "prefab": step["prefab"], "count": step["count"]}

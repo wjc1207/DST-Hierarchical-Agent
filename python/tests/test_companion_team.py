@@ -66,6 +66,32 @@ class TeamBridgeTests(unittest.TestCase):
     def action(self,identity,guid):
         obs=self.bridge.member_call("observe",identity)
         return self.bridge.member_call("action",identity,"collect",obs["observation_id"],{"target_guid":guid})
+    def test_pause_heartbeats_hold_dispatch_and_resume_with_fresh_credentials(self):
+        from mcp_server.game_bridge import BridgeError
+
+        now = [0]
+        self.bridge = CompanionTeamBridge(TOKEN, clock=lambda: now[0])
+        self.exchange()
+        running = self.action("buddy1", 99)["id"]
+        queued = self.action("buddy2", 100)["id"]
+        old = self.bridge.member_call("observe", "buddy2")["observation_id"]
+        self.raw["paused"] = True
+        self.assertEqual(self.exchange([{"buddy_id": "buddy1", "id": running,
+                                         "status": "running", "revision": 1}])["commands"], [])
+        for _ in range(30):
+            now[0] += 1
+            self.assertEqual(self.exchange()["commands"], [])
+            self.assertTrue(self.bridge.observe()["state"]["paused"])
+        with self.assertRaisesRegex(BridgeError, "Game is paused"):
+            self.action("buddy2", 100)
+        self.raw["paused"] = False
+        self.assertEqual(self.exchange()["commands"], [])
+        self.assertEqual(self.bridge.member_call("result", "buddy1", running)["status"], "running")
+        self.assertEqual(self.bridge.member_call("result", "buddy2", queued)["reason"], "game_resumed_refresh")
+        with self.assertRaisesRegex(BridgeError, "Expired observation"):
+            self.bridge.member_call("action", "buddy2", "collect", old, {"target_guid": 100})
+        self.assertNotEqual(self.action("buddy2", 100)["id"], queued)
+
     def test_legacy_snapshot_is_rejected_without_resetting_team(self):
         from mcp_server.game_bridge import BridgeError
 
@@ -122,6 +148,51 @@ class TeamBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.bridge.member_call("observe","other_player_buddy")
 
 
+class PlanningClientScheduledReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_newly_scheduled_board_is_reviewed_once_and_keeps_return_time(self):
+        from mcp_agent.planning_client import PlanningClient
+
+        client = PlanningClient(None)
+        client.companion_model = object()
+        return_task = {"id": "back", "status": "scheduled", "blocked_reason": "waiting to depart",
+                       "target": {"type": "return_owner"}, "at": {"day": 1, "phase": "night"}}
+        initial_plan = {"kind": "task_board", "tasks": [return_task]}
+        actor = {"version": "initial", "intent_version": "gather-and-return", "ready": True,
+                 "interaction": {"mode": "instruction", "enabled": True, "instruction": "天黑回来"},
+                 "observation": {}, "current_task_board": None, "review_reason": None}
+        reasons = []
+
+        async def rpc(name, **args):
+            if name == "get_planning_state":
+                return {"members": {"buddy1": copy.deepcopy(actor)}}
+            self.assertEqual(name, "submit_task_board")
+            self.assertEqual(args["versions"], {"buddy1": actor["version"]})
+            actor.update(version=f"board-{len(reasons)}",
+                         current_task_board=args["board"]["assignments"]["buddy1"],
+                         review_reason="only_scheduled_tasks")
+            return {"versions": {"buddy1": actor["version"]}}
+
+        def plan(snapshot, requested, cancel):
+            row = snapshot["members"]["buddy1"]
+            reasons.append(row["review_reason"])
+            self.assertEqual(requested, ["buddy1"])
+            return "observation", "plan", {"buddy1": row["current_task_board"] or initial_plan}
+
+        client.rpc, client.plan = rpc, plan
+        try:
+            for _ in range(2):
+                await client.cycle()
+                self.assertIsNotNone(client.pending)
+                await asyncio.wait_for(client.pending, 2)
+                await client.cycle()
+            await client.cycle()
+            self.assertIsNone(client.pending)
+            self.assertEqual(reasons, [None, "only_scheduled_tasks"])
+            self.assertEqual(actor["current_task_board"]["tasks"][0]["at"], {"day": 1, "phase": "night"})
+        finally:
+            client.close()
+
+
 class TeamPlannerTests(unittest.TestCase):
     def test_actual_shared_request_loop_accepts_team_envelope_and_repairs_without_losing_scope(self):
         ctx=context();bad=assignments(ctx);bad["assignments"][1]["buddy_id"]="buddy1"
@@ -158,7 +229,10 @@ class TeamPlannerTests(unittest.TestCase):
 
         messages = [json.loads(call.args[0].data)["messages"] for call in send.call_args_list]
         example = '"type":"return_owner","at":"night"'
-        self.assertIn(example, messages[0][0]["content"])
+        prompt = messages[0][0]["content"]
+        self.assertIn('{"reply":"我去采草。","tasks":[{"type":"collect","prefab":"cutgrass","count":4}]}', prompt)
+        self.assertIn("A gathering-only request does not imply a return deadline", prompt)
+        self.assertIn(example, prompt)
         repair = messages[1][-1]["content"]
         self.assertIn("assignments[buddy1].plan: tasks[2].at", repair)
         self.assertIn(example, repair)

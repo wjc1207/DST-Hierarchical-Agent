@@ -5,7 +5,8 @@ import time
 from collections import OrderedDict
 
 from common.task_timing import number
-from mcp_agent.navigation_intents import sources_for
+from mcp_agent.navigation_intents import WORK_SOURCES, sources_for
+from mcp_agent.region_resources import room_resources
 
 
 CELL = 4
@@ -24,7 +25,8 @@ class ResourceSearch:
         self.paused = {}
         self.recent_legs = OrderedDict()
         self.last_version = None
-        self.position = self.heading = None
+        self.position = None
+        self.strategy = None
         self.inflight = None
 
     def observe(self, observed):
@@ -50,11 +52,6 @@ class ResourceSearch:
         if not all(number(point.get(k)) for k in ("x", "z")):
             return
         position = (point["x"], point["z"])
-        if self.position:
-            dx, dz = position[0]-self.position[0], position[1]-self.position[1]
-            length = math.hypot(dx, dz)
-            if length >= 1:
-                self.heading = (dx/length, dz/length)
         self.position = position
         seen = set()
         for row in observed.get("nearby", []):
@@ -65,9 +62,22 @@ class ResourceSearch:
             self.sources[identity] = {"guid": identity, "product": row["product"], "x": row["x"], "z": row["z"],
                                       "seen_at": now, "available": True}
             self.sources.move_to_end(identity)
+        work_targets = observed.get("work_targets")
+        for row in work_targets or []:
+            if not all(number(row.get(k)) for k in ("guid", "x", "z")):
+                continue
+            for product in row.get("products", []):
+                identity = (row["guid"], product)
+                seen.add(identity)
+                self.sources[identity] = {"guid": row["guid"], "product": product,
+                                          "work": row["work"], "x": row["x"], "z": row["z"],
+                                          "seen_at": now, "available": True}
+                self.sources.move_to_end(identity)
         radius = perception.get("resource_radius", 15)
         for identity, source in self.sources.items():
-            if (identity not in seen and observed.get("resources_complete") is True
+            complete = (work_targets is not None and len(work_targets) < 24 if source.get("work")
+                        else observed.get("resources_complete") is True)
+            if (identity not in seen and complete
                     and math.hypot(source["x"]-position[0], source["z"]-position[1]) <= radius):
                 source["available"] = False
         while len(self.sources) > 256:
@@ -76,66 +86,66 @@ class ResourceSearch:
 
     def select(self, product, observed, *, max_distance=20):
         self.observe(observed)
+        self.strategy = None
         perception = observed.get("perception") or {}
         if not self.position or perception.get("cell_size") != CELL:
             return None
-        # Reuse canonical resource/source relations from the existing explorer.
-        sources = sources_for(product)
-        memory = [r for r in self.sources.values() if r["available"] and r["product"] in sources
-                  and self.clock()-r["seen_at"] <= 300]
-        origin = self.position
-        remembered = min(memory, key=lambda r: math.hypot(r["x"]-origin[0], r["z"]-origin[1])) if memory else None
-        candidates, transit = [], []
-        for point in perception.get("points", []):
-            if (not isinstance(point.get("id"), str) or point["id"] in self.paused
-                    or not all(number(point.get(k)) for k in ("x", "z"))):
-                continue
-            dx, dz = point["x"]-origin[0], point["z"]-origin[1]
-            distance = math.hypot(dx, dz)
-            if not 3 <= distance <= min(20, max_distance):
-                continue
-            gx, gz = cell_at(point["x"], point["z"])
-            gain = sum((gx+x, gz+z) not in self.cells for x in range(-4, 5) for z in range(-4, 5) if x*x+z*z <= 16)
-            approach = 0
-            if remembered:
-                approach = math.hypot(remembered["x"]-origin[0], remembered["z"]-origin[1])-math.hypot(remembered["x"]-point["x"], remembered["z"]-point["z"])
-            if gain == 0 and approach <= 1:
-                transit.append((distance, point))
-                continue
-            forward = (dx*self.heading[0]+dz*self.heading[1])/distance if self.heading else 0
-            candidates.append((gain*4+approach*2+forward*3+distance*.05, point["id"], point))
-        if candidates:
-            return max(candidates, key=lambda r: (r[0], r[1]))[2]
-        return self.route_to_frontier(transit, memory)
+        tools = {work for item in observed.get("equipment", []) if item.get("usable")
+                 for work in item.get("tools", [])}
+        sources = {source for source in sources_for(product)
+                   if source not in WORK_SOURCES or ("CHOP" if WORK_SOURCES[source][0] == "axe" else "MINE") in tools}
+        memory = [r for r in self.sources.values() if r["available"] and r["product"] == product
+                  and (not r.get("work") or r["work"] in tools) and self.clock()-r["seen_at"] <= 300]
+        return self.route_to_frontier(perception.get("points", []), memory, sources, max_distance)
 
-    def route_to_frontier(self, candidates, sources):
-        # Only the first leg is dispatched. Later legs must be offered again
-        # by the server after moving, so this map can guide us around a bend.
+    def route_to_frontier(self, points, memory, sources, max_distance):
+        # Rank destinations along observed land. Only dispatch the first,
+        # server-offered leg; later legs are revalidated from the new position.
         origin = cell_at(*self.position)
         now = self.clock()
         first_legs, queue = {}, []
-        for distance, point in candidates:
-            identity = point["id"]
+        for point in points:
+            identity = point.get("id")
+            if (not isinstance(identity, str) or identity in self.paused
+                    or self.recent_legs.get((origin, identity), -math.inf) > now
+                    or not all(number(point.get(k)) for k in ("x", "z"))):
+                continue
+            distance = math.hypot(point["x"]-self.position[0], point["z"]-self.position[1])
             cell = cell_at(point["x"], point["z"])
-            if self.recent_legs.get((origin, identity), -math.inf) > now or not self.cells.get(cell, {}).get("land"):
+            if not 3 <= distance <= min(20, max_distance) or not self.cells.get(cell, {}).get("land"):
                 continue
             first_legs[identity] = point
-            heapq.heappush(queue, (distance, identity, cell))
-        source_cells = {cell_at(row["x"], row["z"]) for row in sources}
+            heapq.heappush(queue, (distance, -distance, identity, cell))
+        source_cells = {cell_at(row["x"], row["z"]) for row in memory}
+        priors = room_resources()
         visited = {origin}
+        fallback = None
+        prior_route = None
         while queue:
-            distance, first, cell = heapq.heappop(queue)
+            distance, first_distance, first, cell = heapq.heappop(queue)
             if cell in visited:
                 continue
             visited.add(cell)
             gx, gz = cell
             neighbors = [(gx+dx, gz+dz) for dx, dz in NEIGHBORS]
-            if cell in source_cells or any(next_cell not in self.cells for next_cell in neighbors):
+            if cell in source_cells:
+                self.strategy = "known_source"
                 return first_legs[first]
+            if any(next_cell not in self.cells for next_cell in neighbors):
+                if prior_route is None and sources.intersection(priors.get(self.cells[cell].get("room_type"), ())):
+                    prior_route = first
+                if fallback is None:
+                    fallback = first
             if distance + CELL <= LOCAL_ROUTE_LIMIT:
                 for next_cell in neighbors:
-                    if next_cell not in visited and self.cells[next_cell]["land"]:
-                        heapq.heappush(queue, (distance+CELL, first, next_cell))
+                    if next_cell not in visited and self.cells.get(next_cell, {}).get("land"):
+                        heapq.heappush(queue, (distance+CELL, first_distance, first, next_cell))
+        if prior_route is not None:
+            self.strategy = "room_prior"
+            return first_legs[prior_route]
+        if fallback is not None:
+            self.strategy = "unknown_frontier"
+            return first_legs[fallback]
         return None
 
     def start_leg(self, task_id, args):

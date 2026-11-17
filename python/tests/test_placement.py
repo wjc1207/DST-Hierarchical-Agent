@@ -112,7 +112,7 @@ class PlacementTests(unittest.TestCase):
 class PlacementAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_host_passes_scope_to_native_build_command(self):
         client=FakeClient();client.state=state(x=2)
-        agent=MCPAgent(client,lambda *_:self.fail('Scoped camp construction should not ask JEV'),
+        agent=MCPAgent(client,
                        planner=FakePlanner(plan()),execute=True,poll=.001)
         try:
             await asyncio.wait_for(agent.cycle(),2)

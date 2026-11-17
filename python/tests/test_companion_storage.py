@@ -31,6 +31,23 @@ def board(kind="give_owner", count=3, **fields):
 
 
 class StorageTasksTests(unittest.TestCase):
+    def test_eat_uses_exact_edible_prefab_and_finishes_from_native_receipts(self):
+        observed = observation()
+        observed["capabilities"].append("eat")
+        observed["foods"] = [{"prefab": "monstermeat", "count": 2,
+                              "hunger_delta": 18.75, "sanity_delta": -15, "health_delta": -20}]
+        observed["buddy"]["inventory"].update(monstermeat=2, berries=3)
+        runtime = CompanionTasks()
+        runtime.adopt(board("eat", 2, prefab="monstermeat"), observed)
+        _, op, args = runtime.next_action(observed)
+        self.assertEqual((op, args["prefab"], args["total_count"]), ("eat", "monstermeat", 2))
+        observed["transfer_receipts"] = [{"task_key": args["task_key"], "count": 1}]
+        self.assertEqual(runtime.view(observed)["tasks"][0]["progress"], {"current": 1, "required": 2})
+        observed["foods"] = []
+        self.assertEqual(runtime.next_action(observed)[1], "needs_replan")
+        observed["transfer_receipts"][0]["count"] = 2
+        self.assertEqual(runtime.next_action(observed)[1], "completed")
+
     def test_total_transfer_progress_comes_from_receipts_not_current_destination_stock(self):
         observed = observation();runtime = CompanionTasks();runtime.adopt(board("withdraw"), observed)
         task, op, args = runtime.next_action(observed)

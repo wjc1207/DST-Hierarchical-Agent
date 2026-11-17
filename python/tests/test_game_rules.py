@@ -13,7 +13,6 @@ from unittest.mock import patch
 from common import game_rules as rules
 from common.config import load_dotenv
 from common.paths import DATA_DIR, PROJECT_ROOT, PYTHON_ROOT
-from mcp_agent import jev_client
 
 
 class RuleTests(unittest.TestCase):
@@ -88,17 +87,6 @@ class RuleTests(unittest.TestCase):
                               cwd=PYTHON_ROOT,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)
 
-    def test_model_client_filters_all_navigation_keys_without_a_keyboard_candidate_builder(self):
-        class Response:
-            def __enter__(self):return self
-            def __exit__(self,*_):pass
-            def read(self):return b'{"answers":{"next_action":{"choice":"wait"}}}'
-        state={"world":{"day":1,"phase":"day"},"player":{"inventory":{"items":[],"equipped":[]}},"nearby":[]}
-        criteria={"wait":"Wait","explore_current_region":"Explore","travel_region_B":"Travel","navigate_resource_4":"Source"}
-        with patch.object(jev_client.urllib.request,"urlopen",return_value=Response()) as send:
-            jev_client.call_jev("https://offline.invalid","offline","mock",state,criteria)
-        body=json.loads(send.call_args.args[0].data)
-        self.assertEqual(body["questions"]["next_action"]["criteria"],{"wait":"Wait"})
 
 
 if __name__=="__main__":

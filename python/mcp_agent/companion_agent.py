@@ -68,8 +68,9 @@ class CompanionAgent:
         self.basis = None
         self.dialogue_revision = None
         self.plan = self.previous = None
-        self.tasks = CompanionTasks()
+        self.tasks = CompanionTasks(clock=lambda: self.task_time())
         self.observed = None
+        self.sampled_at = None
         self.idle_marker = None
         self.history = []
         self.active = None
@@ -125,6 +126,9 @@ class CompanionAgent:
         if not isinstance(result.structured_content, dict):
             raise RuntimeError("Companion tool returned no structured result")
         return result.structured_content
+
+    def task_time(self):
+        return self.sampled_at if self.sampled_at is not None else time.monotonic()
 
     def board(self):
         if not self.plan:
@@ -185,7 +189,12 @@ class CompanionAgent:
     async def cycle(self):
         packet = await self.rpc("buddy_observe")
         state = packet["state"]
+        if state.get("paused"):
+            return
         control, observed = state["control"], state.get("companion") or {}
+        sampled_at = observed.get("sampled_at")
+        if number(sampled_at):
+            self.sampled_at = sampled_at
         autonomous = control.get("mode") == "autonomous"
         goal = control.get("goal") if autonomous else None
         basis = (packet["session_id"], observed.get("token"), control["revision"], autonomous, goal)
@@ -201,7 +210,7 @@ class CompanionAgent:
             if same_goal:
                 self.tasks.clear_task_deferrals()
             else:
-                self.tasks = CompanionTasks()
+                self.tasks = CompanionTasks(clock=lambda: self.task_time())
                 self.history = []
             self.plan, self.active = None, None
             self.basis = basis
@@ -266,6 +275,9 @@ class CompanionAgent:
             _, task_id, kind = self.active
             self.trace("action_result", action_id=self.active[0], status=action["status"], reason=action.get("reason"), task_id=task_id)
             self.active = None
+            if action.get("reason") == "game_resumed_refresh":
+                self.tasks.pause_search()
+                return
             if kind == "stop":
                 return
             locally_handled = self.tasks.on_result(task_id, action, observed)
@@ -423,7 +435,7 @@ class CompanionAgent:
                 position = tuple(point[k] for k in ("x", "z")) if all(number(point.get(k)) for k in ("x", "z")) else None
                 progressed = position is not None and (self.waiting_position is None or
                     math.hypot(position[0]-self.waiting_position[0],position[1]-self.waiting_position[1]) >= .5)
-                now = time.monotonic()
+                now = self.task_time()
                 if self.waiting_at is None or progressed:
                     self.waiting_at,self.waiting_position = now,position
                 if now - self.waiting_at < 20 or dialogue_pending:

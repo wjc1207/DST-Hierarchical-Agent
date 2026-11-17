@@ -71,7 +71,7 @@ class TaskService:
             from mcp_agent.companion_team_agent import CompanionTeamAgent
             return CompanionTeamAgent(client, None, execute=True, log_path=PROJECT_ROOT / "logs/companion_agent.jsonl")
         from mcp_agent.mcp_agent import MCPAgent
-        host = MCPAgent(client, None, execute=True, poll=self.poll)
+        host = MCPAgent(client, execute=True, poll=self.poll)
         host.external_board = True
         return host
 
@@ -229,7 +229,10 @@ class TaskService:
     def planning_state(self):
         """Capture game intent, boards and their submission versions together."""
         with self.bridge.lock:
-            ids = list(self.bridge.observe()["state"]["members"]) if self.companion else ["player"]
+            team_state = self.bridge.observe()["state"] if self.companion else {}
+            if team_state.get("paused"):
+                return {"paused": True, "members": {}, "interaction": team_state["control"]}
+            ids = list(team_state["members"]) if self.companion else ["player"]
             members = {}
             for identity in ids:
                 actor, packet = self.actor(identity if self.companion else None)
@@ -268,7 +271,10 @@ class TaskService:
     def check_versions(self, versions, identities):
         if versions is None:
             return
-        current = self.planning_state()["members"]
+        snapshot = self.planning_state()
+        if snapshot.get("paused"):
+            raise BridgeError("Game is paused")
+        current = snapshot["members"]
         if set(versions) != set(identities) or any(
                 identity not in current or current[identity]["version"] != version
                 for identity, version in versions.items()):

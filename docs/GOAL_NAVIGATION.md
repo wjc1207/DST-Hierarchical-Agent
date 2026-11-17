@@ -74,21 +74,14 @@ and emergency lighting remain local safety decisions, not timed wait goals.
    still-unmet target yields with `goal_action_available`; this includes pickups,
    sufficient-tool/durability tree or ore work, crafting, construction and food.
    No collectible type-set change is required for tree/ore discovery. The host
-   reselects by board priority without JEV. New room discovery alone does not stop
+   reselects by board priority. New room discovery alone does not stop
    a board walk; destination, path and safety events remain in force.
    While a walk runs, the host cancels and waits for acknowledgement when the
    goal/ready targets change or existing room/global search budgets require a
    review; continuous movement must not postpone a planner update for 120 seconds.
    A pending cancel survives still-running Lua reports and is redelivered until
    Lua reports a terminal outcome; it never releases ownership early.
-   DS-gap navigation omits the target filter and retains resource-set events/JEV.
-5. JEV runs only for planning gaps or safety: targeted enemies, damage, lighting
-   changes/unsafe night light, and known health, hunger or sanity below 30%.
-   Hunger triggers even without carried food; unknown vitals are not danger facts.
-   Lua interrupts running work when a vital crosses the threshold. If JEV chooses
-   native `wait`, an unchanged danger is acknowledged so safe board work can resume.
-   New remedies, a worse 10% vital band, new targeted enemies or native safety
-   interrupts re-arm the decision. Useful remedies continue to receive decisions.
+5. The executor applies local safety rules for threats, unsafe night light and critical hunger. Lua interrupts work when safety thresholds are crossed.
    Lua owns
    live legality, passability and movement verification; Python never invents
    coordinates or bypasses the offered-action snapshot.
@@ -172,12 +165,10 @@ always outrank a retained room-prior intent. `search_spent` is per attempt;
 `search_retry` reports attempt, remaining cooldown and cumulative seconds/distance.
 
 If no task can currently advance, the host immediately requests evaluation.
-With unfinished focus, it retains control (`focus_pending`) and checks safety
-while waiting for review/retry; without focus, JEV can take temporary local
-control. A set-home task whose building ID is missing from the current building
+It checks local safety while waiting for review or retry. A set-home task whose building ID is missing from the current building
 memory or confirmed destroyed fails and releases its focus. A remembered building
 that is merely out of sight remains a valid target, and missing place telemetry
-does not invalidate it. Exact-choice failure pauses also apply during temporary control.
+does not invalidate it.
 Missing paths are not completion.
 
 ## Asynchronous review
@@ -212,20 +203,7 @@ Validation failures, query-limit events and adoption/request errors are saved
 to `logs/planner_errors.jsonl` as bounded diagnostic summaries without request
 bodies or credentials.
 
-Missing/empty/completed boards and boards with no feasible offered action or
-route hand control to JEV while DeepSeek evaluates and updates the goals, unless
-unfinished focus reserves control. A focus promoted during a pending optional
-JEV request discards that response, even if the focused task is blocked. Only
-one DeepSeek request runs at a time; failed requests retain the 15-second retry
-backoff while local control continues. Useful future goals remain on the board.
-Temporary navigation uses free exploration rather than a currently unexecutable
-goal. When the old board becomes actionable or a usable update arrives, automatic
-execution resumes after the current bounded action. A pending JEV gap choice
-returns control without executing if the latest board can already advance.
-
-Both models receive the same fact projection, current native capability limits
-and room-resource priors. The planner sees current/previous board progress and
-exact native failure reasons; it must not equate route rejection with no resource.
+Missing, completed or blocked boards prompt a DeepSeek review. Runnable tasks can continue while the review is pending. Otherwise the executor waits, with local safety rules still active.
 
 ## Stable DeepSeek request prefix
 
@@ -242,8 +220,7 @@ the current game snapshot, day/quarter, request reason, board progress and recen
 action results. Live available actions, protocol/revision, observed topology and
 actual resource records remain dynamic. Older user snapshots are cleaned of
 duplicated knowledge/contracts before replay and before applying history limits.
-Both models retain the same live facts; DeepSeek reads static references from
-`system`, while JEV keeps its compact observed-room priors in decision state.
+DeepSeek reads the static references from `system`.
 
 When the API supplies usage numbers, the CLI prints `daily_plan_usage` with
 `prompt_tokens`, `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`. Missing

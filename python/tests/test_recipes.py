@@ -12,7 +12,6 @@ from common.task_board import board_view, validate_board
 from mcp_agent import daily_planner
 from mcp_agent.model_state import model_game_state
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals
-from mcp_agent.mcp_agent import MCPAgent
 from test_mcp_agent import snapshot
 
 
@@ -80,7 +79,7 @@ class RecipeTests(unittest.TestCase):
         action = {"kind": "place", "recipe_id": "researchlab2", "product": "researchlab2"}
         self.assertEqual(PriorityBoardExecutor.local_choices(plan["tasks"][0], {"recipe_researchlab2": action})[0][0], "recipe_researchlab2")
 
-    def test_jev_sees_neither_catalog_nor_generic_candidates(self):
+    def test_compact_model_state_omits_catalog_and_generic_candidates(self):
         actual = snapshot(); actual["recipes"] = copy.deepcopy(CATALOG)
         actions = {"wait": {"kind": "wait"}, "recipe_boards": {
             "kind": "craft", "planner_only": True, "recipe_id": "boards", "product": "boards"}}
@@ -88,12 +87,6 @@ class RecipeTests(unittest.TestCase):
         facts = model_game_state(actual)
         self.assertNotIn("recipes", facts)
         self.assertEqual(set(facts["control"]["available_actions"]), {"wait"})
-        agent = MCPAgent(None, lambda *_: self.fail("No JEV call needed for wait only"))
-        try:
-            choice, _ = asyncio.run(agent.choose_local({"state": actual, "actions": actions}))
-            self.assertEqual(choice, "wait")
-        finally:
-            agent.worker.shutdown()
 
     def test_deepseek_queries_before_planning_without_full_catalog_in_prompt(self):
         actual = snapshot(); actual["recipes"] = copy.deepcopy(CATALOG)

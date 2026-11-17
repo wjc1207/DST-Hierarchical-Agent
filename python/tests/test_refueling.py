@@ -10,7 +10,7 @@ from common.refueling import validate_target
 from common.residence import allowed
 from mcp_agent import daily_planner
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals, progress_signatures_match, task_signature
-from mcp_agent.navigation_intents import ExplorationExecutor, local_candidates
+from mcp_agent.navigation_intents import ExplorationExecutor
 from mcp_agent.model_state import model_game_state
 from mcp_agent.mcp_agent import MCPAgent
 from mcp_server.game_bridge import GameBridge, BridgeError
@@ -142,7 +142,6 @@ class RefuelingTests(unittest.TestCase):
         a=action(); task=plan()['tasks'][0]
         for changes in ({'building_id':'building:41'},{'fuel_prefab':'twigs'}):
             self.assertFalse(PriorityBoardExecutor.local_choices(task,{'fuel':{**a,**changes}}))
-        self.assertFalse(local_candidates({}, {'fuel':a})[1])
         s=actual(); s['bridge']['available_actions']['fuel']=a
         self.assertNotIn('fuel',model_game_state(s)['control']['available_actions'])
 
@@ -242,7 +241,7 @@ class RefuelApproachAgentTests(unittest.IsolatedAsyncioTestCase):
             elif a['kind']=='add_fuel':
                 peer.state['recipe_inventory']['log']-=1
         client.hook=after_start
-        agent=MCPAgent(client,lambda *_:self.fail('Refuel approach must not ask JEV'),
+        agent=MCPAgent(client,
                        planner=FakePlanner(plan()),execute=True,poll=.001)
         try:
             for _ in range(3):
@@ -257,7 +256,7 @@ class RefuelApproachAgentTests(unittest.IsolatedAsyncioTestCase):
         client=FakeClient();client.state=actual()
         client.state['bridge']['available_actions']={'add_fuel:40:log':action(),'wait':{'kind':'wait'}}
         planner=FakePlanner(plan(3));seen=set();revised=False
-        agent=MCPAgent(client,lambda *_:self.fail('Fueling should not ask JEV'),planner=planner,execute=True,poll=.001)
+        agent=MCPAgent(client,planner=planner,execute=True,poll=.001)
         def review_inflight(peer):
             nonlocal revised
             if not peer.bridge.active or peer.bridge.active in seen:return

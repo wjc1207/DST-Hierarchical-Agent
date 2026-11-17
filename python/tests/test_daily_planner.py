@@ -8,7 +8,6 @@ from concurrent.futures import Future
 from unittest.mock import patch
 
 from mcp_agent import daily_planner
-from mcp_agent import jev_client as jev_agent
 
 
 def observed(day: int = 1, world_time: float = 0.1) -> dict:
@@ -61,9 +60,6 @@ class PlannerTests(unittest.TestCase):
             "priority": "Keep light ready", "replan_if": ["Goal complete"],
         }, 2)
         self.assertEqual(plan["day"], 2)
-        compact = jev_agent.compact_game_state(observed(2), plan)
-        self.assertEqual(compact["daily_plan"], plan)
-        self.assertIn("not a command", " ".join(compact["decision_guidance"]))
         with self.assertRaises(ValueError):
             daily_planner.validate_plan({"goal": "", "steps": []}, 2)
 
@@ -323,24 +319,6 @@ class PlannerTests(unittest.TestCase):
                 daily_planner.request_plan("https://example.invalid/chat", "key", "model", 3, {})
         send.assert_called_once()
 
-    def test_jev_receives_plan_as_state_not_as_action_filter(self) -> None:
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return b'{"answers":{"next_action":{"choice":"wait","confidence":1}}}'
-
-        choices = {"wait": "Wait briefly", "craft_torch": "Craft a torch"}
-        plan = {"day": 1, "goal": "Find gold", "steps": ["Explore safely"]}
-        with patch.object(jev_agent.urllib.request, "urlopen", return_value=Response()) as send:
-            jev_agent.call_jev("https://example.invalid/jev", "secret", "jev", observed(), choices, plan)
-        body = json.loads(send.call_args.args[0].data)
-        self.assertEqual(json.loads(body["state"])["daily_plan"], plan)
-        self.assertEqual(body["questions"]["next_action"]["criteria"], choices)
 
     def test_daily_request_is_nonblocking_and_replans_after_day_change(self) -> None:
         with patch.object(daily_planner, "ThreadPoolExecutor", FakeExecutor):

@@ -49,6 +49,20 @@ function M.new(G,reply,validate_text,encoded_size,trace)
     function E.dead(a)
         return (a.HasTag and a:HasTag("playerghost")) or a.components.health:IsDead()
     end
+    function E.save_buddy(a)
+        local record,references=a:GetSaveRecord()
+        record.id=a.GUID
+        if E.dead(a) then
+            record.data=record.data or {}
+            record.data.is_ghost=true
+        end
+        return record,references
+    end
+    function E.load_buddy(record,newents)
+        local a=G.SpawnSaveRecord(record,newents)
+        if a and a:IsValid() then return a end
+        if trace then trace("buddy_restore_failed",{saved_guid=record.id}) end
+    end
     function E.stop(a) a:ClearBufferedAction();a.components.locomotor:Clear();a.components.locomotor:Stop() end
     function E.set_name(a,name) return Presentation.set_name(G,a,name) end
     function E.activate(a)
@@ -137,6 +151,7 @@ function M.new(G,reply,validate_text,encoded_size,trace)
             local c=a.components or {}
             if a~=player and a.prefab=="wilson" and (not a.userid or a.userid=="") and not a.brain
                 and not a._jev_companion_owner and not a._jev_probe_owner
+                and not a._jev_companion_slot
                 and (not a._jev_companion_created_for or a._jev_companion_created_for==player.userid)
                 and a.sg and c.locomotor and c.inventory and c.health and not E.dead(a) then
                 local d=E.distance(a,player);if not distance or d<distance then chosen,distance=a,d end
@@ -305,6 +320,8 @@ function M.new(G,reply,validate_text,encoded_size,trace)
             state.capabilities={}
             return state
         end
+        state.foods=native.foods(a)
+        if state.foods then state.capabilities[#state.capabilities+1]="eat" end
         state.nearby=selected;state.resources_complete=#nearby<=48
         state.escape=r.escape and {status=r.escape.status,threat_prefab=r.escape.threat_prefab} or nil
         state.action=r.active and {id=r.active.id,op=r.active.op,status="running",

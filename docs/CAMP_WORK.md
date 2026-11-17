@@ -1,7 +1,7 @@
 # Camp storage, cooking and charcoal
 
 DeepSeek submits goals. The native executor chooses current actions for those
-goals; camp actions are excluded from JEV's choice list.
+goals.
 
 | Goal target | Fields | Completion |
 | --- | --- | --- |

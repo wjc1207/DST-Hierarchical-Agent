@@ -31,6 +31,14 @@ function M.new(env)
             or (packet.state.version or 0)>((self.snapshot or {}).version or -1)) then
             local previous=self.snapshot and self.snapshot.buddy
             self.snapshot=packet.state;self.snapshot_seq=packet.seq;self.last_snapshot=env.now();self.dirty=true
+            local result=self.snapshot.last_action_result
+            if result and packet.token==self.token and TERMINAL[result.status] then
+                local action=self.requests[result.id]
+                if action and action.backend_id and action.request.seq==result.seq and action.request.op==result.op then
+                    save_result(action.backend_id,result.status,result.reason,action.request.revision,result.data)
+                    self.requests[result.id]=nil
+                end
+            end
             local buddy=self.snapshot.buddy
             if buddy and buddy.dead and (not previous or previous.guid~=buddy.guid or not previous.dead) then
                 notice((env.name or "伙伴").."已死亡，当前任务停止。")
@@ -155,7 +163,7 @@ function M.new(env)
             save_result(command.id,"interrupted","client_intent_changed",command.revision);return
         end
         if not ({summon=true,bind=true,move=true,collect=true,follow=true,stay=true,stop=true,
-            recipes=true,equip=true,unequip=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true})[command.op] then
+            recipes=true,equip=true,unequip=true,eat=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true})[command.op] then
             save_result(command.id,"failed","unsupported_action",command.revision);return
         end
         self:send(command.op,command.args,nil,command.id)

@@ -172,7 +172,7 @@ class HungerHostTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for agent in self.agents: await agent.shutdown()
     def agent(self,b):
-        a=MCPAgent(self.client,lambda *_:self.fail('JEV must not arbitrate food maintenance'),planner=FakePlanner(b),execute=True,poll=.001)
+        a=MCPAgent(self.client,planner=FakePlanner(b),execute=True,poll=.001)
         self.agents.append(a);return a
 
     async def test_monitor_then_replenish_then_monitor_again(self):

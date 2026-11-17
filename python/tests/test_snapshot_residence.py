@@ -73,16 +73,17 @@ class ObservationTests(unittest.TestCase):
 
 
 class ObservationHostTests(unittest.IsolatedAsyncioTestCase):
-    async def test_jev_original_credentials_do_not_rewind_future_task_timer(self):
+    async def test_safety_action_does_not_rewind_future_task_timer(self):
         b=board(task(start_at={'day':1,'phase':'night'},end_at={'phase':'day','next':True}))
         class Planner(FakePlanner):
             def __init__(self):super().__init__(b);self.goals=PriorityBoardExecutor()
             def update(self,s):self.goals.view(b,s);return b
         c=FakeClient();c.state=state(100,.2)
+        c.state['player']['vitals']['hunger']=10
         c.state['bridge']['available_actions']={'eat_safe_food':{'kind':'eat_safe_food'},'wait':{'kind':'wait'}}
         def advance(client):client.state['world']['time']+=.001;client.state['observed_at']+=.48
         c.hook=advance;p=Planner()
-        a=MCPAgent(c,lambda *_:{'answer':{'choice':'eat_safe_food'},'response':{'model':'offline'}},planner=p,execute=True,poll=.001)
+        a=MCPAgent(c,planner=p,execute=True,poll=.001)
         try:
             await asyncio.wait_for(a.cycle(),3)
             self.assertEqual(p.goals.view(b,c.state)['tasks'][0]['status'],'scheduled')
@@ -101,7 +102,7 @@ class ObservationHostTests(unittest.IsolatedAsyncioTestCase):
                 if polls>=3:
                     client.state['player']['position']['x']=0;client.state['places']['home']['arrived']=True;client.auto_complete=True
         c.hook=arrive
-        a=MCPAgent(c,lambda *_:self.fail('JEV must not arbitrate residence return'),planner=FakePlanner(b),execute=True,poll=.001)
+        a=MCPAgent(c,planner=FakePlanner(b),execute=True,poll=.001)
         try:
             await asyncio.wait_for(a.cycle(),3)
             self.assertGreaterEqual(polls,3)

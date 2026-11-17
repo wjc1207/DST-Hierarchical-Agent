@@ -10,11 +10,9 @@ from unittest.mock import patch
 
 from mcp_server.game_bridge import GameBridge, BridgeError
 from mcp_agent.mcp_agent import MCPAgent, MCPRejected, PlayerDead, SessionChanged, IncompatibleBridge
-from mcp_agent.mcp_agent import dispatch_for_navigation
 from mcp_agent.model_state import model_game_state
 from mcp_agent.action_sequence import validate_sequence
 from mcp_agent.priority_board import validate_goals
-from mcp_agent.jev_client import CONTINUE_MAIN_TASK
 from mcp_agent.daily_planner import DailyPlanner
 from common import timing_log as timing
 
@@ -30,11 +28,6 @@ def snapshot():
                        "available_actions": {"collect_grass": {"kind": "collect", "guid": 20,
                                                 "prefab": "grass", "product": "cutgrass"},
                                              "wait": {"kind": "wait"}}}}
-
-
-def answer(_s, criteria, _plan):
-    choice = "collect_grass" if "collect_grass" in criteria else next(iter(criteria))
-    return {"answer": {"choice": choice, "confidence": 0.1}, "response": {"model": "offline"}}
 
 
 def board():
@@ -117,8 +110,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.client = FakeClient()
         self.agents = []
 
-    def agent(self, decide=answer, **options):
-        instance = MCPAgent(self.client, decide, poll=0.001, navigator=options.pop("navigator", FakeNavigator()), **options)
+    def agent(self, **options):
+        instance = MCPAgent(self.client, poll=0.001, navigator=options.pop("navigator", FakeNavigator()), **options)
         self.agents.append(instance)
         return instance
 
@@ -127,55 +120,41 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             await agent.shutdown()
 
     async def test_atomic_state_shared_projection_and_dry_run_is_read_only(self):
-        seen = []
-        def decide(s, c, p):
-            seen.append((s, c))
-            return answer(s, c, p)
-        agent = self.agent(decide)
+        agent = self.agent()
         await agent.cycle()
         self.assertEqual({name for name, _ in self.client.calls}, {"get_available_actions"})
-        self.assertEqual(seen[0][0]["bridge"]["available_actions"], agent.packet["actions"])
-        facts = model_game_state(seen[0][0])
+        self.assertEqual(agent.packet["state"]["bridge"]["available_actions"], agent.packet["actions"])
+        facts = model_game_state(agent.packet["state"])
         self.assertEqual(facts["control"]["execution_owner"], "lua")
         self.assertEqual(facts["control"]["available_actions"], agent.packet["actions"])
 
     async def test_native_execution_records_once_and_polls_planner(self):
         planner = FakePlanner()
         agent = self.agent(planner=planner, execute=True)
-        await agent.cycle()
+        packet = await agent.observe()
+        await agent.perform("collect_grass", packet)
         starts = [args for name, args in self.client.calls if name == "start_action"]
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0]["choice"], "collect_grass")
         self.assertEqual(planner.events, [("collect_grass", "executed")])
-        self.assertGreaterEqual(planner.updates, 3)
+        self.assertGreaterEqual(planner.updates, 2)
         self.assertIsNone(agent.active_id)
         agent.record({"action_id": next(iter(agent.seen_actions)), "choice": "collect_grass", "status": "completed"}, self.client.state)
         self.assertEqual(len(planner.events), 1)
 
-    async def test_navigation_is_executor_owned_and_not_jev(self):
-        def forbidden(*_):
-            raise AssertionError("exploration must not call JEV")
-        nav = {"kind": "explore", "mode": "search", "x": 4, "z": 0}
-        self.client.state["bridge"]["available_actions"]["explore_other_region"] = nav
-        agent = self.agent(forbidden, navigator=FakeNavigator("explore_other_region"))
-        await agent.cycle()
-        dispatch = dispatch_for_navigation(self.client.state["bridge"]["available_actions"], self.client.state)
-        self.assertEqual(dispatch["explore_other_region"]["search_region_id"], "A")
 
-    async def test_lua_board_ack_then_pause_before_manual_decision(self):
+    async def test_lua_board_ack_then_pause(self):
         planner = FakePlanner(board())
-        def decide(s, c, p):
-            self.assertFalse(s["bridge"]["board_auto_execute"])
-            self.assertTrue(agent.board_acked)
-            return answer(s, c, p)
-        agent = self.agent(decide, planner=planner, execute=True)
+        agent = self.agent(planner=planner, execute=True)
         await agent.cycle()
         modes = [args["auto_execute"] for name, args in self.client.calls if name == "submit_task_board"]
         self.assertEqual(modes, [True, False])
+        self.assertTrue(agent.board_acked)
+        self.assertFalse(agent.auto_enabled)
         await agent.cycle()
         self.assertEqual([args["auto_execute"] for name, args in self.client.calls if name == "submit_task_board"], modes)
 
-    async def test_board_runs_many_actions_without_per_plant_jev_requests(self):
+    async def test_legacy_board_runs_many_actions(self):
         planner = FakePlanner(board())
         count = 0
         def tick(client):
@@ -190,191 +169,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 planner.plan = None
                 b["available_actions"] = {"wait": {"kind": "wait"}}
         self.client.hook = tick
-        agent = self.agent(lambda *_: self.fail("board work should not ask JEV"), planner=planner, execute=True)
+        agent = self.agent(planner=planner, execute=True)
         await agent.cycle()
         self.assertEqual(count, 2)
         self.assertEqual(planner.events, [("collect_grass", "executed")] * 2)
         self.assertFalse(agent.auto_enabled)
 
-    async def test_game_changes_keep_one_request_and_deliver_original_target_to_lua(self):
-        for field in ("phase", "guid", "health", "inventory", "threat", "unavailable"):
-            self.client = FakeClient()
-            started, release = threading.Event(), threading.Event()
-            def decide(s, c, p):
-                started.set()
-                release.wait(2)
-                return answer(s, c, p)
-            def change(client):
-                if started.is_set():
-                    if field == "phase":
-                        client.state["world"]["phase"] = "night"
-                    elif field == "guid":
-                        client.state["bridge"]["available_actions"]["collect_grass"]["guid"] = 21
-                    elif field == "health":
-                        client.state["player"]["vitals"]["health"] -= 1
-                    elif field == "inventory":
-                        client.state["player"]["inventory"]["items"] = [{"prefab": "cutgrass", "count": 3}]
-                    elif field == "threat":
-                        client.state["nearby"] = [{"guid": 99, "activeThreat": True}]
-                    else:
-                        client.state["bridge"]["available_actions"].pop("collect_grass", None)
-                    release.set()
-            self.client.hook = change
-            agent = self.agent(decide, execute=True)
-            try:
-                with timing.CycleTrace(1, emit_console=False) as trace:
-                    await agent.cycle()
-            finally:
-                release.set()
-            starts = [args for n, args in self.client.calls if n == "start_action"]
-            self.assertEqual(len(starts), 1, field)
-            record = next(iter(self.client.bridge.actions.values()))
-            self.assertEqual(record["action"]["guid"], 20, "must not silently switch to GUID 21")
-            self.assertNotIn("model_discard_reason", trace.record)
-            self.assertEqual(sum(e["stage"] == "decision.submitted" for e in trace.record["events"]), 1)
-
-    async def test_flee_request_survives_repeated_damage_and_changing_hostiles(self):
-        started, release = threading.Event(), threading.Event()
-        self.client.state["bridge"]["available_actions"] = {"flee_from_nearest_hostile": {
-            "kind": "flee_from_nearest_hostile", "x": 6, "z": 0}}
-        polls = 0
-        def decide(s, criteria, plan):
-            started.set()
-            release.wait(2)
-            return answer(s, criteria, plan)
-        def damage(client):
-            nonlocal polls
-            if started.is_set():
-                polls += 1
-                client.state["player"]["vitals"]["health"] -= 5
-                client.state["nearby"] = [{"guid": 99+polls, "activeThreat": True}]
-                if polls >= 3: release.set()
-        self.client.hook = damage
-        agent = self.agent(decide, execute=True)
-        try:
-            with timing.CycleTrace(1, emit_console=False) as trace:
-                await agent.cycle()
-        finally:
-            release.set()
-        self.assertGreaterEqual(polls, 3)
-        self.assertEqual([args["choice"] for n, args in self.client.calls if n == "start_action"],
-                         ["flee_from_nearest_hostile"])
-        self.assertNotIn("model_discard_reason", trace.record)
-
-    async def test_lifecycle_changes_during_request_never_deliver_an_answer(self):
-        for field, error in (("player", SessionChanged), ("session", SessionChanged), ("dead", PlayerDead)):
-            self.client = FakeClient()
-            started, release = threading.Event(), threading.Event()
-            def decide(*args):
-                started.set()
-                release.wait(2)
-                return answer(*args)
-            def change(client):
-                if not started.is_set(): return
-                if field == "player": client.state["player"]["guid"] = 99
-                elif field == "session":
-                    client.bridge.received = -999
-                    client.session = "another-world"
-                else: client.state["player"]["vitals"]["dead"] = True
-                release.set()
-            self.client.hook = change
-            agent = self.agent(decide, execute=True)
-            try:
-                with self.subTest(field=field), self.assertRaises(error): await agent.cycle()
-            finally:
-                release.set()
-            self.assertFalse(any(n == "start_action" for n, _ in self.client.calls))
-
-    async def test_model_cannot_invent_a_choice_outside_its_request(self):
-        for choice in ("craft_torch", CONTINUE_MAIN_TASK):
-            with self.subTest(choice=choice):
-                agent = self.agent(lambda *_, chosen=choice: {"answer": {"choice": chosen}}, execute=True)
-                with self.assertRaisesRegex(RuntimeError, "outside the requested options"):
-                    await agent.cycle()
-                self.assertFalse(any(n == "start_action" for n, _ in self.client.calls))
-
-    async def test_old_actionable_snapshot_refreshes_once_before_decision_not_during_inference(self):
-        original = self.client.call_tool
-        async def cached(name, arguments):
-            result = await original(name, arguments)
-            if name == "get_available_actions": result.structured_content["state_age_ms"] = 5000
-            return result
-        self.client.call_tool = cached
-        agent = self.agent(execute=True)
-        await agent.cycle()
-        refreshes = [args for n, args in self.client.calls if n == "get_available_actions" and args.get("refresh")]
-        self.assertEqual(len(refreshes), 1)
-        self.assertTrue(any(n == "start_action" for n, _ in self.client.calls))
-
-    async def test_old_wait_only_snapshot_does_not_force_full_upload_on_each_idle_poll(self):
-        self.client.state["bridge"]["available_actions"] = {"wait": {"kind": "wait"}}
-        original = self.client.call_tool
-        async def cached(name, arguments):
-            result = await original(name, arguments)
-            if name == "get_available_actions": result.structured_content["state_age_ms"] = 15000
-            return result
-        self.client.call_tool = cached
-        agent = self.agent(lambda *_: self.fail("wait-only does not need a model"), execute=True)
-        await agent.cycle()
-        await agent.cycle()
-        self.assertFalse(any(args.get("refresh") for n, args in self.client.calls if n == "get_available_actions"))
-
-    async def test_expired_model_observation_is_not_silently_renewed(self):
-        started, release = threading.Event(), threading.Event()
-        def decide(*args):
-            started.set()
-            release.wait(2)
-            return answer(*args)
-        def expire(client):
-            if started.is_set():
-                identity = next(iter(client.bridge.observations))
-                session, _, owner, actions = client.bridge.observations[identity]
-                client.bridge.observations[identity] = (session, -100, owner, actions)
-                release.set()
-        self.client.hook = expire
-        agent = self.agent(decide, execute=True)
-        try:
-            with self.assertRaisesRegex(MCPRejected, "Observation expired"):
-                await agent.cycle()
-        finally:
-            release.set()
-        self.assertFalse(self.client.bridge.actions)
-
-    async def test_wait_handoff_to_navigation_uses_a_new_observation(self):
-        started, release = threading.Event(), threading.Event()
-        def decide(*_):
-            started.set()
-            release.wait(2)
-            return {"answer": {"choice": "wait"}, "response": {"model": "offline"}}
-        def discover(client):
-            if started.is_set():
-                client.state["bridge"]["available_actions"]["explore_other_region"] = {
-                    "kind": "explore", "mode": "search", "x": 4, "z": 0}
-                release.set()
-        self.client.hook = discover
-        agent = self.agent(decide, execute=True,
-                           navigator=FakeNavigator("explore_other_region", handoff=True))
-        try:
-            await agent.cycle()
-        finally:
-            release.set()
-        record = next(iter(self.client.bridge.actions.values()))
-        self.assertEqual(record["choice"], "explore_other_region")
-        self.assertNotIn("navigation_targets", record["action"], "gap/no-plan navigation retains resource events")
-
-    async def test_pending_planning_does_not_block_fill_gap_action(self):
-        planner = FakePlanner(None)
-        agent = self.agent(planner=planner, execute=True)
-        await agent.cycle()
-        self.assertTrue(any(n == "start_action" for n, _ in self.client.calls))
-        self.assertFalse(any(n == "submit_task_board" for n, _ in self.client.calls))
-
-    async def test_priority_board_executes_visible_lower_goal_without_jev_or_lua_board_upload(self):
+    async def test_priority_board_executes_visible_lower_goal_without_lua_board_upload(self):
         plan = validate_goals({"goal":"Get gold and grass","tasks":[
             {"id":"gold","title":"Gold","priority":1,"target":{"type":"inventory","prefab":"goldnugget","count":1}},
             {"id":"grass","title":"Grass","priority":2,"target":{"type":"inventory","prefab":"cutgrass","count":2}}]}, 1)
         plan["board_id"] = "goals:1"
-        agent = self.agent(lambda *_: self.fail("visible goal must not ask JEV"), planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         await agent.cycle(); await agent.cycle()
         self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"], ["collect_grass"]*2)
         self.assertFalse(any(n=="submit_task_board" for n,_ in self.client.calls))
@@ -389,8 +195,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if client.bridge.active:
                 client.state["nearby"]=[{"prefab":"sciencemachine","game_prefab":"researchlab","guid":42}]
         self.client.hook=replicate
-        agent=self.agent(lambda *_:self.fail("ready Science Machine goal must execute without JEV"),
-                         planner=planner,execute=True)
+        agent=self.agent(planner=planner,execute=True)
         await agent.cycle()
         self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"],["build_sciencemachine"])
         self.assertEqual(planner.events[-1],("build_sciencemachine","executed"))
@@ -398,52 +203,32 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.client.state["nearby"]=[]
         self.assertEqual(agent.goals.view(plan,self.client.state)["tasks"][0]["status"],"done")
 
-    async def test_jev_never_receives_science_machine_with_new_or_older_native_peers(self):
-        for marked in (False, True):
-            with self.subTest(planner_only=marked):
-                self.client=FakeClient()
-                self.client.state["bridge"]["available_actions"]["build_sciencemachine"]={
-                    "kind":"build_sciencemachine", "planner_only":marked}
-                seen=[]
-                def decide(s, criteria, _plan):
-                    seen.append(set(criteria))
-                    self.assertNotIn("build_sciencemachine", criteria)
-                    self.assertNotIn("build_sciencemachine", model_game_state(s)["control"]["available_actions"])
-                    return {"answer":{"choice":"collect_grass"}, "response":{}}
-                agent=self.agent(decide,execute=True)
-                await agent.cycle()
-                self.assertEqual(len(seen),1)
-                self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"],["collect_grass"])
 
     async def test_priority_board_navigation_never_requests_off_board_opportunities(self):
         plan = validate_goals({"goal":"Gold","tasks":[{"id":"gold","title":"Gold","target":{"type":"inventory","prefab":"goldnugget","count":1}}]}, 1)
         plan["board_id"] = "goals:1"
         self.client.state["bridge"]["available_actions"]["explore_other_region"] = {"kind":"explore","mode":"search","x":4,"z":0}
-        def decide(*_):
-            self.fail("off-board resources must not request JEV")
-        agent = self.agent(decide, planner=FakePlanner(plan), execute=True, navigator=FakeNavigator("explore_other_region"))
+        agent = self.agent(planner=FakePlanner(plan), execute=True, navigator=FakeNavigator("explore_other_region"))
         await agent.cycle()
         self.client.state["bridge"]["available_actions"]["collect_berries"] = {
             "kind":"collect", "prefab":"berries", "product":"berries", "guid":30}
         await agent.cycle()
         self.client.state["bridge"]["available_actions"].pop("collect_grass")
         await agent.cycle()
-        self.assertEqual(agent.request_index, 0)
         self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"], ["explore_other_region"]*3)
         for name, arguments in self.client.calls:
             if name == "start_action":
                 self.assertEqual(arguments["navigation_targets"], [{"type":"inventory","prefab":"goldnugget","count":1}])
         self.assertIn("wait", self.client.state["bridge"]["available_actions"])
 
-    async def test_resource_event_reschedules_newly_visible_board_work_without_jev(self):
+    async def test_resource_event_reschedules_newly_visible_board_work(self):
         plan = validate_goals({"goal":"Gold","tasks":[{"id":"gold","title":"Gold","target":{"type":"inventory","prefab":"goldnugget","count":1}}]}, 1)
         plan["board_id"] = "goals:1"
         replacement = validate_goals({"goal":"Grass","tasks":[{"id":"grass","title":"Grass","target":{"type":"inventory","prefab":"cutgrass","count":2}}]}, 1)
         replacement["board_id"] = "goals:2"
         planner = FakePlanner(plan)
         self.client.state["bridge"]["available_actions"]["explore_other_region"] = {"kind":"explore","mode":"search","x":4,"z":0}
-        agent = self.agent(lambda *_: self.fail("board navigation/work must not ask JEV"),
-                           planner=planner, execute=True, navigator=FakeNavigator("explore_other_region"))
+        agent = self.agent(planner=planner, execute=True, navigator=FakeNavigator("explore_other_region"))
         await agent.cycle()
         planner.plan = replacement
         await agent.cycle()
@@ -464,7 +249,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if client.bridge.active:
                 planner.plan=replacement
         self.client.hook=review
-        agent=self.agent(lambda *_:self.fail("board review must not call JEV"),planner=planner,
+        agent=self.agent(planner=planner,
                          execute=True,navigator=FakeNavigator("explore_other_region"))
         await asyncio.wait_for(agent.cycle(),1)
         self.assertIsNone(agent.active_id)
@@ -475,17 +260,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"],
                          ["explore_other_region","collect_grass"])
 
-    async def test_blocked_focus_waits_for_review_instead_of_jev_gap_or_unrelated_navigation(self):
+    async def test_blocked_focus_waits_without_unrelated_navigation(self):
         plan = validate_goals({"goal":"Light first", "tasks":[
             {"id":"torch", "title":"Torch", "focus":True, "target":{"type":"inventory", "prefab":"torch", "count":1}},
             {"id":"grass", "title":"Grass", "target":{"type":"inventory", "prefab":"cutgrass", "count":2}}]}, 1)
         plan["board_id"] = "focus:1"
         self.client.state["bridge"]["available_actions"]["explore_other_region"] = {"kind":"explore", "mode":"search", "x":4, "z":0}
-        agent = self.agent(lambda *_:self.fail("unfinished focus cannot hand optional work to JEV"),
-                           planner=FakePlanner(plan), execute=True, navigator=FakeNavigator("explore_other_region"))
+        agent = self.agent(planner=FakePlanner(plan), execute=True, navigator=FakeNavigator("explore_other_region"))
         with timing.CycleTrace(1, None, emit_console=False) as trace:
             await agent.cycle()
-        self.assertEqual(trace.record["decision_source"], "focus_pending")
+        self.assertEqual(trace.record["decision_source"], "waiting_for_board")
         self.assertFalse(any(n == "start_action" for n, _ in self.client.calls))
 
     async def test_focus_navigation_targets_exclude_visible_ordinary_grass(self):
@@ -494,91 +278,26 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             {"id":"grass", "title":"Grass", "target":{"type":"inventory", "prefab":"cutgrass", "count":2}}]}, 1)
         plan["board_id"] = "focus:1"
         self.client.state["bridge"]["available_actions"]["explore_other_region"] = {"kind":"explore", "mode":"search", "x":4, "z":0}
-        agent = self.agent(lambda *_:self.fail("focus navigation must not ask JEV"), planner=FakePlanner(plan),
+        agent = self.agent(planner=FakePlanner(plan),
                            execute=True, navigator=FakeNavigator("explore_other_region"))
         await agent.cycle()
         starts = [a for n, a in self.client.calls if n == "start_action"]
         self.assertEqual(starts[0]["choice"], "explore_other_region")
         self.assertEqual(starts[0]["navigation_targets"], [{"type":"inventory", "prefab":"goldnugget", "count":1}])
 
-    async def test_promoting_a_blocked_focus_discards_an_inflight_optional_model_choice(self):
-        def light_board(focus):
-            result = validate_goals({"goal":"Light", "tasks":[{"id":"torch", "title":"Torch", "focus":focus,
-                "target":{"type":"inventory", "prefab":"torch", "count":1}}]}, 1)
-            result["board_id"] = "focus:2" if focus else "ordinary:1"
-            return result
-        planner = FakePlanner(light_board(False))
-        def decide(*_):
-            planner.plan = light_board(True)
-            return {"answer":{"choice":"collect_grass"}, "response":{}}
-        agent = self.agent(decide, planner=planner, execute=True)
-        await agent.cycle()
-        self.assertFalse(any(n == "start_action" for n, _ in self.client.calls))
-
-    async def test_safety_still_preempts_a_blocked_focused_task(self):
-        plan = validate_goals({"goal":"Light", "tasks":[{"id":"torch", "title":"Torch", "focus":True,
-            "target":{"type":"inventory", "prefab":"torch", "count":1}}]}, 1)
-        plan["board_id"] = "focus:1"
-        self.client.state["player"]["vitals"].update(health=20, health_max=150)
-        seen = []
-        def decide(_state, _criteria, board):
-            seen.append(board["handoff_reason"])
-            return {"answer":{"choice":"wait"}, "response":{}}
-        agent = self.agent(decide, planner=FakePlanner(plan), execute=True)
-        await agent.cycle()
-        self.assertEqual(seen, ["safety"])
-        self.assertEqual([a["choice"] for n, a in self.client.calls if n == "start_action"], ["wait"])
-
-    async def test_low_vitals_request_safety_without_carried_food_and_wait_is_not_repeated(self):
-        for name, maximum in (("sanity", 200), ("hunger", 150), ("health", 150)):
-            with self.subTest(vital=name):
-                self.client = FakeClient()
-                plan = validate_goals({"goal":"Grass","tasks":[{"id":"grass","title":"Grass",
-                    "target":{"type":"inventory","prefab":"cutgrass","count":10}}]}, 1)
-                plan["board_id"] = "goals:1"
-                self.client.state["player"]["vitals"].update({name:maximum*.29, name+"_max":maximum})
-                seen = []
-                def decide(_s, criteria, requested):
-                    seen.append(requested["handoff_reason"])
-                    self.assertIn("wait", criteria)
-                    self.assertNotIn(CONTINUE_MAIN_TASK, criteria)
-                    return {"answer":{"choice":"wait"},"response":{}}
-                agent = self.agent(decide, planner=FakePlanner(plan), execute=True)
-                await agent.cycle(); await agent.cycle()
-                self.assertEqual(seen, ["safety"])
-                self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"],
-                                 ["wait", "collect_grass"])
-                # A newly reachable remedy and a fresh native damage event both re-arm safety.
-                self.client.state["bridge"]["available_actions"]["collect_flower"] = {
-                    "kind":"collect","product":"petals","guid":40}
-                await agent.cycle()
-                agent.goals.needs_safety_decision = True
-                await agent.cycle()
-                self.assertEqual(seen, ["safety"]*3)
-                self.client.state["player"]["vitals"][name] = maximum*.5
-                await agent.cycle()
-                self.client.state["player"]["vitals"][name] = maximum*.29
-                await agent.cycle()
-                self.assertEqual(seen, ["safety"]*4)
-
     async def test_priority_board_safety_preempts_visible_work_then_resumes(self):
         plan = validate_goals({"goal":"Grass","tasks":[{"id":"grass","title":"Grass","target":{"type":"inventory","prefab":"cutgrass","count":2}}]}, 1)
         plan["board_id"] = "goals:1"
         self.client.state["nearby"] = [{"prefab":"hound","activeThreat":True}]
         self.client.state["bridge"]["available_actions"] = {"flee_from_nearest_hostile":{"kind":"flee_from_nearest_hostile"}}
-        seen = []
-        def decide(_s, _c, p):
-            seen.append(p["handoff_reason"])
-            return {"answer":{"choice":"flee_from_nearest_hostile"},"response":{}}
-        agent = self.agent(decide, planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         await agent.cycle()
         self.client.state["nearby"] = []
         self.client.state["bridge"]["available_actions"] = snapshot()["bridge"]["available_actions"]
         await agent.cycle()
-        self.assertEqual(seen, ["safety"])
         self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"], ["flee_from_nearest_hostile","collect_grass"])
 
-    async def test_priority_board_native_failure_keeps_goal_and_does_not_call_jev_to_replace_it(self):
+    async def test_priority_board_native_failure_keeps_goal(self):
         plan = validate_goals({"goal":"Grass","tasks":[{"id":"grass","title":"Grass","target":{"type":"inventory","prefab":"cutgrass","count":2}}]}, 1)
         plan["board_id"] = "goals:1"
         def tick(client):
@@ -587,32 +306,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 client.bridge.exchange({"token":client.bridge.token,"session_id":client.session,"sequence":client.sequence,
                     "state":client.state,"action_report":{"action_id":client.bridge.active,"status":"failed","reason":"action_unavailable"}})
         self.client.hook = tick
-        agent = self.agent(lambda *_: self.fail("goal failure must stay local"), planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         await agent.cycle(); await agent.cycle()
         self.assertEqual(agent.goals.view(plan,self.client.state)["status"], "active")
         self.assertEqual(sum(n=="start_action" for n,_ in self.client.calls),1)
 
-    async def test_unavailable_board_requests_ds_once_and_jev_acts_without_idle_delay(self):
-        planner = DailyPlanner("offline", board_log_dir=None)
-        self.addCleanup(planner.close)
-        planner.plan = validate_goals({"goal":"Light","tasks":[{"id":"campfire","title":"Fire",
-            "target":{"type":"structure","prefab":"campfire"}}]}, 1)
-        planner.plan["board_id"] = "goals:fire"
-        planner.requested_slot = (1, 0)
-        planner.goal_retry_at = time.monotonic() + 100
-        pending = Future(); seen = []
-        def decide(s, criteria, plan):
-            seen.append(plan["handoff_reason"])
-            self.assertNotIn(CONTINUE_MAIN_TASK, criteria)
-            return answer(s, criteria, plan)
-        agent = self.agent(decide, planner=planner, execute=True)
-        with patch.object(planner.executor, "submit", return_value=pending) as submit:
-            await agent.cycle(); await agent.cycle()
-        self.assertEqual(submit.call_count, 1)
-        self.assertEqual(submit.call_args.args[5]["replan_reason"], "no_feasible_action_or_route")
-        self.assertEqual(seen, ["planning_gap", "planning_gap"])
-        self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"], ["collect_grass"]*2)
-        self.assertEqual(agent.plan["tasks"][0]["id"], "campfire")
 
     async def test_idle_boards_request_ds_before_quarter_and_do_not_loop(self):
         scheduled = {"id":"later", "title":"Later", "start_at":{"day":1,"progress":.9},
@@ -629,7 +327,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 planner.plan = {**plan, "board_id":"idle:1"}
                 planner.requested_slot = (1, 0); planner.goal_retry_at = time.monotonic() + 100
                 pending = Future()
-                agent = self.agent(answer, planner=planner, execute=True)
+                agent = self.agent(planner=planner, execute=True)
                 with patch.object(planner.executor, "submit", return_value=pending) as submit:
                     await agent.cycle()
                     self.assertEqual(submit.call_args.args[5]["replan_reason"], reason)
@@ -638,56 +336,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(submit.call_count, 1)
                 self.assertTrue(all(t["status"] in {"scheduled", "blocked"} for t in agent.plan["tasks"]))
 
-    async def test_ds_ready_during_gap_decision_discards_temporary_choice_and_resumes_board(self):
-        planner = DailyPlanner("offline", board_log_dir=None)
-        self.addCleanup(planner.close)
-        planner.plan = validate_goals({"goal":"Light","tasks":[{"id":"campfire","title":"Fire",
-            "target":{"type":"structure","prefab":"campfire"}}]}, 1)
-        planner.plan["board_id"] = "goals:fire"
-        planner.requested_slot = (1, 0)
-        planner.goal_retry_at = time.monotonic() + 100
-        replacement = validate_goals({"goal":"Grass","tasks":[{"id":"grass","title":"Grass",
-            "target":{"type":"inventory","prefab":"cutgrass","count":2}}]}, 1)
-        pending = Future(); started, release = threading.Event(), threading.Event()
-        self.client.state["bridge"]["available_actions"]["collect_flower"] = {"kind":"collect","prefab":"flower","product":"petals","guid":30}
-        def decide(_s, _c, plan):
-            self.assertEqual(plan["handoff_reason"], "planning_gap")
-            started.set(); release.wait(2)
-            return {"answer":{"choice":"collect_flower"},"response":{}}
-        def finish_review(_client):
-            if started.is_set() and not pending.done():
-                pending.set_result((replacement, 1., None))
-                release.set()
-        self.client.hook = finish_review
-        agent = self.agent(decide, planner=planner, execute=True)
-        with patch.object(planner.executor, "submit", return_value=pending) as submit:
-            try:
-                await agent.cycle()
-            finally:
-                release.set()
-            self.assertFalse(any(n=="start_action" for n,_ in self.client.calls))
-            await agent.cycle()
-        self.assertEqual(submit.call_count, 1)
-        self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"], ["collect_grass"])
-
-    async def test_priority_board_daylight_change_gets_one_safety_choice_before_visible_work(self):
-        plan = validate_goals({"goal":"Grass","tasks":[{"id":"grass","title":"Grass","target":{"type":"inventory","prefab":"cutgrass","count":2}}]}, 1)
-        plan["board_id"]="goals:1"
-        agent=self.agent(lambda *_: self.fail("initial local goal must not call JEV"),planner=FakePlanner(plan),execute=True)
-        await agent.cycle()
-        seen=[]
-        def decide(_s,criteria,p):
-            seen.append(p["handoff_reason"])
-            self.assertIn("wait", criteria)
-            self.assertNotIn(CONTINUE_MAIN_TASK, criteria)
-            return {"answer":{"choice":"wait"},"response":{}}
-        agent.decide=decide
-        self.client.state["world"]["phase"]="dusk"
-        await agent.cycle(); await agent.cycle()
-        self.assertEqual(seen,["safety"])
-        self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"],["collect_grass","wait","collect_grass"])
-
-    async def test_sequence_collects_batch_then_crafts_without_per_item_jev_or_board_sync(self):
+    async def test_sequence_collects_batch_then_crafts_without_board_sync(self):
         plan = validate_sequence({"goal": "Make torch", "steps": [
             {"id": "grass", "action": "collect", "prefab": "cutgrass", "count": 2},
             {"id": "torch", "action": "craft", "prefab": "torch"}]}, 1)
@@ -707,7 +356,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             else:
                 inventory["items"] = [{"prefab": "torch", "count": 1}]
         self.client.hook = tick
-        agent = self.agent(lambda *_: self.fail("sequence should not call JEV"), planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         for _ in range(4):
             await agent.cycle()
         self.assertEqual(choices, ["collect_grass", "collect_grass", "craft_torch"])
@@ -730,7 +379,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 graph["current"]["observed_cells"] += 4
                 actions["collect_berrybush"] = {"kind": "collect", "guid": 99, "prefab": "berrybush", "product": "berries"}
         self.client.hook = tick
-        agent = self.agent(lambda *_: self.fail("resource discoveries should not call JEV"), planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         for _ in range(5):
             await agent.cycle()
         self.assertEqual(agent.sequence.status, "completed")
@@ -744,9 +393,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.client.state["nearby"] = [{"guid": 99, "activeThreat": True}]
         actions = self.client.state["bridge"]["available_actions"]
         actions["flee_from_nearest_hostile"] = {"kind": "flee_from_nearest_hostile"}
-        def flee(*_):
-            return {"answer": {"choice": "flee_from_nearest_hostile"}, "response": {"model": "offline"}}
-        agent = self.agent(flee, planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         await agent.cycle()
         self.assertEqual(agent.sequence.index, 0)
         self.client.state["nearby"] = []
@@ -768,8 +415,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     "sequence": client.sequence, "state": client.state,
                     "action_report": {"action_id": client.bridge.active, "status": "failed", "reason": "verification_timeout"}})
         self.client.hook = tick
-        agent = self.agent(lambda *_: self.fail("failed sequence must replan, not ask JEV to skip"),
-                           planner=FakePlanner(plan), execute=True)
+        agent = self.agent(planner=FakePlanner(plan), execute=True)
         await agent.cycle(); await agent.cycle()
         self.assertEqual(agent.sequence.status, "failed")
         self.assertEqual([a["choice"] for n, a in self.client.calls if n == "start_action"], ["collect_grass"])
@@ -848,37 +494,6 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mark["queue_to_delivery_ms"], 150)
         self.assertEqual(mark["terminal_cache_ms"], 20)
         self.assertLess(mark["at_ms"], 1000)  # Never subtract Lua time from host time.
-
-    async def test_model_worker_has_independent_trace_and_result_notice_measurement(self):
-        def decide(s, c, p):
-            with timing.span("api.fake_request"):
-                return answer(s, c, p)
-        agent = self.agent(decide)
-        with timing.CycleTrace(1, emit_console=False) as trace:
-            await agent.cycle()
-        events = trace.record["events"]
-        submitted = next(e for e in events if e["stage"] == "decision.submitted")
-        worker = next(e for e in events if e["stage"] == "decision.worker_completed")
-        notice = next(e for e in events if e["stage"] == "decision.result_observed")
-        self.assertEqual(submitted["request_id"], worker["request_id"])
-        self.assertEqual(worker["request_id"], notice["request_id"])
-        self.assertIn("api.fake_request", worker["worker_timing"]["totals"])
-        self.assertNotIn("api.fake_request", trace.record["totals"])
-        self.assertGreaterEqual(worker["worker_queue_ms"], 0)
-        self.assertGreaterEqual(notice["result_ready_to_notice_ms"], 0)
-        self.assertNotIn("inventory", str(worker))
-
-    async def test_model_failure_is_measured_without_changing_exception_or_logging_text(self):
-        def fail(*_):
-            raise RuntimeError("secret-body-do-not-log")
-        agent = self.agent(fail)
-        with timing.CycleTrace(1, emit_console=False) as trace:
-            with self.assertRaisesRegex(RuntimeError, "secret-body-do-not-log"):
-                await agent.cycle()
-        worker = next(e for e in trace.record["events"] if e["stage"] == "decision.worker_completed")
-        self.assertEqual(worker["worker_timing"]["error_type"], "RuntimeError")
-        self.assertNotIn("secret-body-do-not-log", str(trace.record))
-
 
 if __name__ == "__main__":
     unittest.main()

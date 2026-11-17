@@ -5,13 +5,25 @@ local Places=require("jev_companion_places")
 local M={}
 function M.new(env)
     local self={owners={}}
+    local function get_owner(userid)
+        local owner=self.owners[userid]
+        if not owner then
+            owner={userid=userid,slots={},roster_version=0}
+            self.owners[userid]=owner
+        end
+        return owner
+    end
+    local function get_actor(owner,slot)
+        local r=slot.engine.owners[owner.userid]
+        return r and r.buddy or slot.engine.spawned[owner.userid] or slot.actor
+    end
     local function roster(owner)
         local result={}
         for i=1,Names.MAX do
             local slot=owner.slots["buddy"..i]
             if slot then
                 local r=slot.engine.owners[owner.userid]
-                local a=r and r.buddy or slot.engine.spawned[owner.userid] or slot.actor
+                local a=get_actor(owner,slot)
                 result[#result+1]={id=slot.id,name=slot.name,guid=a and a:IsValid() and a.GUID or nil,
                     bound=r~=nil and r.buddy~=nil and r.buddy:IsValid(),dead=a and a:IsValid() and env.dead(a) or false}
             end
@@ -24,6 +36,15 @@ function M.new(env)
     local function create(owner,id,name)
         local slot={id=id,name=name};local wrapped={}
         for key,value in pairs(env) do wrapped[key]=value end
+        local function remember(a)
+            slot.actor=a
+            slot.engine.spawned[owner.userid]=a
+            a._jev_companion_slot=slot
+            a._jev_companion_id=id
+            a._jev_companion_created_for=owner.userid
+            a._jev_companion_name=slot.name
+        end
+        slot.remember=remember
         local function share(a)
             for _,other in pairs(owner.slots) do
                 local r=other.engine.owners[owner.userid]
@@ -40,7 +61,7 @@ function M.new(env)
             env.reply(player,packet)
         end
         wrapped.snapshot=function(player,a,r)
-            if a then slot.actor=a;a._jev_companion_slot=slot;a._jev_companion_name=slot.name;share(a) end
+            if a then remember(a);share(a) end
             local state=env.snapshot(player,a,r);state.buddy_id=id;state.buddy_name=slot.name
             return state
         end
@@ -85,11 +106,59 @@ function M.new(env)
         end end
         slot.engine=Core.new(wrapped);owner.slots[id]=slot;return slot
     end
+    function self:save()
+        local entries,references={},{}
+        for userid,owner in pairs(self.owners) do
+            for id,slot in pairs(owner.slots) do
+                local actor=get_actor(owner,slot)
+                local record,refs
+                if actor and actor:IsValid() and actor._jev_companion_slot==slot
+                    and (not actor.userid or actor.userid=="") then
+                    record,refs=env.save_buddy(actor)
+                elseif slot.restore_failed then
+                    record=slot.restore_failed
+                end
+                if record then
+                    entries[#entries+1]={userid=userid,id=id,name=slot.name,actor=record}
+                    for _,ref in pairs(refs or {}) do references[#references+1]=ref end
+                end
+            end
+        end
+        if #entries>0 then return {version=1,buddies=entries},references end
+    end
+    function self:load(data,newents)
+        if type(data)~="table" or data.version~=1 or type(data.buddies)~="table" then return end
+        -- Inventory children and their save IDs share the native post-load lookup.
+        local entities={}
+        for key,entry in pairs(newents) do entities[key]=entry end
+        for _,entry in ipairs(data.buddies) do
+            if type(entry)=="table" and type(entry.userid)=="string" and entry.userid~=""
+                and (entry.id=="buddy1" or entry.id=="buddy2") and type(entry.actor)=="table"
+                and entry.actor.prefab=="wilson" then
+                local name=Names.name(entry.name)
+                local owner=get_owner(entry.userid)
+                if name and not owner.slots[entry.id] then
+                    local slot=create(owner,entry.id,name)
+                    local actor=env.load_buddy(entry.actor,entities)
+                    if actor then
+                        slot.remember(actor)
+                        if env.set_name then env.set_name(actor,name) end
+                    else
+                        slot.restore_failed=entry.actor
+                    end
+                end
+            end
+        end
+        for key,entry in pairs(entities) do
+            if newents[key]==nil and entry.entity:IsValid() then
+                entry.entity:LoadPostPass(entities,entry.data)
+            end
+        end
+    end
     function self:request(player,q)
         if not player or not player:IsValid() or type(player.userid)~="string" or player.userid=="" or type(q)~="table"
             or type(q.id)~="string" or #q.id>100 or type(q.seq)~="number" or q.seq<1 or q.seq%1~=0 then return end
-        local owner=self.owners[player.userid]
-        if not owner then owner={userid=player.userid,slots={},roster_version=0};self.owners[player.userid]=owner end
+        local owner=get_owner(player.userid)
         if q.op=="roster" then
             env.reply(player,{id=q.id,seq=q.seq,op=q.op,status="completed",reason="roster",roster_version=owner.roster_version,roster=roster(owner)});return
         end
@@ -98,8 +167,7 @@ function M.new(env)
         local slot=owner.slots[id]
         if q.op=="delete" then
             local args=q.args
-            local record=slot and slot.engine.owners[owner.userid]
-            local actor=slot and (record and record.buddy or slot.engine.spawned[owner.userid] or slot.actor)
+            local actor=slot and get_actor(owner,slot)
             if not slot or type(args)~="table" or args.name~=slot.name
                 or args.roster_version~=owner.roster_version
                 or args.guid~=(actor and actor:IsValid() and actor.GUID or nil) then
@@ -129,6 +197,7 @@ function M.new(env)
             if not slot then slot=create(owner,id,name) end
         end
         if not slot then fail(player,q,owner,"buddy_not_summoned");return end
+        if slot.restore_failed then fail(player,q,owner,"companion_restore_failed");return end
         slot.engine:request(player,q)
     end
     function self:tick()

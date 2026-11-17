@@ -18,6 +18,7 @@ class PlanningClient:
         self.pending = None
         self.cancel = None
         self.versions = {}
+        self.request_markers = {}
         self.retry_at = 0
         self.blocked_until = {}
         self.finished = {}
@@ -85,6 +86,8 @@ class PlanningClient:
 
     async def cycle(self):
         snapshot = await self.rpc("get_planning_state")
+        if snapshot.get("paused"):
+            return
         members = snapshot["members"]
         if self.pending:
             if any(members.get(i, {}).get("version") != v or not members[i]["interaction"].get("enabled")
@@ -99,7 +102,6 @@ class PlanningClient:
             pending, self.pending = self.pending, None
             try:
                 user_message, assistant_message, plans = pending.result()
-                markers = {identity: self.marker(members[identity]) for identity in plans}
                 boards = {i: p for i, p in plans.items() if p.get("kind") == "task_board"}
                 replies = {i: p for i, p in plans.items() if i not in boards}
                 if boards:
@@ -121,10 +123,15 @@ class PlanningClient:
                 for identity in plans:
                     row = fresh.get(identity)
                     if row and row["intent_version"] == members[identity]["intent_version"]:
-                        # Preserve an immediate review when an accepted board is already complete.
                         marker = self.marker(row)
-                        if identity in boards and marker[2] == "all_tasks_completed" and markers[identity][2] != marker[2]:
-                            marker = markers[identity]
+                        requested = self.request_markers[identity]
+                        # Review an idle state the model has not seen. Once a
+                        # review leaves the same idle reason, wait for a change.
+                        if identity in boards and marker[2] in {
+                            "all_tasks_completed", "only_scheduled_tasks", "no_actionable_tasks",
+                            "search_or_prerequisite_blocked",
+                        } and requested[2] != marker[2]:
+                            marker = requested
                         self.handled[identity] = marker
                 return
             except Exception as exc:
@@ -151,6 +158,7 @@ class PlanningClient:
             for identity in requested:
                 self.blocked_until.pop(identity, None)
             self.versions = {identity: members[identity]["version"] for identity in requested}
+            self.request_markers = {identity: self.marker(members[identity]) for identity in requested}
             self.cancel = threading.Event()
             self.pending = asyncio.create_task(asyncio.to_thread(self.plan, snapshot, requested, self.cancel))
 

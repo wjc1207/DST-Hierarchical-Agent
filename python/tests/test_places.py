@@ -11,7 +11,6 @@ from mcp_agent import daily_planner
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
 from mcp_agent.navigation_intents import dispatch_for_navigation
 from mcp_agent.model_state import model_game_state
-from mcp_agent.mcp_agent import MCPAgent
 from test_mcp_agent import snapshot
 from test_recipes import Response
 
@@ -137,7 +136,7 @@ class PlacesTests(unittest.TestCase):
         again = next(t for t in runtime.view(merged, actual)["tasks"] if t["id"] == "visit_again")
         self.assertEqual(again["status"], "ready")
 
-    def test_jev_and_unprompted_exploration_do_not_receive_place_actions(self):
+    def test_place_actions_are_not_generic_navigation_choices(self):
         actual = self.actual()
         actions = {"wait": {"kind": "wait"}, "set_home_building:42": {
             "kind": "set_home", "anchor_id": "building:42", "planner_only": True},
@@ -147,11 +146,6 @@ class PlacesTests(unittest.TestCase):
         self.assertNotIn("places", facts)
         self.assertEqual(set(facts["control"]["available_actions"]), {"wait"})
         self.assertEqual(dispatch_for_navigation(actions, actual), {})
-        agent = MCPAgent(None, lambda *_: self.fail("No new JEV decision expected"))
-        try:
-            self.assertEqual(asyncio.run(agent.choose_local({"state": actual, "actions": actions}))[0], "wait")
-        finally:
-            agent.worker.shutdown()
 
     def test_deepseek_can_query_places_without_a_recipe_catalog(self):
         context = daily_planner.planning_context(self.actual(), [])

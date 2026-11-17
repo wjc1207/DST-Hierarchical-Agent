@@ -26,17 +26,6 @@ WORK_SOURCES = {
 FOOD_SEARCH_PRODUCT = "safe_food"
 
 
-def local_candidates(criteria, dispatch):
-    """Keep all navigation choices out of local model arbitration."""
-    actions = {k: a for k, a in dispatch.items() if a["kind"] != "explore" and not a.get("planner_only")
-               and k not in rules.PLANNER_ONLY_ACTIONS}
-    return {k: v for k, v in criteria.items() if k in actions}, actions
-
-
-def exploration_key(key):
-    return key.startswith(("explore_", "travel_region_", "navigate_resource_"))
-
-
 def dispatch_for_navigation(actions, state):
     """Adapt offered native IDs, never invent routes or coordinates."""
     region = (state.get("navigation", {}).get("graph") or {}).get("current_node")

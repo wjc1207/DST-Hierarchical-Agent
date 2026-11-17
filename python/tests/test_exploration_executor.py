@@ -5,7 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from mcp_agent import jev_client as jev_agent
 from common import timing_log as timing
 from mcp_agent.navigation_intents import ExplorationExecutor, sources_for
 from common.task_board import validate_board

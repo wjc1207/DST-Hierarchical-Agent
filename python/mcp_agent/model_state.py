@@ -1,4 +1,4 @@
-"""One shared game-fact projection for DeepSeek and JEV; no game or API I/O."""
+"""One shared game-fact projection for DeepSeek; no game or API I/O."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def model_game_state(state: dict) -> dict:
         "execution_context": execution_context,
         "refueling": state.get("refueling", {"available":False,"options":[]}),
         "thermal": state.get("thermal", {"available":False,"active":False}),
-        # Existing JEV convenience fields remain, and are now also sent to DeepSeek.
+        # Keep derived facts alongside the raw observation.
         "day": world.get("day"),
         "phase": world.get("phase"),
         "world_time": world.get("time"),

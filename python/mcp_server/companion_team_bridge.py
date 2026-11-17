@@ -31,6 +31,9 @@ class CompanionTeamBridge:
             state = payload.get("state")
             if not isinstance(state, dict) or state.get("team") is not True:
                 raise BridgeError("Companion team snapshot required; update DST Buddy Agent")
+            paused=state.get("paused", False)
+            if type(paused) is not bool:
+                raise BridgeError("Invalid companion pause state")
             members=state.get("members")
             if members==[]:members={}
             control=autonomy.settings({"autonomy":state.get("control")})
@@ -75,12 +78,12 @@ class CompanionTeamBridge:
                     for key,value in old.__dict__.items():
                         if key!="lock":setattr(candidate,key,copy.deepcopy(value))
                 response=candidate.exchange({"token":self.token,"session_id":session+"|"+identity,"sequence":sequence,
-                    "state":entry,"results":[r for r in results if isinstance(r,dict) and r.get("buddy_id")==identity]})
+                    "state":{**entry, "paused":paused},"results":[r for r in results if isinstance(r,dict) and r.get("buddy_id")==identity]})
                 staged[identity]=candidate
                 if response["command"]:commands.append({**response["command"],"buddy_id":identity})
                 feedback.extend({**r,"buddy_id":identity} for r in response["feedback"])
             self.members=staged;self.session=session;self.sequence=sequence;self.received=self.clock()
-            self.state={"team":True,"control":copy.deepcopy(control),"roster":copy.deepcopy(roster),
+            self.state={"team":True,"paused":paused,"control":copy.deepcopy(control),"roster":copy.deepcopy(roster),
                         "members":{key:copy.deepcopy(value.state) for key,value in staged.items()}}
             return {"server_id":self.server_id,"session_id":session,"sequence":sequence,"commands":commands,"feedback":feedback}
 

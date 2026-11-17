@@ -26,7 +26,7 @@ Requirements and the Python test runner live under `python/`.
 `.env`, `logs/` and the installed bridge token/config retain their locations.
 
 - `python/mcp_agent/daily_planner.py`: DeepSeek needs, priorities, dependencies and reviews.
-- `python/mcp_agent/jev_client.py`: bounded local choices for safety and planning gaps.
+- The MCP player executor applies local safety rules.
 - `python/mcp_agent/priority_board.py`: visible-first scheduling and search budgets.
 - `python/mcp_agent/navigation_intents.py`: source/region destinations and unknown-branch
   search. It chooses only navigation options already offered by Lua.
@@ -44,7 +44,7 @@ See [goal scheduling and Klei priors](GOAL_NAVIGATION.md) and
 ## Execution
 
 During daytime, the Lua executor automatically unequips a held torch to save
-fuel without asking JEV. Maintenance requires a live control connection and
+fuel. Maintenance requires a live control connection and
 works while idle or fleeing without replacing the current action/report. If
 the torch remains equipped, it retries once per second. Dusk and nighttime
 torch decisions retain their existing rules.
@@ -52,11 +52,7 @@ torch decisions retain their existing rules.
 DeepSeek reviews in the background without expiring goals every quarter. Visible
 feasible goals run first. Missing sources trigger remembered-position,
 known-source-room, worldgen-prior and unknown-branch search. Lua executes movement
-and native actions continuously; JEV handles only safety and planning gaps.
-Off-board opportunity arbitration is disabled. Known health, hunger or sanity below
-30% triggers safety even without a carried remedy; native threshold crossings
-interrupt running work. An unchanged situation acknowledged with `wait` resumes
-safe board work until remedies, danger bands or native safety events change.
+and native actions continuously. The executor handles threats, unsafe night light and critical hunger using available native actions.
 
 Board navigation sends ready local goals as optional `navigation_targets` in
 `start_action`. Lua ignores unrelated resource changes and yields only when a
@@ -64,8 +60,7 @@ live offered action can advance a still-unmet watched goal after four units.
 Pickup, tool/durability/path-checked tree/ore work, crafting, construction and
 food are covered. Trees and ore need not change the collectible resource set.
 The host checks planner changes and existing search budgets during movement,
-cancelling with acknowledgement before rescheduling. DS gaps omit the filter
-and keep their resource-event handoff. Safety remains immediate.
+cancelling with acknowledgement before rescheduling. Safety remains immediate.
 
 Known-region detours retain the committed physical entrance across incidental
 room-label changes. They switch entrances after reaching the selected next-hop
@@ -84,7 +79,7 @@ recipes can be placed without spending ingredients again. Completion requires
 observing the resulting entity; an observed manually built machine is also a
 persistent verified milestone.
 
-Once JEV selects escape, Lua redirects within that same action after about 0.8
+Once escape begins, Lua redirects within that same action after about 0.8
 seconds without 0.3 units of movement progress. Failed headings are avoided for
 eight seconds within two units of the failure position; the whole flee action
 never receives the ordinary 15-second failure cooldown. If every currently
@@ -94,12 +89,7 @@ live route set reports `no_safe_escape_route`. Reports/events retain
 explicit cancellation keep their previous semantics.
 
 If the board is missing, empty, completed, or has no feasible offered action/route,
-DeepSeek is asked to evaluate/update it immediately and JEV temporarily takes
-local control. One planner request runs at a time, with the existing 15-second
-error backoff and no intentional idle period before the first evaluation.
-Future goals are preserved; automatic execution resumes when a task becomes
-actionable. Pending gap choices yield to newly actionable board work before
-dispatch, while already running native actions keep their bounded lifecycle.
+DeepSeek evaluates the board. Existing tasks continue as they become runnable, and the executor waits during gaps.
 
 DeepSeek requests start with stable `system` rules and static knowledge: DSTKnowledge,
 the full Klei room-type/resource mapping, capabilities, canonical IDs/aliases and
@@ -123,7 +113,7 @@ before buffering and again before placement. No safe site hides the build option
 there is no unsafe fallback. A buffered campfire remains available for later
 placement without spending ingredients again.
 
-Both models receive `construction.campfire` status, reason and clearance facts.
+The planner receives `construction.campfire` status, reason and clearance facts.
 Timing includes `campfire_siting_ms`. This checks the construction site; it does
 not change later cooking approach behavior or identify the cause of health loss.
 

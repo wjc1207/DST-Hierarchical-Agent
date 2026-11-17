@@ -49,11 +49,10 @@ class StartupTests(unittest.TestCase):
 
     def test_host_fails_before_child_launch_models_or_observation_loop(self):
         listener = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
-        decide, planner = Mock(), Mock()
+        planner = Mock()
         try:
             with self.assertRaises(BridgePortUnavailable):
-                asyncio.run(run(SimpleNamespace(port=listener.server_port), decide, planner))
-            decide.assert_not_called()
+                asyncio.run(run(SimpleNamespace(port=listener.server_port), planner))
             planner.update.assert_not_called()
         finally:
             listener.server_close()

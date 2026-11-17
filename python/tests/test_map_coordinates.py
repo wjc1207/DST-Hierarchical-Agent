@@ -14,7 +14,7 @@ from common.task_board import board_view
 from mcp_agent import daily_planner as dp
 from mcp_agent.map_view import render_map
 from mcp_agent.priority_board import validate_goals, PriorityBoardExecutor, merge_goals
-from mcp_agent.navigation_intents import ExplorationExecutor, local_candidates
+from mcp_agent.navigation_intents import ExplorationExecutor
 from mcp_agent.mcp_agent import MCPAgent
 from mcp_server.game_bridge import GameBridge, BridgeError
 from test_mcp_agent import FakeClient, FakePlanner, snapshot
@@ -65,7 +65,6 @@ class CoordinatesTests(unittest.TestCase):
         selected=runner.choose(b,s,s['bridge']['available_actions'],ExplorationExecutor())
         self.assertEqual(selected[1],'move_to')
         self.assertEqual(selected[2]['coordinate_target'],{'x':12,'z':0,'arrival_radius':2})
-        self.assertFalse(local_candidates({}, {'move_to':selected[2]})[1])
 
     def test_unknown_map_and_old_mod_do_not_offer_coordinate_travel(self):
         s=state();s['bridge'].pop('coordinate_navigation')
@@ -227,7 +226,7 @@ class MapVisionTests(unittest.TestCase):
 class CoordinateAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_host_sends_dynamic_target_through_the_bridge(self):
         client=FakeClient();client.state=state()
-        agent=MCPAgent(client,lambda *_:self.fail('coordinate navigation must not call JEV'),
+        agent=MCPAgent(client,
                        planner=FakePlanner(board()),execute=True,poll=.001)
         try:
             await asyncio.wait_for(agent.cycle(),2)

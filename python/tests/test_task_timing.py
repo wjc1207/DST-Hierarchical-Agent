@@ -142,12 +142,12 @@ class TimingAgentTests(unittest.IsolatedAsyncioTestCase):
         for agent in self.agents:
             await agent.shutdown()
 
-    def agent(self,plan,decide=None,**kwargs):
-        agent=MCPAgent(self.client,decide or (lambda *_:self.fail("JEV should not arbitrate residence chores")),
+    def agent(self,plan,**kwargs):
+        agent=MCPAgent(self.client,
                        planner=FakePlanner(plan),execute=True,poll=.001,**kwargs)
         self.agents.append(agent);return agent
 
-    async def test_holding_does_not_hand_unrelated_exploration_to_jev(self):
+    async def test_holding_does_not_start_unrelated_exploration(self):
         self.client.state=actual(.1)
         self.client.state["bridge"]["available_actions"]={"wait":{"kind":"wait"},
             "explore_other_region":{"kind":"explore","mode":"search","x":30,"z":0}}
@@ -166,22 +166,19 @@ class TimingAgentTests(unittest.IsolatedAsyncioTestCase):
         queued=next(iter(self.client.bridge.actions.values()))["action"]
         self.assertEqual(queued["residence"]["x"],0)
 
-    async def test_start_time_interrupts_background_navigation(self):
+    async def test_scheduled_work_waits_without_exploring_and_runs_when_due(self):
         self.client.state=actual(.2)
         self.client.state["bridge"]["available_actions"]={"wait":{"kind":"wait"},
             "explore_other_region":{"kind":"explore","mode":"search","x":30,"z":0},
             "build_campfire":{"kind":"build_campfire"}}
         plan=board({"id":"fire","title":"Fire","start_at":{"day":1,"progress":.75},
                     "target":{"type":"structure","prefab":"campfire"}})
-        self.client.auto_complete=False
-        def start_timer(client):
-            if client.bridge.active:
-                client.state["world"].update(time=.8,phase="night")
-        self.client.hook=start_timer
         agent=self.agent(plan,navigator=FakeNavigator("explore_other_region"))
-        await asyncio.wait_for(agent.cycle(),2)
-        self.assertTrue(any(n=="cancel_action" for n,_ in self.client.calls))
-        self.assertEqual(next(iter(self.client.bridge.actions.values()))["status"],"cancelled")
+        await agent.cycle()
+        self.assertFalse(any(n=="start_action" for n,_ in self.client.calls))
+        self.client.state["world"].update(time=.8,phase="night")
+        await agent.cycle()
+        self.assertEqual([a["choice"] for n,a in self.client.calls if n=="start_action"],["build_campfire"])
 
     async def test_residence_end_interrupts_unfinished_compatible_work(self):
         self.client.state=actual(.1)
@@ -203,7 +200,7 @@ class TimingAgentTests(unittest.IsolatedAsyncioTestCase):
         self.client.state["nearby"]=[{"guid":99,"activeThreat":True}]
         self.client.state["bridge"]["available_actions"]={"wait":{"kind":"wait"},
             "flee_from_nearest_hostile":{"kind":"flee_from_nearest_hostile","dx":1,"dz":0,"distance":20}}
-        agent=self.agent(board(task(duration=.25)),lambda *_:{"answer":{"choice":"flee_from_nearest_hostile"},"response":{}})
+        agent=self.agent(board(task(duration=.25)))
         await agent.cycle()
         args=next(a for n,a in self.client.calls if n=="start_action")
         self.assertNotIn("residence",args)

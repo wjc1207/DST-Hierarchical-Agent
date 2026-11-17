@@ -7,7 +7,7 @@ from common import autonomy
 from mcp_agent.daily_planner import DailyPlanner
 from mcp_agent.mcp_agent import MCPAgent
 from mcp_server.game_bridge import GameBridge, BridgeError
-from test_mcp_agent import FakeClient, FakePlanner, answer
+from test_mcp_agent import FakeClient, FakePlanner
 from test_priority_board import PendingWorker, board, task, state
 
 
@@ -102,9 +102,10 @@ class HostAutonomyTests(unittest.IsolatedAsyncioTestCase):
             if peer.bridge.active:
                 peer.state["autonomy"] = {"enabled": False, "revision": 2}
         client.hook = disable_when_running
-        agent = MCPAgent(client, answer, execute=True, poll=.001)
+        agent = MCPAgent(client, execute=True, poll=.001)
         try:
-            await agent.cycle()
+            packet = await agent.observe()
+            await agent.perform("collect_grass", packet)
             self.assertIsNone(agent.active_id)
             self.assertTrue(any(name == "cancel_action" for name, _ in client.calls))
             starts = sum(name == "start_action" for name, _ in client.calls)
@@ -116,22 +117,7 @@ class HostAutonomyTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_mode_neither_calls_models_nor_sends_actions(self):
         client, planner = FakeClient(), FakePlanner()
         client.state["autonomy"] = {"enabled": False, "revision": 0}
-        def unexpected(*_):
-            raise AssertionError("Disabled mode called a model")
-        agent = MCPAgent(client, unexpected, planner=planner, execute=True, poll=.001)
-        try:
-            await agent.cycle()
-            self.assertFalse(any(name == "start_action" for name, _ in client.calls))
-        finally:
-            await agent.shutdown()
-
-    async def test_goal_edit_during_jev_call_discards_its_old_answer(self):
-        client = FakeClient()
-        client.state["autonomy"] = {"enabled": True, "revision": 1, "goal": "first"}
-        def decide(*args):
-            client.state["autonomy"] = {"enabled": True, "revision": 2, "goal": "second"}
-            return answer(*args)
-        agent = MCPAgent(client, decide, execute=True, poll=.001)
+        agent = MCPAgent(client, planner=planner, execute=True, poll=.001)
         try:
             await agent.cycle()
             self.assertFalse(any(name == "start_action" for name, _ in client.calls))

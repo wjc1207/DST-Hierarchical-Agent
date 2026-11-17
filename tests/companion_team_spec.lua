@@ -3,6 +3,7 @@ local Names=require("jev_companion_roster")
 local Server=require("jev_companion_team_server")
 local Client=require("jev_companion_team_client")
 local Places=require("jev_companion_places")
+local World=require("jev_companion_world")
 local passed=0
 local function test(name,fn) local ok,err=pcall(fn);assert(ok,name..": "..tostring(err));passed=passed+1;print("ok "..passed.." - "..name) end
 local function fixture()
@@ -28,12 +29,36 @@ local function fixture()
         say=function(a,text) w.spoken={guid=a.GUID,text=text};w.speeches=w.speeches or {};w.speeches[#w.speeches+1]=w.spoken end,validate_text=Client.validate_text,
         collect_target=function(_,id) return {guid=id,product="cutgrass"} end,count=function() return 0 end,collect=function() return true end}
     w.env=env;w.network={};w.server=Server.new(env)
-    w.client=Client.new({nonce="client",now=env.now,http_enabled=true,notice=function(text) w.notices[#w.notices+1]=text end,
+    w.client=Client.new({nonce="client",now=function() return w.wall or w.time end,sim_now=env.now,http_enabled=true,notice=function(text) w.notices[#w.notices+1]=text end,
         send=function(q) w.sent[#w.sent+1]=q;if w.delay then w.network[#w.network+1]=q else w.server:request(w.owner,q) end end,
         http=function(payload,callback) w.http=payload;callback({session_id=payload.session_id,sequence=payload.sequence,commands={},feedback=w.feedback or {}}) end})
     function w:record(id) return self.server.owners.A.slots[id].engine.owners.A end
     return w
 end
+test("paused heartbeat sends no gameplay RPC and resumes the same intent after a fresh snapshot",function()
+    local w=fixture()
+    w.client:summon("一号")
+    w.client:command("do @一号 采草")
+    w.time=2;w.wall=2;w.client:tick()
+    local child=w.client.children.buddy1
+    local revision,token=child.control.revision,child.token
+    local count=#w.sent
+    w.feedback={{buddy_id="buddy1",id="during-pause",revision=revision,finish=true,text="已完成"}}
+    for i=1,30 do
+        w.wall=2+i;w.client:tick(true)
+        assert(w.http.state.paused and #w.sent==count)
+        assert(child.control.enabled and child.control.revision==revision)
+    end
+    w.feedback=nil
+    w.delay=true;w.wall=33;w.time=2.1;w.client:tick()
+    assert(w.http.state.paused and child.control.enabled)
+    w.delay=false
+    for _,q in ipairs(w.network) do w.server:request(w.owner,q) end
+    w.wall=34;w.time=2.2;w.client:tick()
+    assert(not w.http.state.paused and child.control.enabled)
+    assert(child.control.revision==revision and child.token==token)
+end)
+
 test("mentions resolve exact owner-local names, multiple targets and all; unknown never widens scope",function()
     local roster={{id="buddy1",name="小威"},{id="buddy2",name="二号"}}
     local ids,body=Names.resolve("@小威 采草",roster);assert(#ids==1 and ids[1]=="buddy1" and body=="采草")
@@ -72,6 +97,74 @@ test("two named summons create two real actors and repeated summons reuse their 
     w.client:command("summon 小威");assert(w.spawns==2)
     w.client:command("summon 第三位");assert(w.spawns==2)
     assert(w.client.children.buddy1.token and w.client.children.buddy2.token)
+end)
+test("world save restores named companions, ghost state, inventory references and owner reservations",function()
+    local w=fixture()
+    w.client:summon("小威")
+    w.client:summon("二号")
+    local alive,ghost=w:record("buddy1").buddy,w:record("buddy2").buddy
+    alive.x=45
+    alive.components.health={IsDead=function() return false end}
+    ghost.components.health={IsDead=function() return true end}
+    function alive:GetSaveRecord()
+        return {prefab="wilson",x=self.x,data={inventory={cutgrass=5},health=70}},{99}
+    end
+    function ghost:GetSaveRecord()
+        return {prefab="wilson",x=self.x,data={health=0}}
+    end
+    w.client:command("release @小威")
+    local adapter=World.new({SpawnSaveRecord=function(record,entities)
+        local actor=w:actor(record.id+100)
+        actor.x=record.x
+        actor.dead=record.data.is_ghost
+        actor.components.health={IsDead=function() return actor.dead==true end}
+        actor.health=record.data.health
+        actor.inventory=record.data.inventory
+        actor.GetSaveRecord=record.data.is_ghost and ghost.GetSaveRecord or alive.GetSaveRecord
+        function actor:LoadPostPass(loaded,data)
+            assert(loaded[99].entity=="world entity")
+            assert(loaded[alive.GUID] and loaded[ghost.GUID])
+            assert(data==record.data)
+            self.post_loaded=true
+        end
+        entities[record.id]={entity=actor,data=record.data}
+        if record.data.inventory then
+            local item=w:actor(400)
+            function item:LoadPostPass(loaded)
+                assert(loaded[record.id].entity==actor)
+                actor.inventory_post_loaded=true
+            end
+            entities[item]={entity=item}
+        end
+        return actor
+    end})
+    w.env.save_buddy,w.env.load_buddy=adapter.save_buddy,adapter.load_buddy
+    local saved,refs=w.server:save()
+    assert(#saved.buddies==2 and #refs==1 and refs[1]==99)
+    local newents={[99]={entity="world entity"}}
+    local reloaded=Server.new(w.env)
+    reloaded:load(saved,newents)
+    reloaded:load(saved,newents)
+    assert(newents[alive.GUID]==nil and newents[ghost.GUID]==nil)
+    w.server=reloaded
+    local slots=reloaded.owners.A.slots
+    local restored,restored_ghost=slots.buddy1.actor,slots.buddy2.actor
+    assert(restored.post_loaded and restored.inventory_post_loaded and restored_ghost.post_loaded)
+    assert(restored.displayed_name=="小威" and restored_ghost.displayed_name=="二号")
+    assert(restored.x==45 and restored.health==70 and restored.inventory.cutgrass==5 and restored_ghost.dead)
+    assert(not restored._jev_companion_owner and not w:record("buddy1"))
+    local other=w:actor(8,"B")
+    reloaded:request(other,{id="other",seq=1,op="roster"})
+    assert(#w.packets[#w.packets].roster==0)
+    w.client:fetch_roster()
+    assert(not w.client.roster[1].bound and w.client.roster[2].dead)
+    w.client:summon("小威")
+    assert(w:record("buddy1").buddy==restored and w.spawns==2)
+    w.client:summon("二号")
+    assert(w.spawns==2 and w.packets[#w.packets].reason=="existing_companion_dead")
+    w.client:delete(w.client:panel_state().roster[2])
+    assert(not restored_ghost:IsValid())
+    assert(#reloaded:save().buddies==1)
 end)
 test("rapid summons are serialized against the authoritative roster even when RPC replies are delayed",function()
     local w=fixture();w.delay=true

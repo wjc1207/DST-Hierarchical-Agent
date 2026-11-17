@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 from common.thermal import heat_risk, refuel_pause
 from common import timing_log as timing
-from mcp_agent.navigation_intents import ExplorationExecutor, local_candidates
+from mcp_agent.navigation_intents import ExplorationExecutor
 from mcp_agent.priority_board import PriorityBoardExecutor
 from mcp_agent.mcp_agent import MCPAgent
 from mcp_agent.model_state import model_game_state
@@ -47,9 +47,10 @@ class ThermalFactsTests(unittest.TestCase):
         s['player']['vitals'].update(temperature=66,heat_warning_threshold=65)
         self.assertEqual(refuel_pause(p['tasks'][0]['target'],s),'temperature_too_high')
 
-    def test_cooling_never_enters_jev_options_even_if_marker_missing(self):
-        _,choices=local_candidates({}, {'cool_down':{'kind':'cool_down'},'wait':{'kind':'wait'}})
-        self.assertNotIn('cool_down',choices)
+    def test_compact_model_state_hides_native_cooling_action(self):
+        state = snapshot()
+        state["bridge"]["available_actions"]["cool_down"] = {"kind": "cool_down"}
+        self.assertNotIn("cool_down", model_game_state(state)["control"]["available_actions"])
 
     def test_hot_time_does_not_count_as_safe_residence(self):
         from mcp_agent.residence import update_residences
@@ -75,7 +76,7 @@ class ThermalFactsTests(unittest.TestCase):
 
 class ThermalAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_safety_bypasses_focus_residence_and_local_model(self):
-        client=FakeClient();agent=MCPAgent(client,lambda *_:self.fail('must not ask JEV'),poll=.001)
+        client=FakeClient();agent=MCPAgent(client,poll=.001)
         agent.plan=board();agent.plan['tasks'][0]['focus']=True;agent.goals.adopt(agent.plan)
         agent.goals.residence={'holding':True,'radius':1,'x':0,'z':0,'task_ids':['stay']}
         s=snapshot();s['thermal']={'active':True};s['player']['vitals']['temperature']=66
@@ -87,7 +88,7 @@ class ThermalAgentTests(unittest.IsolatedAsyncioTestCase):
         finally: await agent.shutdown()
 
     async def test_no_route_holds_and_hostile_yields(self):
-        agent=MCPAgent(FakeClient(),lambda *_:self.fail('must not ask JEV'),poll=.001);agent.perform=AsyncMock()
+        agent=MCPAgent(FakeClient(),poll=.001);agent.perform=AsyncMock()
         s=snapshot();s['thermal']={'active':True};packet={'state':s,'actions':{'wait':{'kind':'wait'}}}
         try:
             self.assertTrue(await agent.handle_thermal(packet));agent.perform.assert_not_awaited()
@@ -98,7 +99,7 @@ class ThermalAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_cooling_cycle_uses_native_action_without_goal_bounds(self):
         client=FakeClient();client.state['thermal']={'active':True};client.state['player']['vitals'].update(temperature=66,overheating=False)
         client.state['bridge']['available_actions']={'cool_down':{'kind':'cool_down','x':4,'z':0,'planner_only':True}}
-        agent=MCPAgent(client,lambda *_:self.fail('must not ask JEV'),execute=True,poll=.001)
+        agent=MCPAgent(client,execute=True,poll=.001)
         try:
             await agent.cycle()
             args=next(args for name,args in client.calls if name=='start_action')
@@ -109,7 +110,7 @@ class ThermalAgentTests(unittest.IsolatedAsyncioTestCase):
         client=FakeClient();client.state['player']['vitals'].update(temperature=67,overheating=False,freezing=False,heat_warning_threshold=65)
         client.state['thermal']={'active':True,'status':'cooling','reason':'move_away_from_heat'}
         client.state['refueling']={'targets':[{'building_id':'building:40','fire_section':4,'reason':'temperature_too_high'}]}
-        agent=MCPAgent(client,lambda *_:None,poll=.001)
+        agent=MCPAgent(client,poll=.001)
         try:
             with patch.object(timing,'annotate') as annotate:
                 await agent.observe()
@@ -122,7 +123,7 @@ class ThermalAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_auto_board_releases_ownership_before_cooling(self):
         client=FakeClient();client.state['thermal']={'active':True}
         client.state['bridge']['available_actions']={'cool_down':{'kind':'cool_down','x':4,'z':0,'planner_only':True}}
-        agent=MCPAgent(client,lambda *_:self.fail('must not ask JEV'),execute=True,poll=.001)
+        agent=MCPAgent(client,execute=True,poll=.001)
         # Use the already supported legacy board fixture rather than priority auto execution.
         agent.uploaded={'kind':'task_board','board_id':'legacy:1','goal':'Wait','tasks':[]}
         agent.uploaded_source='legacy:1';agent.auto_enabled=True;agent.board_acked=True

@@ -10,7 +10,6 @@ from unittest.mock import patch
 from mcp_agent.action_sequence import SequenceExecutor, validate_sequence, format_sequence
 from mcp_agent.daily_planner import DailyPlanner, request_plan
 from mcp_agent.navigation_intents import ExplorationExecutor
-from mcp_agent.jev_client import compact_game_state
 
 
 def state(**counts):
@@ -108,14 +107,11 @@ class SequenceTests(unittest.TestCase):
         executor.on_result("failed", "verification_timeout")
         self.assertEqual(executor.view(sequence, state())["status"], "failed")
 
-    def test_missing_recipe_does_not_execute_later_step_and_jev_sees_safety_role(self):
+    def test_missing_recipe_does_not_execute_later_step(self):
         sequence = plan({"action": "craft", "prefab": "axe"}, {"action": "collect", "prefab": "twigs", "count": 2})
         executor = SequenceExecutor()
         self.assertIsNone(executor.choose(sequence, state(), {"collect_sapling": {"kind": "collect", "product": "twigs"}}, None))
         self.assertEqual(executor.status, "failed")
-        compact = compact_game_state(state(), sequence)
-        self.assertIn("action_sequence", compact)
-        self.assertIn("safety", " ".join(compact["decision_guidance"]))
 
     def test_collection_reuses_known_source_bfs_and_unknown_branch_search_with_tool_checks(self):
         sequence = plan({"action": "collect", "prefab": "goldnugget", "count": 1})

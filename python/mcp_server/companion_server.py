@@ -30,7 +30,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
         "unequip requires a currently equipped item GUID and stows it without dropping overflow; can_unequip reports capacity/restrictions. "
         "When search is advertised, perception offers local terrain, hazards and validated short search points. "
         "Search accepts only offered points; resource_found is not inventory completion. "
-        "Use buddy_storage for nearby observed chest contents. give_owner, drop_item, deposit and withdraw move one unit per action; "
+        "Companion observations list carried foods and their per-serving hunger, sanity and health deltas. Use eat for named food. Use buddy_storage for nearby observed chest contents. give_owner, drop_item, deposit and withdraw move one unit per action; "
         "task_key and total_count preserve a cumulative receipt across retries. Never take items from owner inventory. "
         "Use buddy_places for buildings actually seen by the companion. visit_building={building_id} returns over long distances; "
         "unconfirmed means outside local observation, not missing. Ordinary move still has a 20-unit limit. "
@@ -51,7 +51,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
 
     @server.tool()
     def buddy_action(op: str, observation_id: str, args: dict[str, Any] | None = None, buddy_id: str | None = None) -> dict[str, Any]:
-        """Queue a native action. visit_building={building_id} accepts remembered buildings only, with up to 300 seconds of travel. work={target_guid,work:CHOP|MINE}, equip/unequip={item_guid}, craft={recipe_id}, place={recipe_id,x,z,radius?}, search={point_id,x,z,products:[prefab],timeout_seconds:0.2..8}. give_owner/drop_item={prefab,total_count:1..100,task_key}; deposit/withdraw additionally require container_guid. Poll actual results."""
+        """Queue a native action. visit_building={building_id} accepts remembered buildings only, with up to 300 seconds of travel. work={target_guid,work:CHOP|MINE}, equip/unequip={item_guid}, craft={recipe_id}, place={recipe_id,x,z,radius?}, search={point_id,x,z,products:[prefab],timeout_seconds:0.2..8}. eat/give_owner/drop_item={prefab,total_count:1..100,task_key}; deposit/withdraw additionally require container_guid. Poll actual results."""
         if op not in {"summon", "bind", "recipes"}:
             invoke(tasks.check_manual_action, buddy_id)
         return member("action",buddy_id,op,observation_id,args)

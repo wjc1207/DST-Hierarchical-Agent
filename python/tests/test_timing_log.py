@@ -7,25 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
-from mcp_agent import jev_client as jev_agent
 from common import timing_log as timing
 
 
 class TimingTests(unittest.TestCase):
-    def test_real_jev_client_records_packaging_headers_read_and_parse_without_request_content(self):
-        from fixtures import state
-        response = MagicMock()
-        response.read.return_value = json.dumps({"answers": {"next_action": {
-            "choice": "wait", "confidence": 1}}}).encode()
-        with patch.object(jev_agent.urllib.request, "urlopen", return_value=response):
-            with timing.CycleTrace(1, emit_console=False) as trace:
-                result = jev_agent.call_jev("https://offline.invalid", "secret-key-not-in-timing",
-                                           "fake", state([]), {"wait": "Wait"})
-        self.assertEqual(result["answer"]["choice"], "wait")
-        for name in ("api.encode_state", "api.encode_request", "api.response_headers",
-                     "api.read_body", "api.parse_response"):
-            self.assertIn(name, trace.record["totals"])
-        self.assertNotIn("secret-key-not-in-timing", json.dumps(trace.record))
 
 
     def test_nested_times_separate_parent_total_from_self_time(self):

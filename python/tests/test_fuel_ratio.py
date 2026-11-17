@@ -5,7 +5,7 @@ import unittest
 from common.refueling import validate_target, fuel_bounds
 from common.task_board import format_board
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
-from mcp_agent.navigation_intents import ExplorationExecutor, local_candidates
+from mcp_agent.navigation_intents import ExplorationExecutor
 from mcp_agent.mcp_agent import MCPAgent
 from test_refueling import actual as old_state, action as old_action, distant_fire
 from test_mcp_agent import FakeClient, FakePlanner
@@ -67,8 +67,6 @@ class FuelRatioTests(unittest.TestCase):
 
     def test_does_not_use_legacy_action_for_ratio_goal(self):
         r=PriorityBoardExecutor();self.assertIsNone(r.choose(plan(),actual(),{'legacy':old_action()},ExplorationExecutor()))
-        _,choices=local_candidates({}, {'add_fuel_ratio:40:log':action(),'wait':{'kind':'wait'}})
-        self.assertNotIn('add_fuel_ratio:40:log',choices)
 
     def test_at_expiry_lit_but_below_ratio_is_expired(self):
         p=plan(.5,duration=.25);r=PriorityBoardExecutor();view(r,p,actual(3))
@@ -131,7 +129,7 @@ class RatioHostTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for a in self.agents: await a.shutdown()
     def agent(self,p):
-        a=MCPAgent(self.client,lambda *_:self.fail('No JEV for ratio maintenance'),planner=FakePlanner(p),execute=True,poll=.001)
+        a=MCPAgent(self.client,planner=FakePlanner(p),execute=True,poll=.001)
         self.agents.append(a);return a
 
     async def test_monitor_low_add_then_monitor_without_changing_deadline(self):

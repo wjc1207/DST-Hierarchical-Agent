@@ -3,7 +3,6 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from mcp_agent import jev_client as jev_agent
 from mcp_agent.navigation_intents import ExplorationExecutor, usable_sources_for
 from fixtures import observed, route, native_navigation_dispatch
 from test_exploration_executor import board

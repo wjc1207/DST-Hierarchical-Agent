@@ -14,7 +14,7 @@ from common.companion_transfer import (COUNTED_TARGETS, STORAGE_TARGETS, TRANSFE
                                        validate_target as validate_transfer)
 
 CAPABILITIES = {"collect", "move", "follow", "stay", "recipes", "equip", "unequip", "work", "craft", "place", "search",
-                "storage", "give_owner", "drop_item", "receive_item", "visit_building", "timed_return"}
+                "storage", "give_owner", "drop_item", "receive_item", "visit_building", "timed_return", "eat"}
 RESOURCE_NAMES = {"grass": "cutgrass", "sapling": "twigs", "berrybush": "berries", "berrybush2": "berries",
                   "carrot_planted": "carrot", "reeds": "cutreeds", "logs": "log"}
 STORAGE_WAIT_SECONDS = 60
@@ -423,6 +423,8 @@ class CompanionTasks:
                 if not chest or not chest.get("contents_known"):
                     return task, "needs_replan", {"reason": "chest_unavailable"}
             if kind in COUNTED_TARGETS:
+                if kind == "eat" and not any(row.get("prefab") == target["prefab"] for row in observed.get("foods", [])):
+                    return task, "needs_replan", {"reason": "food_not_carried_or_inedible:" + target["prefab"]}
                 if kind in {"give_owner", "deposit", "drop_item"} and not (observed["buddy"].get("inventory") or {}).get(target["prefab"], 0):
                     return task, "needs_replan", {"reason": "transfer_source_missing:" + target["prefab"]}
                 if kind in {"give_owner", "deposit", "drop_item"}:

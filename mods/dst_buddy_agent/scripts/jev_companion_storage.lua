@@ -75,6 +75,24 @@ function M.stow(a,item)
     if item:IsValid() then inv:Equip(item) end
     return false,"unequip_not_stowed"
 end
+function M.item_receipt(r,args,op)
+    if type(args.task_key)~="string" or #args.task_key<1 or #args.task_key>64 or not args.task_key:match("^[%w_%-]+$")
+        or type(args.prefab)~="string" or #args.prefab>60 or not args.prefab:match("^[a-z0-9_]+$")
+        or type(args.total_count)~="number" or args.total_count<1 or args.total_count>100 or args.total_count%1~=0 then return nil,"invalid_transfer" end
+    r.transfer_totals=r.transfer_totals or {};r.transfer_order=r.transfer_order or {}
+    local row=r.transfer_totals[args.task_key]
+    if row and (row.op~=op or row.prefab~=args.prefab or row.container_guid~=args.container_guid) then return nil,"transfer_identity_changed" end
+    if not row then
+        -- Do not evict receipts: forgetting one would permit replaying its quantity.
+        if #r.transfer_order>=128 then return nil,"transfer_receipt_limit" end
+        row={op=op,prefab=args.prefab,container_guid=args.container_guid,count=0}
+        r.transfer_totals[args.task_key]=row
+    end
+    for i,key in ipairs(r.transfer_order) do if key==args.task_key then table.remove(r.transfer_order,i);break end end
+    r.transfer_order[#r.transfer_order+1]=args.task_key
+    return row
+end
+
 function M.new(G,E)
     local S={}
     local function chest(a,id)
@@ -87,23 +105,6 @@ function M.new(G,E)
         if c:IsOpenedByOthers(a) then return nil,"chest_busy" end
         return e
     end
-    local function ledger(r,args,op)
-        if type(args.task_key)~="string" or #args.task_key<1 or #args.task_key>64 or not args.task_key:match("^[%w_%-]+$")
-            or type(args.prefab)~="string" or #args.prefab>60 or not args.prefab:match("^[a-z0-9_]+$")
-            or type(args.total_count)~="number" or args.total_count<1 or args.total_count>100 or args.total_count%1~=0 then return nil,"invalid_transfer" end
-        r.transfer_totals=r.transfer_totals or {};r.transfer_order=r.transfer_order or {}
-        local row=r.transfer_totals[args.task_key]
-        if row and (row.op~=op or row.prefab~=args.prefab or row.container_guid~=args.container_guid) then return nil,"transfer_identity_changed" end
-        if not row then
-            -- Do not evict receipts: forgetting one would permit replaying its quantity.
-            if #r.transfer_order>=128 then return nil,"transfer_receipt_limit" end
-            row={op=op,prefab=args.prefab,container_guid=args.container_guid,count=0}
-            r.transfer_totals[args.task_key]=row
-        end
-        for i,key in ipairs(r.transfer_order) do if key==args.task_key then table.remove(r.transfer_order,i);break end end
-        r.transfer_order[#r.transfer_order+1]=args.task_key
-        return row
-    end
     function S.start(a,q,r)
         local reason
         if q.args.container_guid~=nil and q.op~="deposit" and q.op~="withdraw" then return false,"invalid_transfer_target" end
@@ -115,7 +116,7 @@ function M.new(G,E)
             if not r.player:IsValid() or E.dead(r.player) or E.distance(a,r.player)>20 then return false,"owner_out_of_range_or_dead" end
             q.transfer_target=r.player
         end
-        local row;row,reason=ledger(r,q.args,q.op)
+        local row;row,reason=M.item_receipt(r,q.args,q.op)
         if not row then return false,reason end
         q.receipt=row
         return true

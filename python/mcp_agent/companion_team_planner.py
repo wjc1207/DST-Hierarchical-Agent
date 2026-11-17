@@ -12,19 +12,20 @@ from mcp_agent.planning_core import request_json_plan,recent_exchanges
 
 COMPACT_FORMAT = (
     'Return one JSON object with assignments keyed by requested buddy ID, e.g. '
-    '{"assignments":{"buddy1":{"reply":"我去采草，天黑回来。","tasks":'
-    '[{"type":"collect","prefab":"cutgrass","count":4},{"type":"return_owner","at":"night"}]},'
-    '"buddy2":{"reply":"我去找树枝，天黑回来。","tasks":'
-    '[{"type":"collect","prefab":"twigs","count":4},{"type":"return_owner","at":"night"}]}}}. '
+    '{"assignments":{"buddy1":{"reply":"我去采草。","tasks":'
+    '[{"type":"collect","prefab":"cutgrass","count":4}]},'
+    '"buddy2":{"reply":"我去找树枝。","tasks":'
+    '[{"type":"collect","prefab":"twigs","count":4}]}}}. '
     'For conversation, blockage or verified completion, use a local object with reply and '
     'outcome ("reply", "blocked" or "completed"); completed also requires evidence. '
     'A team outcome is optional (default working). For tasks, omit kind, schema, day, goal and title. '
     'Put type and its arguments directly on each task, with optional priority, focus, depends_on, '
     'start_at, reason and search budgets on the same object. Default priority is 3, or 1 for a timed return. '
     'Use inventory for crafting with recipe_id and collect for raw collection. Both counts mean total carried stock. '
+    'Only when the active player request or autonomous goal specifies returning at night, use a timed return such as {"type":"return_owner","at":"night"}. '
     'at may be a phase string for the next onset, or {day,phase} / {day,progress} for an explicit arrival. Reuse the pending return ID on reviews. '
     'To revise an existing task, reuse its ID. Assign IDs to prerequisites referenced by depends_on; '
-    'include those prerequisites in the same assignment. Counted transfers require stable IDs across replans. '
+    'include those prerequisites in the same assignment. Counted transfers and eat tasks require stable IDs across replans. '
     'Omitted tasks remain on the board; use cancel_task_ids for obsolete work. '
 )
 
@@ -41,7 +42,7 @@ def expand_assignment(raw, actor):
     for index, (task, row) in enumerate(zip(raw["tasks"], expanded), 1):
         kind = task["type"]
         if kind in COUNTED_TARGETS and "id" not in task:
-            raise ValueError(f"tasks[{index}]: counted transfers require a stable id")
+            raise ValueError(f"tasks[{index}]: counted item tasks require a stable id")
         if isinstance(row.get("at"), str):
             phase = row["at"]
             if kind != "return_owner" or phase not in PHASES:

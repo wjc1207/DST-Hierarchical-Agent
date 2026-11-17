@@ -10,7 +10,7 @@ from mcp_agent.daily_planner import DailyPlanner, request_plan, validate_agent_r
 from mcp_agent.mcp_agent import MCPAgent
 from mcp_server.game_bridge import GameBridge, BridgeError
 from test_autonomy import controlled
-from test_mcp_agent import FakeClient, answer
+from test_mcp_agent import FakeClient
 from test_priority_board import PendingWorker, board, task
 
 
@@ -208,7 +208,7 @@ class HostDialogueTests(unittest.IsolatedAsyncioTestCase):
             planner = DailyPlanner("offline", board_log_dir=None)
         client = FakeClient()
         client.state["autonomy"] = dialogue()["autonomy"]
-        agent = MCPAgent(client, answer, planner=planner, execute=True, poll=.001)
+        agent = MCPAgent(client, planner=planner, execute=True, poll=.001)
         try:
             await agent.cycle()
             planner.future.set_result((reply(), 1, None))
@@ -223,14 +223,12 @@ class HostDialogueTests(unittest.IsolatedAsyncioTestCase):
             await agent.shutdown()
             planner.close()
 
-    async def test_planning_wait_does_not_call_jev_or_start_optional_work(self):
+    async def test_planning_wait_does_not_start_optional_work(self):
         with patch("mcp_agent.daily_planner.ThreadPoolExecutor", PendingWorker):
             planner = DailyPlanner("offline", board_log_dir=None)
         client = FakeClient()
         client.state["autonomy"] = dialogue()["autonomy"]
-        def unexpected(*_):
-            raise AssertionError("JEV optional work while dialogue replans")
-        agent = MCPAgent(client, unexpected, planner=planner, execute=True, poll=.001)
+        agent = MCPAgent(client, planner=planner, execute=True, poll=.001)
         try:
             await agent.cycle()
             self.assertFalse(any(name == "start_action" for name, _ in client.calls))
@@ -247,9 +245,10 @@ class HostDialogueTests(unittest.IsolatedAsyncioTestCase):
                 peer.state["autonomy"]["revision"] = 2
                 peer.state["autonomy"]["messages"].append({"id": 2, "text": "先回来"})
         client.hook = interrupt
-        agent = MCPAgent(client, answer, execute=True, poll=.001)
+        agent = MCPAgent(client, execute=True, poll=.001)
         try:
-            await agent.cycle()
+            packet = await agent.observe()
+            await agent.perform("collect_grass", packet)
             self.assertIsNone(agent.active_id)
             self.assertTrue(any(name == "cancel_action" for name, _ in client.calls))
         finally:

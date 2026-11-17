@@ -5,7 +5,7 @@
 The control path is: **AI host → STDIO MCP server → authenticated loopback HTTP → client Mod**.
 The server does not tail game logs, simulate input or call model APIs. Lua reports
 legal actions, executes them natively and verifies effects. The included external
-host, `python/mcp_agent/mcp_agent.py`, connects DeepSeek/JEV to this path. The keyboard runner has been removed; model calls use an independent API client.
+host, `python/mcp_agent/mcp_agent.py`, connects DeepSeek to this path. The keyboard runner has been removed; model calls use an independent API client.
 
 ## Setup
 
@@ -40,7 +40,7 @@ Public goals/actions keep `sciencemachine` / `build_sciencemachine`; the Mod use
 `researchlab` for native recipes/entities and retains it in `game_prefab` on the
 normalized observation. No task-board or action-name migration is required.
 
-## Autonomous DeepSeek/JEV host
+## Autonomous DeepSeek host
 
 Stop bridge-only instances, probes and other same-port clients.
 Using the Python environment with MCP dependencies installed, run:
@@ -50,9 +50,7 @@ python .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
 The host launches its own STDIO service and loads existing `.env` model settings.
-Without `--execute`, it observes one decision without game commands or DeepSeek
-planning. `--no-planner` disables planning; `--env PATH` and `--config PATH` select
-existing files. A missing DeepSeek key leaves JEV/exploration available.
+Use `--loop --execute` with `DEEPSEEK_API_KEY`. Without `--execute`, the host reads one game snapshot.
 
 The automatic host and an external MCP client must not own the same bridge port
 at once. Startup preflights the port; the HTTP listener also binds exclusively
@@ -67,29 +65,19 @@ the Mod and existing token configuration are unchanged.
 
 - DeepSeek maintains persistent priority goals, dependencies and search budgets,
   using the existing knowledge and conversation history.
-- JEV handles safety and temporary gaps when no board
-  task can advance, not each planned pickup. The host requests DeepSeek evaluation
-  immediately for an empty/completed/unexecutable board; one request runs at a time.
-  Off-board opportunity arbitration is disabled. Safety includes targeted enemies,
-  damage, lighting and known health/hunger/sanity below 30%, even without a carried remedy.
+- The MCP scheduler advances runnable board work while planning is pending. It waits when there is no runnable work and applies local safety rules.
 - Python owns visible-first scheduling, latched completion, search budgets and DFS/BFS
   intent selection. It selects only offered actions; Lua owns game movement.
 - Lua owns approach, continuous movement, native actions, effect verification
   and safety interruption. Legacy board clients remain compatible.
 - The MCP server owns atomic observation/action snapshots and executor handoffs,
-  not model calls. Both models use the same game-fact projection and capability facts.
+  while the model runs in the planning client.
 
-The host waits for Lua acknowledgement before issuing work after a board pause.
-Damage, inventory, phase and threat changes do not discard regular model requests
-in Python. Temporary planning-gap choices yield back to automatic execution if
-the latest board can advance before dispatch. For dispatched choices, submit the
-original offered choice/observation; Lua validates
-live feasibility. Death or a changed game/player session stops the host; disconnected
-or expired observations cannot issue commands.
+Lua validates the offered action and its observation against current game state.
 Ctrl+C requests cancellation and waits for acknowledgement; if unconfirmed,
 closing the service lets the three-second Lua lease stop residual work.
 
-Terminal output includes action results, cycle/JEV time and planning previews.
+Terminal output includes action results, cycle timing and planning previews.
 Timing details go to `logs/mcp_timing.jsonl`; new plans go to `logs/task_board.json`
 and `logs/task_board.jsonl`. Old sequence logs do not identify the current plan.
 The keyboard runner and its predictive buffer have been removed.
@@ -146,7 +134,7 @@ Each cell is 4x4 world units; old area values are divided by 16 on import, so ar
 `explore_other_region {new_regions}` discovers new nodes (default 1), not merely
 another already-known region.
 
-The current step repeats native actions without per-item JEV requests.
+The current step repeats native actions.
 Ordinary resource discoveries resume the same step even if native navigation
 yields; danger, damage, lighting and urgent hunger still hand off to safety
 decisions. Only observed effects advance steps, never predicted state. The
@@ -155,7 +143,7 @@ prerequisites explicitly. Each native command still uses an original MCP
 observation and Lua verification; this is not a blind batch of key presses.
 
 Update the new `python/mcp_agent/action_sequence.py` and changed `python/mcp_agent/daily_planner.py`, `python/mcp_agent/mcp_agent.py`,
-`python/mcp_agent/navigation_intents.py`, `python/mcp_agent/jev_client.py` and `data/DSTKnowledge.txt`, then restart Python.
+`python/mcp_agent/navigation_intents.py` and `data/DSTKnowledge.txt`, then restart Python.
 The Lua protocol remains 4; existing `submit_task_board` tools are kept for older
 clients. Pure semantic sequences remain MCP-compatible, without keyboard fallbacks.
 
@@ -233,7 +221,7 @@ with reason `goal_action_available`; unrelated resources do not stop movement.
 Unfiltered DS-gap navigation retains resource-set changes after four units.
 Safety events do not wait for that floor. The host still reviews changed board
 targets and existing search budgets during native movement, cancelling with
-acknowledgement before rescheduling; this does not ask JEV for ordinary opportunities.
+acknowledgement before rescheduling; this rechecks the board.
 No visible targeted hostile is not proof of permanently cleared aggro.
 
 A blocked escape changes heading inside the current action after about 0.8
@@ -337,15 +325,7 @@ not proof of client receipt. Exchange includes lock/copy; state sampling include
 its children. Do not sum parent and child stages or subtract different processes'
 absolute timestamps.
 
-JEV requests receive a `request_id` tied to the source session/state sequence and
-preceding action. Worker queue time and an independent background trace are stored
-in `decision.worker_completed.worker_timing`; packaging, response headers, body read
-and parse are separate. Headers time includes connection/upload/remote processing,
-not pure model inference. `decision.result_observed.result_ready_to_notice_ms`
-measures result-notice delay. Do not add overlapping background time to host totals.
-Failures/discarded completed requests retain timings without logging exception text.
-DeepSeek retains its existing background total. This release changes no strategy,
-poll intervals, executor policy or predictive-buffer behavior.
+DeepSeek planning and native execution have separate timing records.
 
 ### HTTP upload handshake (1.8.4)
 
@@ -372,11 +352,7 @@ finer game clock is verified.
 
 ### Mod-owned live validation (1.8.5)
 
-The Python host no longer compares entire decision contexts during/after inference.
-JEV must answer one of the original options, but Lua alone determines whether the
-intent remains executable. This also applies to other MCP clients. Target GUID,
-prefab, action kind and navigation node/mode must match; current route coordinates
-can be refreshed without silently switching targets or destination regions.
+Lua checks whether the offered target and action are still valid before execution.
 
 An escape choice survives damage and hostile-set changes and uses a freshly computed
 passable route. Damage during escape does not cancel it. Cleared threats return
@@ -503,7 +479,7 @@ to a nearby observed campfire/firepit, including relighting an extinguished fire
 Priority boards accept `refuel` targets with `building_id`, explicit common
 `fuel_prefab`, and `count:1..10` (default 1). Travel and fuel collection are explicit
 prerequisites; progress counts verified additions. Python scheduling is required.
-JEV options are unchanged. See [refueling details](REFUELING.md).
+See [refueling details](REFUELING.md).
 
 
 ## Camp placement constraints

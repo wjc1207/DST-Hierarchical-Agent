@@ -202,6 +202,8 @@ class CompanionTeamAgent:
         if packet["state"].get("team") is not True:
             raise ValueError("Companion team snapshot required; update DST Buddy Agent")
         self.update(packet)
+        if self.state.get("paused"):
+            return
         for identity in list(self.agents):
             if identity not in self.state["members"]:
                 agent=self.agents.pop(identity);await agent.close();self.release(identity)

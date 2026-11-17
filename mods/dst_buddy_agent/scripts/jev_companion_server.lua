@@ -1,8 +1,8 @@
 -- One authoritative actor/executor per actual RPC sender.
 local M={}
 local OPS={summon=true,bind=true,state=true,intent=true,follow=true,stay=true,stop=true,move=true,collect=true,release=true,say=true,
-    recipes=true,equip=true,unequip=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true}
-local NATIVE={equip=true,unequip=true,work=true,craft=true,place=true,give_owner=true,drop_item=true,deposit=true,withdraw=true}
+    recipes=true,equip=true,unequip=true,eat=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true}
+local NATIVE={equip=true,unequip=true,eat=true,work=true,craft=true,place=true,give_owner=true,drop_item=true,deposit=true,withdraw=true}
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<1e7 end
 local function valid_guid(v) return type(v)=="number" and v==v and v>=1 and v<=9007199254740991 and v%1==0 end
 local function valid_id(v) return type(v)=="string" and #v<=100 and v:match("^[%w:_%-]+$") end
@@ -14,6 +14,7 @@ function M.new(env)
         local p={id=q.id,seq=q.seq,op=q.op,status=status,reason=reason,token=r.token,revision=r.revision or 0,
             state=env.snapshot(r.player,r.buddy,r),data=data}
         p.state.version=r.snapshot_version
+        if q.op=="state" then p.state.last_action_result=r.last_action_result end
         q.last=p;env.reply(r.player,p)
     end
     local function halt(r)
@@ -32,7 +33,9 @@ function M.new(env)
     end
     local function finish(r,status,reason,data)
         local q=r.active;if not q then return end
-        r.active=nil;halt(r);send(r,q,status,reason,data)
+        r.active=nil
+        r.last_action_result={id=q.id,seq=q.seq,op=q.op,status=status,reason=reason,data=data}
+        halt(r);send(r,q,status,reason,data)
     end
     local function release(r,reason)
         finish(r,"interrupted",reason);halt(r)
@@ -42,7 +45,7 @@ function M.new(env)
             if r.buddy:IsValid() then r.buddy._jev_companion_owner=nil end
         end
         r.map_error=nil;r.follow_progress=nil;r.follow_state=nil;r.escape=nil;r.next_threat_scan=nil
-        r.buddy=nil;r.token=nil;r.mode="stay";r.revision=0
+        r.buddy=nil;r.token=nil;r.mode="stay";r.revision=0;r.last_action_result=nil
         r.transfer_totals=nil;r.transfer_order=nil
     end
     function self:delete(userid, actor)

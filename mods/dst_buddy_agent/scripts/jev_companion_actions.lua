@@ -23,6 +23,30 @@ function M.new(G,E)
     local function carried(a,guid)
         return a.components.inventory:FindItems(function(item) return item.GUID==guid and item:IsValid() end)[1]
     end
+    local function edible_for(a,item)
+        local eater=a.components.eater
+        return eater and item:IsValid() and item.components.edible and not eater.eatwholestack
+            and eater:CanEat(item) and eater:PrefersToEat(item)
+    end
+    function A.foods(a)
+        local eater=a.components.eater
+        if not eater then return nil end
+        local foods={}
+        local memory=a.components.foodmemory
+        for _,item in ipairs(a.components.inventory:FindItems(function(i) return edible_for(a,i) end)) do
+            local edible=item.components.edible
+            local multiplier=memory and memory:GetFoodMultiplier(item.prefab) or 1
+            local effects=(edible.healthvalue>=0 and edible.sanityvalue>=0) or eater:DoFoodEffects(item)
+            foods[#foods+1]={guid=item.GUID,prefab=item.prefab,
+                count=item.components.stackable and item.components.stackable:StackSize() or 1,
+                hunger_delta=a.components.hunger and edible:GetHunger(a)*multiplier*eater.hungerabsorption or 0,
+                sanity_delta=a.components.sanity and (edible.sanityvalue>=0 or effects)
+                    and edible:GetSanity(a)*multiplier*eater.sanityabsorption or 0,
+                health_delta=a.components.health and (edible.healthvalue>=0 or effects)
+                    and edible:GetHealth(a)*multiplier*eater.healthabsorption or 0}
+        end
+        return foods
+    end
     local function healthy(item)
         local c=item.components
         return (not c.finiteuses or c.finiteuses:GetPercent()>0) and (not c.fueled or c.fueled:GetPercent()>0)
@@ -155,13 +179,34 @@ function M.new(G,E)
         a.components.locomotor:PushAction(action,true)
         return true
     end
-    function A.start(a,q)
+    local function eat(a,q,r)
+        local args=q.args
+        if args.container_guid~=nil then return false,"invalid_food_target" end
+        local receipt,reason=Storage.item_receipt(r,args,"eat")
+        if not receipt then return false,reason end
+        q.receipt=receipt
+        if receipt.count>=args.total_count then q.eat_complete=true;return true end
+        local item=a.components.inventory:FindItems(function(i)
+            return i.prefab==args.prefab and edible_for(a,i)
+        end)[1]
+        if not item then return false,"food_not_carried_or_inedible" end
+        local action=G.BufferedAction(a,nil,G.ACTIONS.EAT,item)
+        action.validfn=function() return carried(a,item.GUID)==item and edible_for(a,item) end
+        action:AddSuccessAction(function()
+            receipt.count=receipt.count+1
+            q.eat_complete=true
+        end)
+        return push(a,q,action)
+    end
+    function A.start(a,q,r)
         local args=q.args or {};local op=q.op
         if a.sg and a.sg.HasStateTag and (a.sg:HasStateTag("busy") or a.sg:HasStateTag("nointerrupt")) then
             q.deferred=true;return true
         end
         q.deferred=nil
-        if op=="equip" then
+        if op=="eat" then
+            return eat(a,q,r)
+        elseif op=="equip" then
             local item=valid_guid(args.item_guid) and carried(a,args.item_guid)
             if not item or not can_equip(a,item) then return false,"item_not_equippable" end
             q.item_guid=item.GUID
@@ -206,13 +251,15 @@ function M.new(G,E)
         end
         return false,"unsupported_action"
     end
-    function A.progress(a,q)
+    function A.progress(a,q,r)
         if q.deferred then
-            local accepted,reason=A.start(a,q)
+            local accepted,reason=A.start(a,q,r)
             if not accepted then return "failed",reason end
             return
         end
-        if q.op=="equip" then
+        if q.op=="eat" and q.eat_complete then
+            return "completed","food_eaten",{task_key=q.args.task_key,count=q.receipt.count}
+        elseif q.op=="equip" then
             local item=carried(a,q.item_guid)
             if item and a.components.inventory:IsItemEquipped(item) then return "completed","equipped" end
         elseif q.op=="unequip" and q.stowed then return "completed","unequipped"

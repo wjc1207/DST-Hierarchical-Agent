@@ -8,7 +8,6 @@ from concurrent.futures import Future
 from unittest.mock import Mock, patch
 
 from mcp_agent import daily_planner
-from mcp_agent import jev_client as jev_agent
 from common import game_rules as rules
 from common.task_board import (validate_board, board_view, format_board,
                         INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
@@ -258,45 +257,7 @@ class BoardTests(unittest.TestCase):
             next_board = planner.update(current)
             self.assertNotEqual(next_board["board_id"], board["board_id"])
 
-    def test_jev_receives_board_but_exploration_stays_with_executor(self):
-        class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_args): return False
-            def read(self): return b'{"answers":{"next_action":{"choice":"wait","confidence":1}}}'
-        board, actual = validate_board(raw_board(), 1), state([])
-        criteria = {"wait": "Wait", "explore_current_region": "Explore", "build_sciencemachine": "Build science"}
-        with patch.object(jev_agent.urllib.request, "urlopen", return_value=Response()) as send:
-            jev_agent.call_jev("https://example.invalid", "secret", "jev", actual, criteria, board)
-        body = json.loads(send.call_args.args[0].data)
-        supplied = json.loads(body["state"])
-        self.assertIn("task_board", supplied)
-        self.assertNotIn("daily_plan", supplied)
-        self.assertEqual(body["questions"]["next_action"]["criteria"], {"wait": "Wait"})
 
-    def test_jev_priority_payload_limits_role_to_safety_and_planning_gaps(self):
-        class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_args): return False
-            def read(self): return b'{"answers":{"next_action":{"choice":"collect_flower"}}}'
-        board, actual = validate_board(raw_board(), 1), state([])
-        board.update(execution_policy="priority_goals", handoff_reason="safety")
-        criteria = {"wait": "Wait", "collect_flower": "Recover sanity", "explore_current_region": "Explore"}
-        with patch.object(jev_agent.urllib.request, "urlopen", return_value=Response()) as send:
-            result = jev_agent.call_jev("https://example.invalid", "secret", "jev", actual, criteria, board)
-        body = json.loads(send.call_args.args[0].data)
-        question, supplied = body["questions"]["next_action"], json.loads(body["state"])
-        self.assertEqual(result["answer"]["choice"], "collect_flower")
-        self.assertEqual(set(question["criteria"]), {"wait", "collect_flower"})
-        guidance = " ".join(supplied["decision_guidance"])
-        self.assertIn("off-board opportunity arbitration is disabled", guidance)
-        self.assertIn("health/hunger/sanity below 30%", guidance)
-        self.assertEqual(supplied["task_board"]["handoff_reason"], "safety")
-
-        board["handoff_reason"] = "planning_gap"
-        guidance = " ".join(jev_agent.compact_game_state(actual, board)["decision_guidance"])
-        self.assertIn("No task on this board can currently be advanced", guidance)
-        self.assertIn("temporarily choose useful safe local work", guidance)
-        self.assertNotIn("continue_main_task", guidance)
 
     def test_deepseek_is_prompted_for_interleaved_priority_goals(self):
         class Response:
@@ -312,7 +273,7 @@ class BoardTests(unittest.TestCase):
         prompt = json.loads(send.call_args.args[0].data)["messages"][0]["content"]
         self.assertIn('"tasks"', prompt)
         self.assertIn("interleaved order", prompt)
-        self.assertIn("off-board opportunities do not trigger it", prompt)
+        self.assertIn("waits when no board task can advance", prompt)
         self.assertIn("sanity recovery", prompt)
         self.assertIn("log not logs", prompt)
 

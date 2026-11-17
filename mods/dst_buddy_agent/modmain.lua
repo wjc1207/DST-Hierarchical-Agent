@@ -8,8 +8,11 @@ local UI=require("jev_companion_ui")
 local NS="jev_ai_companion"
 local configured,config=G.pcall(require,"jev_companion_config")
 if not configured or type(config)~="table" then config={} end
-local server,client
+local client
 local clock=G.walltime or function() return G.GetTime() end
+local function game_paused()
+    return G.TheNet and G.TheNet:IsServerPaused() or false
+end
 local function notice(text) if G.ChatHistory then G.ChatHistory:SendCommandResponse("[Companion] "..text) end end
 local function log(event,reason,details)
     local row={event=event,reason=reason,version="0.7.0"}
@@ -17,13 +20,19 @@ local function log(event,reason,details)
     print("[JEV_COMPANION]"..json.encode(row))
 end
 AddPrefabPostInit("wilson",function(inst) Presentation.attach(G,inst) end)
-local function ensure_server()
-    if not server and G.TheWorld and G.TheWorld.ismastersim then
-        server=Server.new(World.new(G,function(player,packet)
-            G.SendModRPCToClient(GetClientModRPC(NS,"reply"),player.userid,json.encode(packet))
-        end,Client.validate_text,function(value) return #json.encode(value) end,function(event,details) log(event,nil,details) end))
-    end
-    return server
+local function install_server(world)
+    if not world.ismastersim or world.components.jev_companion_persistence then return end
+    world:AddComponent("jev_companion_persistence")
+    world.components.jev_companion_persistence.server=Server.new(World.new(G,function(player,packet)
+        G.SendModRPCToClient(GetClientModRPC(NS,"reply"),player.userid,json.encode(packet))
+    end,Client.validate_text,function(value) return #json.encode(value) end,function(event,details) log(event,nil,details) end))
+end
+AddPrefabPostInit("forest",install_server)
+AddPrefabPostInit("cave",install_server)
+AddPrefabPostInit("world",install_server)
+local function get_server()
+    local persistence=G.TheWorld and G.TheWorld.components.jev_companion_persistence
+    return persistence and persistence.server
 end
 local function ensure_client()
     local player=G.ThePlayer
@@ -31,7 +40,7 @@ local function ensure_client()
     if client and client.player==player then return client end
     local enabled=config.enabled==true and type(config.token)=="string" and #config.token>=32
         and type(config.url)=="string" and config.url:match("^http://127%.0%.0%.1:%d+/v1/exchange$")~=nil
-    client=Client.new({nonce=tostring(player.GUID)..":"..string.format("%.0f",clock()*1000),now=clock,http_enabled=enabled,
+    client=Client.new({nonce=tostring(player.GUID)..":"..string.format("%.0f",clock()*1000),now=clock,sim_now=G.GetTime,paused=game_paused,http_enabled=enabled,
         notice=notice,send=function(q) G.SendModRPCToServer(GetModRPC(NS,"request"),json.encode(q)) end,
         http=function(payload,callback)
             payload.token=config.token
@@ -48,7 +57,7 @@ end
 AddModRPCHandler(NS,"request",function(player,encoded)
     if type(encoded)~="string" or #encoded>4096 then return end
     local ok,q=G.pcall(json.decode,encoded)
-    local service=ensure_server()
+    local service=get_server()
     if ok and service then
         local handled,error=G.pcall(function() service:request(player,q) end)
         if not handled then log("rpc_error",tostring(error):sub(1,200)) end
@@ -76,13 +85,29 @@ AddClassPostConstruct("screens/chatinputscreen",function(screen)
 end)
 AddSimPostInit(function()
     if not G.TheWorld then return end
-    ensure_server();log("loaded",G.TheWorld.ismastersim and "server" or "client")
-    G.TheWorld:DoPeriodicTask(.1,function()
+    local server=get_server()
+    log("loaded",G.TheWorld.ismastersim and "server" or "client")
+    local world=G.TheWorld
+    local frontend=G.TheFrontEnd
+    if frontend and frontend.StartUpdatingWidget and not (G.TheNet and G.TheNet:IsDedicated()) then
+        local heartbeat={enabled=true,OnUpdate=function()
+            if game_paused() and client and client.player==G.ThePlayer and client.player:IsValid() then
+                client:tick(true)
+            end
+        end}
+        frontend:StartUpdatingWidget(heartbeat)
+        world:ListenForEvent("onremove",function()
+            heartbeat.enabled=false
+            frontend:StopUpdatingWidget(heartbeat)
+        end)
+    end
+    -- The simulation scheduler itself stops while the server is paused.
+    world:DoPeriodicTask(.1,function()
         if server then
             local ok,error=G.pcall(function() server:tick() end)
             if not ok then log("tick_error",tostring(error):sub(1,200)) end
         end
-        if client and client.player:IsValid() then
+        if client and client.player:IsValid() and not game_paused() then
             local ok,error=G.pcall(function() client:tick() end)
             if not ok then log("client_error",tostring(error):sub(1,200)) end
         end

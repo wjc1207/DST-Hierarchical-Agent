@@ -9,7 +9,7 @@
 | DST Player Agent | AI 操作玩家自己的角色 | [玩家操作快速开始](#玩家操作快速开始) |
 | DST Buddy Agent | 召唤一个或两个 AI 伙伴 | [伙伴安装说明](#ai伙伴快速开始) |
 
-《饥荒联机版》智能体实验项目。DeepSeek 维护有优先级的多目标看板，执行器优先完成眼前任务，并结合 Klei 区域资源配置与探索记忆寻找所需物资。Lua Mod 原生执行并验证动作，JEV 处理危险，并在 DeepSeek 规划空窗期临时接手。长期目标是制作炼金引擎，当前已支持科学机器，并新增 DeepSeek 侧的[通用配方查询、制作与放置](docs/RECIPES.md)；炼金引擎尚待完整实机验证。
+《饥荒联机版》智能体实验项目。DeepSeek 维护有优先级的多目标看板，执行器优先完成眼前任务，并结合 Klei 区域资源配置与探索记忆寻找所需物资。MCP 服务调度看板并处理紧急安全动作，Lua 模组执行和验证动作。长期目标是制作炼金引擎，当前已支持科学机器，并新增 DeepSeek 侧的[通用配方查询、制作与放置](docs/RECIPES.md)；炼金引擎尚待完整实机验证。
 
 已完成的阶段：[活过第一晚](https://bilibili.com/video/BV1aehE6DEji) · [制作科学机器](https://www.bilibili.com/video/BV1mFaV6aEQ2)  · [制作科学机器v2](https://www.bilibili.com/video/BV1pRnR62Ex3)
 
@@ -18,7 +18,7 @@
 ## 玩家操作快速开始
 
 1. 将仓库中的 `mods/dst_player_agent` 复制到《饥荒联机版》的 `mods` 目录，在游戏的“模组”菜单启用 **DST Player Agent**。
-2. 将 `.env.example` 复制为 `.env`，填写 `JEV_API_KEY`。如需启用规划，再填写 `DEEPSEEK_API_KEY`。不要分享或提交 `.env`。
+2. 将 `.env.example` 复制为 `.env`，填写 `DEEPSEEK_API_KEY`。不要分享或提交 `.env`。
 3. 需要 Python 3.11+。在项目目录运行（也可以在自己的虚拟环境中安装）：
 
 ```powershell
@@ -33,7 +33,7 @@ python.exe .\python\mcp_agent\mcp_probe.py
 python.exe .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
-最后一条命令会向游戏发送实际操作；按 `Ctrl+C` 停止。若只想观察决策而不操作游戏，去掉 `--execute`。
+最后一条命令会向游戏发送实际操作；按 `Ctrl+C` 停止。只检查连接和游戏状态时，使用 `mcp_probe.py`。
 
 ## AI伙伴快速开始
 
@@ -63,7 +63,7 @@ python.exe .\python\mcp_agent\companion_agent.py --execute
 
 [共用规划与任务层](docs/SHARED_PLANNING.md)：客户端与伙伴共用模型请求、上下文和完成规则、优先级看板与任务调度，分别适配状态和动作。
 
-[建筑记忆、前往建筑与设置／返回家](docs/PLACES.md)由优先级看板调度，JEV 候选范围保持不变。
+[建筑记忆、前往建筑与设置／返回家](docs/PLACES.md)由优先级看板调度。
 
 [看图选址与前往坐标](docs/MAP_SELECTION.md)：DeepSeek 按需查看带世界坐标的已观察地图，
 选择营地候选点；`move_to` 负责安全前往，到场建建筑后再设置家。

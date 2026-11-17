@@ -522,12 +522,8 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
         snapshot["bridge"].update(protocol=4, events=[])
         bridge = GameBridge(TOKEN)
         bridge.exchange({"token": TOKEN, "session_id": "offline", "sequence": 1, "state": snapshot})
-        def decide(s, criteria, plan):
-            self.assertEqual(s["bridge"]["available_actions"], snapshot["bridge"]["available_actions"])
-            self.assertIn("collect_grass", criteria)
-            return {"answer": {"choice": "collect_grass", "confidence": 0.1}, "response": {"model": "fake"}}
         async with Client(create_server(bridge), read_timeout_seconds=3) as client:
-            agent = MCPAgent(client, decide, execute=True, poll=0.01)
+            agent = MCPAgent(client, execute=True, poll=0.01)
             async def lua_peer():
                 seq = 1
                 while not bridge.active:
@@ -540,7 +536,8 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "status": "completed", "reason": "observed_effect"}})
             peer = asyncio.create_task(lua_peer())
             try:
-                await asyncio.wait_for(agent.cycle(), 3)
+                packet = await agent.observe()
+                await asyncio.wait_for(agent.perform("collect_grass", packet), 3)
                 await peer
                 self.assertIsNone(agent.active_id)
                 self.assertEqual(next(iter(bridge.actions.values()))["status"], "completed")

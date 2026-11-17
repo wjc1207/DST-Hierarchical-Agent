@@ -33,7 +33,10 @@ local function fixture()
         TheSim={FindEntities=function(_,x,y,z,r) local rows={};for _,e in pairs(w.ents) do if e.valid and (e.x-x)^2+(e.z-z)^2<=r*r then rows[#rows+1]=e end end;return rows end},
         BufferedAction=function(doer,target,action,item)
             local q={doer=doer,target=target,action=action,invobject=item}
-            function q:AddSuccessAction(fn) self.success=fn end
+            function q:AddSuccessAction(fn)
+                local previous=self.success
+                self.success=function() if previous then previous() end;fn() end
+            end
             function q:AddFailAction(fn) self.fail=fn end
             return q
         end}
@@ -54,6 +57,38 @@ local function fixture()
     end
     return w
 end
+
+test("food telemetry preserves negative effects and native eating counts successful bites only",function()
+    local w=fixture()
+    local a=w.actor
+    local item=w:entity(10,"monstermeat")
+    item.components.edible={healthvalue=-20,sanityvalue=-15,GetHealth=function() return -20 end,
+        GetHunger=function() return 18.75 end,GetSanity=function() return -15 end}
+    a.components.health={};a.components.hunger={};a.components.sanity={}
+    a.components.eater={CanEat=function() return true end,PrefersToEat=function(_,food) return food==item end,
+        DoFoodEffects=function() return true end,healthabsorption=1,hungerabsorption=1,sanityabsorption=1}
+    w.items={item};w.G.ACTIONS.EAT="EAT"
+    local foods=w.native.foods(a)
+    assert(#foods==1 and foods[1].health_delta==-20 and foods[1].sanity_delta==-15 and foods[1].hunger_delta==18.75)
+    local r={}
+    local args={prefab="monstermeat",total_count=1,task_key="meal"}
+    local failed={op="eat",args=args}
+    assert(w.native.start(a,failed,r) and w.action.invobject==item and w.action.validfn())
+    w.items={}
+    assert(not w.action.validfn())
+    w.action.fail()
+    assert(w.native.progress(a,failed,r)=="failed" and r.transfer_totals.meal.count==0)
+    w.items={item}
+    local q={op="eat",args=args}
+    assert(w.native.start(a,q,r))
+    w.action.success()
+    local status,reason,data=w.native.progress(a,q,r)
+    assert(status=="completed" and reason=="food_eaten" and data.count==1)
+    local previous=w.action
+    local retry={op="eat",args=args}
+    assert(w.native.start(a,retry,r) and w.action==previous)
+    assert(w.native.progress(a,retry,r)=="completed")
+end)
 
 test("work targets expose actual drops and exclude buildings, burning or distant entities",function()
     local w=fixture();local tree=w:workable(2,"evergreen","CHOP");local rock=w:workable(3,"rock2","MINE")

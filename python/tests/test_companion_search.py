@@ -121,6 +121,58 @@ class SearchTasksTests(unittest.TestCase):
         observed["nearby"] = [{"guid": 9, "product": "cutgrass", "distance": 1, "x": 1, "z": 0}]
         self.assertEqual(runtime.next_action(observed)[1], "collect")
 
+    def test_known_source_then_room_prior_then_nearest_unexplored_edge(self):
+        observed = observation()
+        perception = observed["perception"]
+        perception["cells"] = [
+            {"gx": x, "gz": z, "land": True, "room_type": "BGGrass" if x < 0 else "BGDirt"}
+            for x in range(-4, 3) for z in range(-3, 4)
+        ]
+        perception["points"] = [
+            {"id": "2:0", "x": 8, "z": 0}, {"id": "-4:0", "x": -16, "z": 0},
+        ]
+        observed["nearby"] = [{"guid": 7, "product": "cutgrass", "x": 8, "z": 0}]
+        search = ResourceSearch()
+        self.assertEqual(search.select("cutgrass", observed)["id"], "2:0")
+        self.assertEqual(search.strategy, "known_source")
+        observed["nearby"] = []
+        self.assertEqual(search.select("cutgrass", observed)["id"], "-4:0")
+        self.assertEqual(search.strategy, "room_prior")
+        self.assertEqual(search.select("seeds", observed)["id"], "2:0")
+        self.assertEqual(search.strategy, "unknown_frontier")
+
+    def test_mining_priors_require_usable_tool_but_loose_flint_does_not(self):
+        observed = observation()
+        observed["perception"]["cells"] = [
+            {"gx": x, "gz": 0, "land": True, "room_type": "BGDirt" if x < 0 else "BGImpassable"}
+            for x in range(-4, 3)
+        ]
+        observed["perception"]["points"] = [
+            {"id": "2:0", "x": 8, "z": 0}, {"id": "-4:0", "x": -16, "z": 0},
+        ]
+        search = ResourceSearch()
+        self.assertEqual(search.select("flint", observed)["id"], "2:0")
+        observed["equipment"] = [{"usable": True, "tools": ["MINE"]}]
+        self.assertEqual(search.select("flint", observed)["id"], "-4:0")
+        observed["equipment"] = []
+        observed["perception"]["cells"][0]["room_type"] = "BGGrass"
+        self.assertEqual(search.select("flint", observed)["id"], "-4:0")
+
+    def test_remembered_work_target_requires_the_matching_tool(self):
+        observed = observation()
+        observed["perception"]["points"] = [{"id": "4:0", "x": 16, "z": 0}]
+        observed["work_targets"] = [
+            {"guid": 8, "work": "MINE", "products": ["flint"], "x": 16, "z": 0},
+        ]
+        search = ResourceSearch()
+        search.observe(observed)
+        observed["work_targets"] = []
+        search.select("flint", observed)
+        self.assertEqual(search.strategy, "unknown_frontier")
+        observed["equipment"] = [{"usable": True, "tools": ["MINE"]}]
+        search.select("flint", observed)
+        self.assertEqual(search.strategy, "known_source")
+
     def test_known_land_can_lead_back_to_a_frontier_via_a_short_leg(self):
         observed = observation()
         perception = observed["perception"]

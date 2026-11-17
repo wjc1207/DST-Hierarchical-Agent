@@ -70,6 +70,12 @@ function M.new(G,E)
                 if (x-px)^2+(z-pz)^2<=MAX_LEG_SQ then
                     local row={gx=gx+dx,gz=gz+dz,land=land(x,z)}
                     if G.TheWorld.Map.GetTileAtPoint then row.tile=G.TheWorld.Map:GetTileAtPoint(x,0,z) end
+                    if row.land and G.TheWorld.Map.GetTopologyIDAtPoint then
+                        local topology=G.TheWorld.Map:GetTopologyIDAtPoint(x,0,z)
+                        if type(topology)=="string" and topology~="" then
+                            row.room_type=topology:match("([^:]+)$")
+                        end
+                    end
                     cache.cells[#cache.cells+1]=row
                 end
             end end

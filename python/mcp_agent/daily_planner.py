@@ -1,4 +1,4 @@
-"""Asynchronous task planning for local execution and fast JEV handoffs."""
+"""Asynchronous task planning for local execution."""
 
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ def _short_text(value: object, limit: int) -> str:
 
 
 def validate_plan(raw: object, day: int) -> dict:
-    """Keep only a small, well-formed advisory plan in JEV's state."""
+    """Keep only a small, well-formed advisory plan in the planning context."""
     if not isinstance(raw, dict):
         raise ValueError("DeepSeek plan must be a JSON object")
     if raw.get("kind") == "action_sequence" or (isinstance(raw.get("steps"), list)
@@ -437,7 +437,7 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "It uses observed source positions, region resource memory, Klei room generation priors, then unknown branches. "
         "Priors are possible initial resources, not guarantees, remaining stock, or spawn probabilities. "
         "A route failure is not proof that a resource is absent. Safety always overrides execution; "
-        "JEV handles emergencies and temporary planning gaps only; off-board opportunities do not trigger it. "
+        "The executor applies local safety rules and waits when no board task can advance. "
         "Include needed food, sanity recovery and resource reserves explicitly in the board. "
         "If no tasks remain or no offered action/route can advance the board, reassess and update it. "
         "Keep useful future goals, but include feasible work or resource search for the current phase; "
@@ -452,7 +452,7 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "Do not infer remaining phase duration from quarter number or assume fixed day/dusk/night lengths. "
         "If current facts justify returning now, plan that explicitly; if staying home is intended, add residence rather than "
         "scheduling every remaining task for day 2 and leaving a planning gap. "
-        "JEV temporarily handles local decisions while this evaluation is pending. "
+        "Runnable board tasks can continue while this evaluation is pending. "
         "Quarterly review is a PATCH, not a reset: preserve current goals, priorities, IDs and progress unless "
         "changed facts justify an update. Omitted tasks remain; explicitly cancel using cancel_task_ids with "
         "an explanation in goal/reasons. Do not raise targets just because time passed. "
@@ -549,7 +549,7 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
 def timed_request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
                        conversation: Optional[list[tuple[str, str]]] = None,
                        reference: Optional[dict] = None, cancel_event=None) -> tuple:
-    """Measure the worker's request, excluding the JEV cycle's polling delay."""
+    """Measure the worker's request, excluding the host's polling delay."""
     started_at = time.monotonic()
     try:
         plan = request_plan(api_url, api_key, model, day, context, conversation, reference,
@@ -890,7 +890,7 @@ class DailyPlanner:
             try:
                 result, response_seconds, error = future.result()
             except Exception as exc:
-                # Planning is optional; even an unexpected planner failure must not stop JEV.
+                # Keep the current board after an unexpected planning failure.
                 print(f"daily_plan_error={exc}")
             else:
                 if error is not None:

@@ -23,7 +23,7 @@ Python MCP 服务（工具、状态缓存、动作队列）
 Lua Mod（可用动作、原生执行、结果验证、事件中断）
 ```
 
-Python 不再读取游戏日志或模拟键鼠；Lua 主动异步交换消息。MCP 服务本身不调用模型，不需要模型密钥。项目自带的外部控制程序 `python/mcp_agent/mcp_agent.py` 负责 DeepSeek/JEV 调用和自动循环，也可以替换成其他 MCP 客户端。旧键鼠控制链已删除；模型调用由独立客户端模块实现。
+Python 不再读取游戏日志或模拟键鼠；Lua 主动异步交换消息。MCP 服务本身不调用模型，不需要模型密钥。项目自带的外部控制程序 `python/mcp_agent/mcp_agent.py` 负责 DeepSeek 调用和自动循环，也可以替换成其他 MCP 客户端。旧键鼠控制链已删除；模型调用由独立客户端模块实现。
 
 服务端文件放在 `python/mcp_server/`（入口、`game_bridge.py`、`transport_metrics.py`），客户端文件放在 `python/mcp_agent/`（自动循环、连接检查器）。模型和搜索意图均在 `python/mcp_agent/`，共享规则在 `python/common/`，知识与资源表在 `data/`。Python 读取仓库的 `.env` 和 `logs/`，游戏读取已安装模组中的 `scripts/jev_bridge_config.lua`。也可以在 `python/` 目录运行 `python -m mcp_server` 或 `python -m mcp_agent`。
 
@@ -41,7 +41,7 @@ python .\python\mcp_server\mcp_server.py --configure-only --write-mod-config (Jo
 
 升级时，从仓库的 `mods/dst_player_agent/` 复制运行文件，并保留安装目录的 `scripts/jev_bridge_config.lua` 和原来的令牌。完整更新 Python（包括 `python/mcp_agent/`、`python/mcp_server/`）与 Mod 文件后，重新进入世界。桥接协议为 4，详细测量版本为 1。
 
-## DeepSeek/JEV 自动循环
+## DeepSeek 自动循环
 
 先停止已有的 `--bridge-only`、检查器、其他同端口 MCP 服务及旧控制循环。在装有 MCP 依赖的同一个 Python 环境中运行：
 
@@ -49,23 +49,11 @@ python .\python\mcp_server\mcp_server.py --configure-only --write-mod-config (Jo
 python .\python\mcp_agent\mcp_agent.py --loop --execute
 ```
 
-它自行启动 STDIO MCP 服务，读取现有 `.env` 的 `JEV_API_KEY`、`DEEPSEEK_API_KEY` 和模型配置。省略 `--execute` 只观察一次决策，不发游戏命令、不请求 DeepSeek 规划；`--no-planner` 禁用规划；`--env PATH`、`--config PATH` 可指定已有文件。没有 DeepSeek 密钥时保留 JEV 和执行器运行，不等待不存在的规划。
+启动时读取 `DEEPSEEK_API_KEY`。传入 `--loop --execute` 启动后台规划。省略 `--execute` 时只读取一次游戏状态。`--env PATH` 和 `--config PATH` 可指定已有文件。
 
-自动循环与外部 MCP 客户端必须二选一占用桥接端口。启动时先检查端口，HTTP 服务绑定时再次执行原子独占检查（Windows 使用 `SO_EXCLUSIVEADDRUSE`，禁用端口复用）。已有 Codex MCP、检查器、`--bridge-only` 或其他服务占用 8765 时，程序输出 `mcp_startup_error bridge_port_unavailable address=127.0.0.1:8765` 并以状态码 2 退出，不进入断线重试、不自动连接旧服务，也不终止原进程。先停用旧客户端／服务，再启动 `python/mcp_agent/mcp_agent.py`；旧服务若由客户端管理，直接结束进程可能被客户端再次拉起。此端口检查的 Python 文件位于 `python/mcp_server/`、`python/mcp_agent/`；不改 Mod 或令牌。
+MCP 服务调度任务看板。规划期间已有可执行任务可以继续，没有任务可推进时待命。本地规则可处理逃跑、夜间照明、紧急进食和降温。Lua 校验并执行动作。
 
-| 组件 | 职责 |
-| --- | --- |
-| DeepSeek | 维护优先级目标、依赖和搜索预算；季度后台复核，不强制换目标 |
-| JEV | 安全变化、导航中的新类型计划外机会，以及缺少规划时的选择 |
-| Python 意图执行器 | 优先完成所有可见可执行任务，再为最高优先目标导航；保留进度及失败记忆 |
-| Lua 执行器 | 接近、连续行走、采集、制作、逃跑、完成验证与实时安全中断；保留旧看板客户端兼容 |
-| MCP 服务 | 原子状态／动作快照、观察凭据、单动作队列和看板交接，无模型调用 |
-
-两种模型复用同一游戏事实投影，含 Lua 可用动作、区域生成资源先验与未支持能力。普通看板任务不逐次询问 JEV；危险、受伤、光照或紧急饥饿可交回安全决策。DeepSeek 请求在后台运行，已有看板继续执行。旧 Lua 看板暂停仍需先等确认，新版看板仅由 Python 调度。使用作出选择时的原观察凭据提交动作，Lua 按实时状态校验。世界／玩家会话变更或死亡时停止，断线时不向旧状态发命令。
-
-按 `Ctrl+C` 停止，程序请求取消并等待确认；来不及确认则依赖服务关闭后的 3 秒租约停止。不要把关窗口等同于立即停止角色。终端输出 `TASK BOARD`、`task_board_action`、`lua_action`、`mcp_cycle` 和规划预览；细分时序保存在 `logs/mcp_timing.jsonl`，新规划保存在 `logs/task_board.json` 与 `logs/task_board.jsonl`。旧动作序列日志不代表当前活动规划。旧键鼠控制链及预测缓冲已移除。
-
-科学机器建造仅由 DeepSeek 看板或显式 MCP 指令发起，不进入 JEV 候选；规划空窗期也不会让 JEV 自行再造科学机器。其他原有本地动作保持不变。
+科学机器建造仅由 DeepSeek 看板或显式 MCP 指令发起。
 
 ## 优先级看板与资源导航（1.8.7）
 
@@ -111,9 +99,9 @@ DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priorit
 | `explore_other_region` | `new_regions`：本步新发现指定数量的拓扑节点，默认 1；不是前往任意旧区域 |
 | `wait` | `seconds`：有界等待 1–30 秒，安全事件仍能中断 |
 
-不会自动发明工具／配方前置任务；DeepSeek 必须明确把前置操作排在前面。暂时没有合法动作或失败／超时会停止这批并要求重规划，而不是偷偷执行后面的步骤。事件快照可能使验证晚一个上传周期，但不能靠预测状态完成步骤。计划内普通资源出现不触发 JEV；原生探索可能为资源事件返回控制，Python 会继续当前步而不调用模型。
+不会自动发明工具／配方前置任务；DeepSeek 必须明确把前置操作排在前面。暂时没有合法动作或失败／超时会停止这批并要求重规划，而不是偷偷执行后面的步骤。事件快照可能使验证晚一个上传周期，但不能靠预测状态完成步骤。原生探索可能为资源事件返回控制，Python 会继续当前步而不调用模型。
 
-升级此旧版功能需要同步新增的 `python/mcp_agent/action_sequence.py` 及更新后的 `python/mcp_agent/daily_planner.py`、`python/mcp_agent/mcp_agent.py`、`python/mcp_agent/navigation_intents.py`、`python/mcp_agent/jev_client.py`、`data/DSTKnowledge.txt`，重启 Python。桥接协议仍为 4；此功能不修改 Lua 协议。这些纯语义序列仅保留 MCP 兼容，不包含键鼠路径。
+升级此旧版功能需要同步新增的 `python/mcp_agent/action_sequence.py` 及更新后的 `python/mcp_agent/daily_planner.py`、`python/mcp_agent/mcp_agent.py`、`python/mcp_agent/navigation_intents.py`、`data/DSTKnowledge.txt`，重启 Python。桥接协议仍为 4；此功能不修改 Lua 协议。这些纯语义序列仅保留 MCP 兼容，不包含键鼠路径。
 
 ## 其他 MCP 客户端与连接检查
 
@@ -154,7 +142,7 @@ python .\python\mcp_server\mcp_server.py --bridge-only
 
 建筑记忆、前往建筑、设置家和返回家见 [地点与家](PLACES.md)。
 
-新增 DeepSeek 侧配方查询与通用制作／放置，详见 [配方说明](RECIPES.md)。JEV 候选保持原有范围。
+新增 DeepSeek 侧配方查询与通用制作／放置，详见 [配方说明](RECIPES.md)。
 
 | 工具 | 含义 |
 | --- | --- |
@@ -208,7 +196,7 @@ Lua 一次仅发一个 HTTP 请求，约 0.5 秒发送一次轻量心跳；执�
 - `lua_execution_ms`：接受到结果验证完成，含接近、行走及游戏动作，不应当作纯动画时长。
 - `lua_finish_to_exchange_ms`：完成后等待发出状态的游戏时间；`lua_previous_http_round_trip_ms` 是前一有效 HTTP 请求的游戏时间往返，用于定位引擎回调／交换等待，暂停时不等于墙钟网络延迟。
 - `queue_to_delivery_ms`：服务排队到首次把命令放进 HTTP 响应；`delivery_to_running_report_ms`：响应准备到收到 running 回报（包含传输及回报等待）；`terminal_cache_ms`：服务收到终态到当前读取；均使用服务自己的单调时钟。
-- `host_observed_to_submit_ms`：Python 得知上一终态到提交下一命令的时间；可结合 JEV／看板同步事件定位空档。
+- `host_observed_to_submit_ms`：Python 得知上一终态到提交下一命令的时间；可结合看板同步事件定位空档。
 
 Lua 游戏时钟、服务时钟和宿主时钟不互相相减。各字段可能覆盖同一段等待，不要直接相加；旧的 `action.execute` 仍是宿主等待整个动作的时长，不能作为角色实际行动时间。本次仅优化交接并增加测量，决策预测缓冲仍待接入 MCP 路径。
 
@@ -222,7 +210,6 @@ Lua 游戏时钟、服务时钟和宿主时钟不互相相减。各字段可能�
 | Lua 动作与候选 | `native_tick_ms`、`board_step_ms`、`board_ready_ms`、`available_actions_ms`、`control_status_ms` |
 | Lua 请求与回调 | `encode_ms`、`query_call_ms`、`query_to_callback_ms`、`decode_ms`、`callback_dispatch_ms`、请求／响应字节数 |
 | Python HTTP | `body_read_ms`、`json_decode_ms`、`lock_wait_ms`、`state_copy_ms`、`exchange_ms`、`json_encode_ms`、`headers_write_ms`、`body_write_ms`、`server_total_ms` |
-| JEV 后台线程 | `worker_queue_ms`、状态／请求编码、`api.response_headers`、`api.read_body`、`api.parse_response` |
 | 宿主发现模型结果 | `decision.result_observed.result_ready_to_notice_ms` |
 
 Lua 优先采用原版 profiler 使用的高精度 `walltime`，回退到 `GetTimeRealSeconds`（或 `GetTimeReal()/1000`），不再用帧内不前进的 `GetTime()` 计 CPU／请求耗时。没有实时时钟则标记 `unavailable`。`query_call_ms` 是原生 API 返回前的同步调用时间；`query_to_callback_ms` 是调用到 Lua 回调入口，**仍包含引擎排队、实际 HTTP 与回调派发，不能独立称为网络延迟**。回调解码和控制派发另计。
@@ -231,7 +218,7 @@ HTTP 接收行按 `(server_id, session_id, sequence)` 标识。Lua 编码与回�
 
 服务端在写出响应后才落日志，`server_total_ms` 不含这次诊断文件写入；写 socket 完成并不证明 Lua 已收到响应。`exchange_ms` 包含锁等待和状态复制；`state_total_ms` 包含子采样、控制状态计算包含候选计算，这些父子阶段不能重复相加。只比较各自时钟中的持续时间，不直接相减不同进程的绝对时间戳。
 
-JEV 的每次请求有独立 `request_id`。`decision.submitted` 记录来源游戏会话、状态消息序号和上一动作 ID；`decision.worker_completed.worker_timing` 保存独立后台计时，不能再加到主循环耗时中。`api.response_headers` 包含连接、上传、服务端处理至收到响应头的整体，并不等于纯模型推理。结果已完成却要等到下次轮询才发现的时间单列；丢弃／失败的请求仍保留已完成的测量，原异常类型不变。DeepSeek 沿用已有后台规划总耗时，本版不改变规划或决策策略，也未启用预测缓冲。
+DeepSeek 规划和原生执行耗时分别记录。
 
 ### HTTP 上传握手（1.8.4）
 
@@ -243,7 +230,7 @@ Python 回环服务改用 HTTP/1.1，在合法的 `Expect: 100-continue` 请求�
 
 ### 实时校验归 Mod（1.8.5）
 
-模型请求不再使用 Python 的整份上下文相等检查。JEV 只能返回本次请求提供过的选项，但目标是否仍可采、材料是否足够、当前危险／照明是否允许，由 Lua 收到命令后判定。MCP 工具同样适用，不限于内置控制循环。目标 GUID、prefab、动作种类、导航节点／模式保持一致；允许按当前事实刷新路线坐标，不悄悄更换采集对象或导航目的区域。
+模型请求不再使用 Python 的整份上下文相等检查。目标是否仍可采、材料是否足够、当前危险／照明是否允许，由 Lua 收到命令后判定。MCP 工具同样适用，不限于内置控制循环。目标 GUID、prefab、动作种类、导航节点／模式保持一致；允许按当前事实刷新路线坐标，不悄悄更换采集对象或导航目的区域。
 
 例如，选择逃跑后生命下降或敌人更换，Python 仍提交原逃跑意图，Lua 重算当前可通行路线；逃跑过程中继续掉血不会因此中断。若敌人已经消失则返回 `threat_cleared`，无路可走返回 `no_safe_escape_route`，不自动改选等待或采集。选择采草后目标已空、消失或更换，则分别返回 `target_not_collectable`、`target_missing`、`target_changed`；遭敌人锁定则返回 `targeted_by_hostile`；其他当前不可用条件返回 `action_unavailable`。终端保留动作名称和明确拒绝原因，下一轮从新状态重新决策。
 
@@ -280,7 +267,7 @@ Python 保留会话／玩家变更、死亡停止、观察凭据过期、断线�
 
 新增坐标移动工具 `move_to(x,z,observation_id,arrival_radius=2)`，只接受已观察陆地；
 Lua 复查路线、危险和照明。DS 的按需地图图片查询及建家流程见
-[看图选址与前往坐标](MAP_SELECTION.md)。该能力保留 JEV 候选范围和建筑家锚点。
+[看图选址与前往坐标](MAP_SELECTION.md)。该能力继续支持建筑家锚点。
 
 任务开始时间和驻留使用 Python 优先级调度器，详见 [任务时间与驻留](TASK_TIME.md)。
 `submit_task_board` 返回单任务时间参数错误 `task_errors`；定时看板由 Python 执行。`start_action` 可附带 `residence={home_id,radius}`，由 MCP 绑定
@@ -303,7 +290,7 @@ python -m unittest discover -s tests -p test_mcp_agent.py -v
 更新 Lua 后重新进入世界；带此约束的看板要求 Python 调度。
 
 
-温度预警、添料暂停、夜间降温避让及相关日志字段见[温度安全与火势控制](THERMAL.md)。`cool_down` 为宿主确定性安全动作，JEV 选项保持不变。
+温度预警、添料暂停、夜间降温避让及相关日志字段见[温度安全与火势控制](THERMAL.md)。`cool_down` 为宿主确定性安全动作。
 
 
 `hunger_ratio` 看板任务支持可选任务级 `duration`（游戏天）：达标后为 `maintaining` 并释放执行权，低于目标重新补食，到期达标完成，否则过期。它由 Python 优先级主循环计时，拒绝原生 `auto_execute=true`。详见[任务时间与饥饿维持](TASK_TIME.md)。

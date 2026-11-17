@@ -54,6 +54,9 @@ class CompanionBridge:
                     or (control["mode"] == "autonomous" and not control["goal"])
                     or type(state.get("ready")) is not bool):
                 raise BridgeError("Invalid companion intent")
+            paused = state.get("paused", False)
+            if type(paused) is not bool:
+                raise BridgeError("Invalid companion pause state")
             remote = state.get("companion")
             age = state.get("snapshot_age_ms")
             if remote is not None and not isinstance(remote, dict):
@@ -78,7 +81,10 @@ class CompanionBridge:
                 self.feedback.clear()
             if sequence <= self.sequence:
                 raise BridgeError("Out-of-order companion exchange")
+            was_paused = bool(self.state and self.state.get("paused"))
             old_basis = self._basis() if self.state else None
+            if paused != was_paused:
+                self.observations.clear()
             self.state = copy.deepcopy(state)
             companion = self.state.get("companion") or {}
             if isinstance(companion.get("buddy"), dict) and companion["buddy"].get("inventory") == []:
@@ -136,16 +142,19 @@ class CompanionBridge:
                 if not identity:
                     continue
                 record = self.actions[identity]
-                if record["status"] == "queued" and self.clock() - record["at"] > 5:
+                if record["status"] == "queued" and was_paused and not paused:
+                    record.update(status="interrupted", reason="game_resumed_refresh")
+                    setattr(self, slot, None)
+                elif not paused and record["status"] == "queued" and self.clock() - record["at"] > 5:
                     record.update(status="failed", reason="dispatch_expired")
                     setattr(self, slot, None)
-                elif record["status"] == "queued" and command is None:
+                elif not paused and record["status"] == "queued" and command is None:
                     command = {k: record[k] for k in ("id", "op", "args", "token", "revision")}
             self.feedback = OrderedDict((key, value) for key, value in self.feedback.items()
                                         if value["revision"] == basis[2]
                                         and value.get("dialogue_revision") == control.get("dialogue_revision"))
             return {"server_id": self.server_id, "session_id": session, "sequence": sequence,
-                    "board_revision": 0, "command": command, "feedback": list(self.feedback.values())}
+                    "board_revision": 0, "command": command, "feedback": [] if paused else list(self.feedback.values())}
 
     def observe(self):
         with self.lock:
@@ -164,6 +173,8 @@ class CompanionBridge:
     def action(self, op, observation_id, args=None):
         with self.lock:
             self._fresh()
+            if self.state.get("paused"):
+                raise BridgeError("Game is paused")
             observation = self.observations.get(observation_id)
             if not observation or self.clock() - observation[0] > 3 or observation[1] != self._basis():
                 raise BridgeError("Expired observation or changed companion intent")
@@ -203,7 +214,7 @@ class CompanionBridge:
                         or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args["task_key"])
                         or not isinstance(args.get("prefab"), str) or not re.fullmatch(r"[a-z0-9_]{1,60}", args["prefab"])
                         or type(args.get("total_count")) is not int or not 1 <= args["total_count"] <= 100):
-                    raise BridgeError("Invalid transfer arguments")
+                    raise BridgeError("Invalid counted item action arguments")
                 if capability == "storage":
                     guid(args["container_guid"])
                     if not any(r["guid"] == args["container_guid"] and r.get("contents_known") for r in snapshot.get("containers", [])):

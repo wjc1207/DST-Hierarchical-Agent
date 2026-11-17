@@ -32,6 +32,16 @@ test("perception exposes bounded local terrain and only walkable offered legs",f
     for _,p in ipairs(data.points) do assert(p.x<=8 and p.x^2+p.z^2<=400) end
     w.clear=false;w.now=3;assert(#w.sensor.observe(w.actor,{}).points==0)
 end)
+test("local land exposes topology room types while missing IDs stay unknown",function()
+    local w=fixture()
+    w.G.TheWorld.Map.GetTopologyIDAtPoint=function(_,x)
+        return x<0 and "Task:Subtask:BGForest" or ""
+    end
+    for _,cell in ipairs(w.sensor.observe(w.actor,{}).cells) do
+        if cell.gx<0 then assert(cell.room_type=="BGForest")
+        else assert(cell.room_type==nil) end
+    end
+end)
 test("terrain sampling is cached but hazards are freshly checked",function()
     local w=fixture();local first=w.sensor.observe(w.actor,{});local calls=w.calls
     w.now=.5;w.sensor.observe(w.actor,{});assert(w.calls==calls)

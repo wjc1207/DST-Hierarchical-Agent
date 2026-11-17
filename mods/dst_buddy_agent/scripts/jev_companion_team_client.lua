@@ -4,7 +4,7 @@ local M={validate_text=Core.validate_text}
 local ACTIVITY={
     collect="采集",search="探索",equip="装备工具",unequip="收起工具",work="工作",CHOP="砍树",MINE="挖矿",
     craft="制作",place="建造",visit_building="前往建筑",move="移动",give_owner="交付物品",
-    drop_item="放下物品",deposit="存放物品",withdraw="取出物品",
+    eat="进食",drop_item="放下物品",deposit="存放物品",withdraw="取出物品",
 }
 function M.new(env)
     local self={children={},roster={},roster_version=0,requests={},deleting={},serial=0,httpseq=0,last_http=-math.huge,last_ok=env.now(),
@@ -15,7 +15,7 @@ function M.new(env)
         local c=self.children[row.id]
         if c and c.team_name==row.name then return c end
         self.child_generation=self.child_generation+1
-        local ce={name=row.name,nonce=env.nonce..":"..row.id..":g"..self.child_generation,now=env.now,http_enabled=env.http_enabled,managed_http=true,
+        local ce={name=row.name,nonce=env.nonce..":"..row.id..":g"..self.child_generation,now=env.sim_now or env.now,http_enabled=env.http_enabled,managed_http=true,
             notice=notice,resume_goal=function()
                 local buddy=(c.snapshot or {}).buddy
                 if self.control.mode=="autonomous" and c.control.mode=="instruction"
@@ -107,7 +107,7 @@ function M.new(env)
     function self:fetch_roster(callback)
         self.serial=self.serial+1
         local q={id=env.nonce..":roster:"..self.serial,seq=self.serial,op="roster"}
-        self.requests[q.id]={seq=q.seq,callback=callback,at=env.now()};self.last_roster=env.now();env.send(q)
+        self.requests[q.id]={seq=q.seq,callback=callback,at=(env.sim_now or env.now)()};self.last_roster=self.requests[q.id].at;env.send(q)
     end
     function self:delete(row)
         if self.deleting[row.id] then return end
@@ -115,7 +115,7 @@ function M.new(env)
         local q={id=env.nonce..":delete:"..self.serial,seq=self.serial,op="delete",buddy_id=row.id,
             args={name=row.name,guid=row.guid,roster_version=row.roster_version}}
         self.deleting[row.id]=true
-        self.requests[q.id]={seq=q.seq,at=env.now(),op=q.op,callback=function(ok)
+        self.requests[q.id]={seq=q.seq,at=(env.sim_now or env.now)(),op=q.op,callback=function(ok)
             self.deleting[row.id]=nil
             notice(ok and ("已删除伙伴 "..row.name.."。") or ("未能删除伙伴 "..row.name.."，请刷新后重试。"))
         end}
@@ -262,17 +262,56 @@ function M.new(env)
         self:interrupt(text,nil,true)
         return true
     end
-    function self:tick()
+    function self:tick(paused)
         local now=env.now()
-        for id,pending in pairs(self.requests) do if now-pending.at>10 then
-            self.requests[id]=nil;notice("伙伴名册请求超时，请重试。")
-            if pending.callback then pending.callback(false) end
-        end end
-        if now-self.last_roster>=3 then self:fetch_roster() end
-        for _,c in pairs(self.children) do c:tick() end
+        local sim_now=env.sim_now and env.sim_now() or now
+        -- Also recognize a frozen simulation if wall updates were suspended.
+        local frozen_gap=self.last_tick and now-self.last_tick>2
+            and sim_now-self.last_sim_tick<.5
+        self.last_tick,self.last_sim_tick=now,sim_now
+        if paused or frozen_gap then
+            if paused and self.resume_started then self.resume_versions=nil end
+            if not self.resume_versions then
+                self.resume_versions={}
+                for id,c in pairs(self.children) do
+                    if c.token then self.resume_versions[id]=c.seq end
+                end
+            end
+        end
+        if not paused then
+            if self.resume_versions and not self.resume_started then
+                self.resume_started=now
+                self.last_ok=now -- Allow the fresh post-resume exchange before the disconnect check.
+                self.inflight=false
+                self.http_generation=(self.http_generation or 0)+1
+                self.retry_at=0
+                for _,c in pairs(self.children) do
+                    if c.state_pending then c.requests[c.state_pending]=nil;c.state_pending=nil end
+                    c.last_state=-math.huge
+                end
+            end
+            for id,pending in pairs(self.requests) do if sim_now-pending.at>10 then
+                self.requests[id]=nil;notice("伙伴名册请求超时，请重试。")
+                if pending.callback then pending.callback(false) end
+            end end
+            if sim_now-self.last_roster>=3 then self:fetch_roster() end
+            for _,c in pairs(self.children) do c:tick() end
+            if self.resume_versions then
+                for id,seq in pairs(self.resume_versions) do
+                    local c=self.children[id]
+                    if not c or not c.token or c.snapshot_seq>seq then self.resume_versions[id]=nil end
+                end
+                if next(self.resume_versions)==nil then
+                    self.resume_versions,self.resume_started=nil,nil
+                end
+            end
+        else
+            self.resume_started=nil
+        end
         self.control.enabled=any_enabled()
         if not env.http_enabled then return end
-        if self.control.enabled and now-self.last_ok>3 and (not self.task_started or now-self.task_started>5) then
+        local suspended=paused==true or self.resume_versions~=nil
+        if not paused and self.control.enabled and now-self.last_ok>3 and (not self.task_started or now-self.task_started>5) then
             self:interrupt("@全体 暂停","stay");notice("本机 AI 未连接，已暂停伙伴任务。")
         end
         if self.inflight and now-self.http_at>3 then self.inflight=false;self.http_generation=self.http_generation+1 end
@@ -284,18 +323,19 @@ function M.new(env)
         for id,c in pairs(self.children) do
             if c.token then
                 members[id]={companion=c.snapshot,control=c.control,ready=c:ready()==true,
-                    snapshot_age_ms=c.snapshot and (now-c.last_snapshot)*1000 or nil}
+                    snapshot_age_ms=c.snapshot and math.max(0,sim_now-c.last_snapshot)*1000 or nil}
                 for _,key in ipairs(c.result_order) do
                     local row={buddy_id=id};for k,v in pairs(c.results[key]) do row[k]=v end;results[#results+1]=row
                 end
             end
         end
-        env.http({session_id=env.nonce,sequence=sequence,kind="snapshot",state={team=true,control=self.control,
+        env.http({session_id=env.nonce,sequence=sequence,kind="snapshot",state={team=true,paused=suspended,control=self.control,
             roster=self.roster,members=members},results=results},function(response)
             if generation~=self.http_generation then return end
             self.inflight=false
             if type(response)~="table" or response.session_id~=env.nonce or response.sequence~=sequence then self.retry_at=env.now()+.5;return end
             self.retry_at=0;self.last_ok=env.now()
+            if suspended or self.resume_versions or (env.paused and env.paused()) then return end
             for _,message in ipairs(response.feedback or {}) do
                 -- Ignore legacy team broadcasts; speech must identify an actual companion.
                 if not message.team and not self.deleting[message.buddy_id] and self.children[message.buddy_id] then self.children[message.buddy_id]:feedback(message) end

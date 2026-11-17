@@ -220,6 +220,19 @@ test("fresh state versions can arrive on older request IDs; cached states never 
     w.client:receive({id=first,seq=w.wire[i].seq,op="move",status="completed",state={version=4}})
     assert(w.client.last_snapshot==2)
 end)
+test("periodic state recovers a lost terminal reply without repeating the action",function()
+    local w=client_world();w:bind()
+    w.client:apply_command({id="search-1",op="search",revision=0,token="bound",args={}})
+    local action=w.wire[#w.wire]
+    w:receive(#w.wire,"running",2)
+    w.client:send("state")
+    w:receive(#w.wire,"completed",3,0,{state={bound=true,token="bound",version=3,revision=0,
+        last_action_result={id=action.id,seq=action.seq,op=action.op,status="completed",reason="search_leg_arrived"}}})
+    assert(w.client.results["search-1"].status=="completed")
+    assert(w.client.results["search-1"].reason=="search_leg_arrived" and not w.client.requests[action.id])
+    w.time=12;w.client:tick()
+    assert(w.client.results["search-1"].status=="completed")
+end)
 test("late local commands are rejected and command redelivery does not duplicate RPCs",function()
     local w=client_world();w:bind()
     local before=#w.wire
@@ -317,13 +330,19 @@ test("Mod entry wires slash commands, real actor snapshots and compliant local H
     local function encode(value) packets[#packets+1]=value;return tostring(#packets) end
     local codec={encode=encode,decode=function(value) return packets[tonumber(value)] end,
         encode_compliant=function(value) compliant=compliant+1;return encode(value) end}
-    local last_http
-    local G={ThePlayer=player,GetTime=function() return now end,walltime=function() return now end,pcall=pcall,
+    local last_http,heartbeat,world_removed
+    local net_paused=false
+    local G={IsPaused=function() return true end,
+        TheNet={IsServerPaused=function() return net_paused end,IsDedicated=function() return false end},
+        TheFrontEnd={StartUpdatingWidget=function(_,widget) heartbeat=widget end,
+            StopUpdatingWidget=function(_,widget) assert(heartbeat==widget);heartbeat=nil end},
+        ThePlayer=player,GetTime=function() return now end,walltime=function() return now end,pcall=pcall,
         net_string=function()
             local value="";return {value=function() return value end,set=function(_,v) value=v end}
         end,
         ChatHistory={SendCommandResponse=function() end},Vector3=function(x,y,z) return {x=x,y=y,z=z} end,
         TheWorld={ismastersim=true,state={cycles=0,phase="day",time=.1},DoPeriodicTask=function(_,_,fn) ticks[#ticks+1]=fn end,
+            ListenForEvent=function(_,event,fn) assert(event=="onremove");world_removed=fn end,
             Map={IsPassableAtPoint=function() return true end,IsAboveGroundAtPoint=function() return true end}},
         Ents={},TheSim={FindEntities=function() return {player,buddy} end}}
     G.SendModRPCToServer=function(_,encoded) requests.request(player,encoded) end
@@ -344,20 +363,56 @@ test("Mod entry wires slash commands, real actor snapshots and compliant local H
         AddModRPCHandler=function(_,name,fn) requests[name]=fn end,
         AddClientModRPCHandler=function(_,name,fn) client_handlers[name]=fn end,
         AddClassPostConstruct=function(name,fn) hooks[name]=fn end,AddSimPostInit=function(fn) init=fn end},{__index=_G})
-    env.AddPrefabPostInit=function(name,fn) assert(name=="wilson");fn(buddy) end
+    local prefab_hooks={}
+    env.AddPrefabPostInit=function(name,fn) prefab_hooks[name]=fn end
+    G.TheWorld.components={}
+    function G.TheWorld:AddComponent(name)
+        local path="mods/dst_buddy_agent/scripts/components/"..name..".lua"
+        local component_env={Class=function(ctor)
+            local class={}
+            return setmetatable(class,{__call=function(_,inst)
+                local instance=setmetatable({},{__index=class});ctor(instance,inst);return instance
+            end})
+        end}
+        local chunk
+        if setfenv then chunk=assert(loadfile(path));setfenv(chunk,component_env)
+        else chunk=assert(loadfile(path,"t",component_env)) end
+        self.components[name]=chunk()(self)
+    end
     local chunk
     if setfenv then chunk=assert(loadfile("mods/dst_buddy_agent/modmain.lua"));setfenv(chunk,env)
     else chunk=assert(loadfile("mods/dst_buddy_agent/modmain.lua","t",env)) end
-    chunk();init()
+    chunk()
+    assert(prefab_hooks.cave and prefab_hooks.world)
+    local remote_world={ismastersim=false}
+    prefab_hooks.forest(remote_world)
+    prefab_hooks.forest(G.TheWorld)
+    local persistence=assert(G.TheWorld.components.jev_companion_persistence)
+    assert(persistence:OnSave()==nil)
+    persistence:LoadPostPass({},nil)
+    prefab_hooks.wilson(buddy)
+    local server_ticks=0
+    local tick=persistence.server.tick
+    function persistence.server:tick()
+        server_ticks=server_ticks+1
+        return tick(self)
+    end
+    init()
     local text,forwarded="/buddy bind",0
     local screen={chat_edit={GetString=function() return text end},Run=function() forwarded=forwarded+1 end}
     hooks["screens/chatinputscreen"](screen);screen:Run()
     assert(buddy._jev_companion_owner=="A" and forwarded==0)
     text="/buddy do I'm collecting 草";screen:Run()
     now=now+.1;for _,fn in ipairs(ticks) do fn() end
-    assert(compliant==1 and last_http.state.control.instruction=="I'm collecting 草")
-    assert(last_http.state.team and last_http.state.members.buddy1.ready and last_http.state.members.buddy1.companion.buddy.guid==2)
+    assert(server_ticks==1 and compliant==1 and last_http.state.control.instruction=="I'm collecting 草")
+    assert(last_http.state.team and not last_http.state.paused and last_http.state.members.buddy1.ready
+        and last_http.state.members.buddy1.companion.buddy.guid==2)
+    net_paused=true;now=now+1;heartbeat:OnUpdate()
+    assert(server_ticks==1 and last_http.state.paused)
+    net_paused=false;now=now+1;for _,fn in ipairs(ticks) do fn() end
+    assert(server_ticks==2 and not last_http.state.paused)
     text="你好";screen:Run();assert(forwarded==1)
+    world_removed();assert(not heartbeat)
 end)
 local function summon_world()
     local w=world();w.buddy=nil;w.spawns=0
