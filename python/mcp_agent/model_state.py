@@ -104,7 +104,7 @@ def model_game_state(state: dict) -> dict:
                 k: a for k, a in bridge.get("available_actions", {}).items() if not a.get("planner_only")
                 and k not in rules.PLANNER_ONLY_ACTIONS},
             "board_revision": bridge.get("board_revision"), "board_paused": bridge.get("board_paused"),
-            "unsupported": ["attack", "equip_weapon", "automatic_tool_prerequisite_solver"],
+            "unsupported": ["attack", "automatic_tool_prerequisite_solver"],
         }
     # Older Mod snapshots may still contain world-area counters. Models see one
     # explicit grid-cell unit; retain the original snapshot for transport clients.

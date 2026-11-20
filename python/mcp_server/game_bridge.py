@@ -26,7 +26,7 @@ TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
 from common.camp_work import CAMP_ACTIONS, CAMP_TARGETS
 
 SUPPORTED = CAMP_ACTIONS | {"cool_down", "add_fuel", "set_home", "craft", "place", "wait", "collect", "craft_torch", "craft_axe", "craft_pickaxe",
-             "equip_torch", "unequip_torch", "eat_safe_food", "cook_food",
+             "equip_torch", "unequip_torch", "equip_item", "unequip_item", "eat_item", "drop_item", "eat_safe_food", "cook_food",
              "build_campfire", "build_sciencemachine",
              "chop_nearest_tree", "mine_nearest_rock", "explore", "flee_from_nearest_hostile"}
 
@@ -109,7 +109,7 @@ class GameBridge:
         self.map_version, self.map_cells = None, None
         self.agent_feedback = OrderedDict()
 
-    def send_agent_feedback(self, text, revision, message_id, finish=False):
+    def send_agent_feedback(self, text, revision, message_id, finish=False, dialogue_revision=None):
         """Idempotent player chat delivery scoped to the exact player intent."""
         with self.lock:
             self._fresh()
@@ -117,13 +117,17 @@ class GameBridge:
                 autonomy.validate_text(text)
             except ValueError as exc:
                 raise BridgeError(str(exc)) from exc
+            current_dialogue = (self.state.get("autonomy") or {}).get("dialogue_revision")
             if (type(revision) is not int or revision != autonomy.revision(self.state)
+                    or dialogue_revision != current_dialogue
                     or not isinstance(message_id, str) or not 1 <= len(message_id) <= 100
                     or type(finish) is not bool):
                 raise BridgeError("Agent feedback belongs to obsolete/invalid player intent")
             if finish and (self.state.get("autonomy") or {}).get("mode") != "instruction":
                 raise BridgeError("Only instruction mode may finish control")
             message = {"id": message_id, "text": text, "revision": revision, "finish": finish}
+            if dialogue_revision is not None:
+                message["dialogue_revision"] = dialogue_revision
             existing = self.agent_feedback.get(message_id)
             if existing is not None and existing != message:
                 raise BridgeError("Agent feedback ID reused with different content")
@@ -304,8 +308,10 @@ class GameBridge:
                           and type(self.state.get("recipe_version")) is int
                           and self.recipe_catalog_version != self.state["recipe_version"]}
             current_revision = autonomy.revision(self.state or {})
+            current_dialogue = ((self.state or {}).get("autonomy") or {}).get("dialogue_revision")
             self.agent_feedback = OrderedDict((key, message) for key, message in self.agent_feedback.items()
-                                             if message["revision"] == current_revision)
+                                             if message["revision"] == current_revision
+                                             and message.get("dialogue_revision") == current_dialogue)
             result["agent_feedback"] = list(self.agent_feedback.values())
             if kind == "snapshot" or control.get("board_revision") != self.board_revision:
                 result["task_board"] = copy.deepcopy(self.board)
@@ -367,7 +373,7 @@ class GameBridge:
                         self.state["bridge"].get("executor_busy") or (self.board and self.board.get("auto_execute"))),
                     "task_board": board_view(self.board, self.state) if self.board else None}
 
-    def start_action(self, choice: str, observation_id: str, navigation_targets: list | None = None, residence: dict | None = None, destination: dict | None = None, placement: dict | None = None):
+    def start_action(self, choice: str, observation_id: str, navigation_targets: list | None = None, residence: dict | None = None, destination: dict | None = None, placement: dict | None = None, transfer_count: int | None = None):
         with self.lock:
             self._fresh()
             if not autonomy.enabled(self.state):
@@ -408,6 +414,12 @@ class GameBridge:
                 if old.get("kind") != "explore":
                     raise BridgeError("Navigation targets apply only to offered navigation actions")
                 action["navigation_targets"] = validate_navigation_targets(navigation_targets)
+            if transfer_count is not None:
+                if action.get("kind") not in {"store_item", "take_item"}:
+                    raise BridgeError("transfer_count applies only to store_item and take_item")
+                if type(transfer_count) is not int or not 1 <= transfer_count <= 40:
+                    raise BridgeError("transfer_count must be an integer 1..40")
+                action["transfer_count"] = transfer_count
             action_id = secrets.token_hex(12)
             record = {"action_id": action_id, "session_id": self.session, "choice": choice,
                       "action": action, "status": "queued", "reason": "",

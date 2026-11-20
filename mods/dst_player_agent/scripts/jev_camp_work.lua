@@ -4,8 +4,9 @@ local fire_siting=require("jev_campfire_siting")
 local M={}
 local RANGE=3
 local kinds={open_container=true,store_item=true,take_item=true,start_meal=true,harvest_meal=true,ignite_tree=true}
-local trees={evergreen=true,evergreen_sparse=true}
-local fixtures={treasurechest=true,cookpot=true}
+local trees={evergreen=true,evergreen_sparse=true,deciduoustree=true,twiggytree=true}
+local fixtures={treasurechest=true,dragonflychest=true,icebox=true,cookpot=true}
+local storages={treasurechest=true,dragonflychest=true,icebox=true}
 local safe_meals={meatballs=true,ratatouille=true}
 local TREE_SPREAD_MAX=7 -- Vanilla evergreen uses MakeMediumPropagator (5..7).
 local SPREAD_MARGIN=.5
@@ -153,7 +154,7 @@ end
 local function valid_tree(e)
     return e and trees[e.prefab] and e:HasTag("CHOP_workable") and e:HasTag("canlight")
         and not e:HasTag("burnt") and not e:HasTag("fire") and not e:HasTag("smolder")
-        and not e:HasTag("stump") and not e:HasTag("plantcreature")
+        and not e:HasTag("stump") and not e:HasTag("plantcreature") and not e:HasTag("monster")
 end
 
 local function ignition_radius(G,e)
@@ -255,9 +256,9 @@ function M.scan(G,player,state,memory,cooking)
                 native_offer(opts,"harvest_meal",row)
             elseif row.contents_known then
                 for _,item in ipairs(row.items) do
-                    if row.prefab=="treasurechest" and can_fit(inv,c:GetItemInSlot(item.slot)) then
+                    if storages[row.prefab] and can_fit(inv,c:GetItemInSlot(item.slot)) then
                         native_offer(opts,"take_item",row,{slot=item.slot,item_guid=item.guid,product=item.prefab,
-                            contents_key=row.contents_key},":"..item.slot)
+                            available=item.count,contents_key=row.contents_key},":"..item.slot)
                     end
                 end
                 for _,item in ipairs(carried()) do
@@ -265,7 +266,7 @@ function M.scan(G,player,state,memory,cooking)
                     local inst=from:GetItemInSlot(item.slot)
                     if inst and can_fit(c,inst,row.prefab=="cookpot") then
                         native_offer(opts,"store_item",row,{slot=item.slot,item_guid=item.guid,source=item.source,
-                            product=item.prefab,contents_key=row.contents_key},":"..item.source..":"..item.slot)
+                            product=item.prefab,available=item.count,contents_key=row.contents_key},":"..item.source..":"..item.slot)
                     end
                 end
                 if row.prefab=="cookpot" and #row.items==4 then
@@ -408,12 +409,16 @@ function M.issue(G,player,a,memory,cooking,safe)
         local item=from and from:GetItemInSlot(a.slot)
         if not item or item.GUID~=a.item_guid or item.prefab~=a.product then return false,"inventory_slot_changed" end
         if not can_fit(c,item,e.prefab=="cookpot") then return false,"container_full_or_rejects_item" end
-        from:MoveItemFromCountOfSlot(a.slot,e,1)
-    elseif a.kind=="take_item" and e.prefab=="treasurechest" then
+        local wanted=type(a.transfer_count)=="number" and a.transfer_count>=1 and math.floor(a.transfer_count) or 1
+        local batch=e.prefab=="cookpot" and 1 or math.min(wanted,amount(item))
+        from:MoveItemFromCountOfSlot(a.slot,e,batch)
+    elseif a.kind=="take_item" and storages[e.prefab] then
         local item=c:GetItemInSlot(a.slot)
         if not item or item.GUID~=a.item_guid or item.prefab~=a.product then return false,"container_slot_changed" end
         if not can_fit(inv,item) then return false,"inventory_full" end
-        c:MoveItemFromCountOfSlot(a.slot,player,1)
+        local wanted=type(a.transfer_count)=="number" and a.transfer_count>=1 and math.floor(a.transfer_count) or 1
+        local batch=math.min(wanted,amount(item))
+        c:MoveItemFromCountOfSlot(a.slot,player,batch)
     elseif a.kind=="start_meal" and e.prefab=="cookpot" then
         if M.predict(cooking,names(items))~=a.product then return false,"meal_prediction_changed" end
         local widget=c:GetWidget()
@@ -460,7 +465,9 @@ function M.verify(a,b,s)
         local sign=a.kind=="store_item" and 1 or -1
         local delta=count(row.items,a.product)-count(before.items,a.product)
         local pack=((s.recipe_inventory or {})[a.product] or 0)-((b.recipe_inventory or {})[a.product] or 0)
-        if delta==sign and pack==-sign then return "one_item_transferred" end
+        if delta*sign>0 and pack==-delta then
+            return delta*sign==1 and "one_item_transferred" or ("items_transferred:"..tostring(delta*sign))
+        end
     end
 end
 

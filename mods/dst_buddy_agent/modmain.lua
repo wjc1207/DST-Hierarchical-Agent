@@ -1,7 +1,7 @@
 local G=GLOBAL
 local json=require("json")
-local Server=require("jev_companion_team_server")
-local Client=require("jev_companion_team_client")
+local Server=require("jev_companion_server")
+local Client=require("jev_companion_client")
 local World=require("jev_companion_world")
 local Presentation=require("jev_companion_presentation")
 local UI=require("jev_companion_ui")
@@ -23,7 +23,7 @@ AddPrefabPostInit("wilson",function(inst) Presentation.attach(G,inst) end)
 local function install_server(world)
     if not world.ismastersim or world.components.jev_companion_persistence then return end
     world:AddComponent("jev_companion_persistence")
-    world.components.jev_companion_persistence.server=Server.new(World.new(G,function(player,packet)
+    world.components.jev_companion_persistence.server=Server.new_team(World.new(G,function(player,packet)
         G.SendModRPCToClient(GetClientModRPC(NS,"reply"),player.userid,json.encode(packet))
     end,Client.validate_text,function(value) return #json.encode(value) end,function(event,details) log(event,nil,details) end))
 end
@@ -40,7 +40,7 @@ local function ensure_client()
     if client and client.player==player then return client end
     local enabled=config.enabled==true and type(config.token)=="string" and #config.token>=32
         and type(config.url)=="string" and config.url:match("^http://127%.0%.0%.1:%d+/v1/exchange$")~=nil
-    client=Client.new({nonce=tostring(player.GUID)..":"..string.format("%.0f",clock()*1000),now=clock,sim_now=G.GetTime,paused=game_paused,http_enabled=enabled,
+    client=Client.new_team({nonce=tostring(player.GUID)..":"..string.format("%.0f",clock()*1000),now=clock,sim_now=G.GetTime,paused=game_paused,http_enabled=enabled,
         notice=notice,send=function(q) G.SendModRPCToServer(GetModRPC(NS,"request"),json.encode(q)) end,
         http=function(payload,callback)
             payload.token=config.token

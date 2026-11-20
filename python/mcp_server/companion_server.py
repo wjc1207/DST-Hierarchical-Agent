@@ -14,7 +14,7 @@ if __package__ in {None, ""}:
 
 from common.paths import PROJECT_ROOT
 from mcp_server.task_service import TaskService
-from mcp_server.companion_team_bridge import CompanionTeamBridge
+from mcp_server.companion_bridge import CompanionTeamBridge
 from mcp_server.game_bridge import serve_bridge
 
 
@@ -62,14 +62,19 @@ def create_server(bridge, *, poll=.2, timing_path=None):
         return member("result",buddy_id,action_id)
 
     @server.tool()
-    def buddy_storage(container_guid: int | None = None, buddy_id: str | None = None) -> dict[str, Any]:
+    def buddy_storage(container_guid: int | None = None, building_id: str | None = None, buddy_id: str | None = None) -> dict[str, Any]:
         """Read current local chest slots/availability; unknown or busy is not empty. Does not open or move items."""
-        return member("storage",buddy_id,container_guid)
+        return member("storage",buddy_id,container_guid,building_id)
 
     @server.tool()
     def buddy_places(query: str = "", building_id: str | None = None, offset: int = 0, limit: int = 12, buddy_id: str | None = None) -> dict[str, Any]:
-        """Query buildings actually seen by this companion. Remote unconfirmed is remembered, not missing; no world scan or home management."""
+        """Query buildings actually seen by this companion. Remote unconfirmed is remembered, not missing."""
         return member("places",buddy_id,query,building_id,offset,limit)
+
+    @server.tool()
+    def buddy_meals(product: str | None = None, buddy_id: str | None = None) -> dict[str, Any]:
+        """List verified four-ingredient Crock Pot combinations for supported dishes."""
+        return member("meals",buddy_id,product)
 
     @server.tool()
     async def buddy_recipes(revision: int, binding_token: str, query: str = "", recipe_id: str | None = None,

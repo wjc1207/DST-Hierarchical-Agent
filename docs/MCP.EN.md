@@ -98,54 +98,9 @@ See [goal schema, navigation policy, budgets and upgrade files](GOAL_NAVIGATION.
 Update both Python and Lua, re-enter the world and restart Python; keep the existing
 `.env`, bridge token and `scripts/jev_bridge_config.lua`. Protocol remains 4.
 
-## Ordered action sequences (legacy compatibility)
+## Ordered action sequences (removed)
 
-The following describes the previous scheduler. New DeepSeek requests no longer
-produce this format.
-
-The legacy scheduler accepts `steps`, not priority-sorted `tasks`:
-
-```json
-{"kind":"action_sequence","goal":"Prepare light","steps":[
-  {"id":"grass","action":"collect","prefab":"cutgrass","count":2},
-  {"id":"twigs","action":"collect","prefab":"twigs","count":2},
-  {"id":"torch","action":"craft","prefab":"torch","count":1},
-  {"id":"survey","action":"explore_current_region","cells":16}
-]}
-```
-
-Each sequence contains 1-12 strictly ordered steps. Each step has a
-`timeout_seconds` bound (default 120, allowed 5-300). `collect`/`craft` counts mean
-desired current stock, not additional collection. Completed steps are latched:
-spending ingredients later never rewinds the sequence. A failure or timeout
-stops the batch and requests a new plan with progress and failure facts.
-Active sequences survive quarter boundaries; without an active sequence the
-existing planning windows remain. Completion/failure asynchronously requests the next batch.
-
-Supported operations: `collect {prefab,count}`, `craft {prefab,count}` (axe,
-pickaxe, torch), `build {prefab}` (campfire, sciencemachine),
-`eat_safe_food {hunger_ratio}` (default 0.7), `cook_food {count}` (additional cooked
-items), `equip_torch`, `unequip_torch`, and bounded `wait {seconds:1..30}`.
-`travel_region {node_id}` requires actual entry into an observed topology node,
-not a display index or historical entered flag. `explore_current_region {area}`
-requires additional observed map cells (default 16, range 1-256), or a fully surveyed boundary.
-Each cell is 4x4 world units; old area values are divided by 16 on import, so area
-512 becomes 32 cells. Use `cells` in new tasks; combining `cells` and `area` is invalid.
-`explore_other_region {new_regions}` discovers new nodes (default 1), not merely
-another already-known region.
-
-The current step repeats native actions.
-Ordinary resource discoveries resume the same step even if native navigation
-yields; danger, damage, lighting and urgent hunger still hand off to safety
-decisions. Only observed effects advance steps, never predicted state. The
-executor does not invent missing-tool/recipe subtasks; the plan must include
-prerequisites explicitly. Each native command still uses an original MCP
-observation and Lua verification; this is not a blind batch of key presses.
-
-Update the new `python/mcp_agent/action_sequence.py` and changed `python/mcp_agent/daily_planner.py`, `python/mcp_agent/mcp_agent.py`,
-`python/mcp_agent/navigation_intents.py` and `data/DSTKnowledge.txt`, then restart Python.
-The Lua protocol remains 4; existing `submit_task_board` tools are kept for older
-clients. Pure semantic sequences remain MCP-compatible, without keyboard fallbacks.
+The legacy `action_sequence.py` scheduler has been removed. Both player and companion agents now use the unified priority task board (`schema=2, execution_policy=priority_goals`). See [AGENT_MEMORY_AND_BACKENDS.md](AGENT_MEMORY_AND_BACKENDS.md) for the updated memory, compaction, and external CLI backend architecture.
 
 ## Other MCP clients and connection checks
 

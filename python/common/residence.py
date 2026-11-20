@@ -20,7 +20,7 @@ def allowed(action, state, area):
                         if r.get("id") == action.get("building_id") and r.get("guid") == action.get("guid")), None)
         return inside(fixture, area, 2) and inside(position, area, 5)
     if kind == "explore" and (action.get("refuel_approach") is True or action.get("camp_approach") is True):
-        allowed_prefabs = {"campfire", "firepit"} if action.get("refuel_approach") else {"cookpot", "treasurechest"}
+        allowed_prefabs = {"campfire", "firepit"} if action.get("refuel_approach") else {"cookpot", "treasurechest", "icebox", "dragonflychest"}
         building = next((b for b in (state.get("places") or {}).get("buildings", [])
                          if b.get("id")==action.get("building_id")), None)
         route = (building or {}).get("route") or {}
@@ -52,7 +52,8 @@ def allowed(action, state, area):
         return (inside(point, area, margin) and number(length) and length >= 0
                 and inside(position, area, length+2))
     return kind in {"wait","craft","craft_torch","craft_axe","craft_pickaxe","eat_safe_food",
-                    "cook_food","equip_torch","unequip_torch","set_home"}
+                    "cook_food","equip_torch","unequip_torch","set_home",
+                    "equip_item","unequip_item","eat_item","drop_item"}
 
 
 def validate_area(raw, state):

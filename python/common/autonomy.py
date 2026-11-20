@@ -23,10 +23,10 @@ def settings(state, *, companion=False):
         messages = value.get("messages", [])
         if not isinstance(messages, list) or len(messages) > 8:
             raise ValueError("Invalid player messages")
-        dialogue_revision = value.get("dialogue_revision") if companion else None
+        dialogue_revision = value.get("dialogue_revision")
         if dialogue_revision is not None:
             if type(dialogue_revision) is not int or not 0 < dialogue_revision <= 2**53 - 1:
-                raise ValueError("Invalid companion dialogue revision")
+                raise ValueError("Invalid dialogue revision")
             result["dialogue_revision"] = dialogue_revision
         message_limit = dialogue_revision if dialogue_revision is not None else revision
         last_id = 0

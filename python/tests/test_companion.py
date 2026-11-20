@@ -156,23 +156,14 @@ class PlannerTests(unittest.TestCase):
         snapshot = state()["companion"];snapshot["nearby"] = []
         self.assertEqual(next_action(plan(), snapshot, set())[1], "blocked")
 
-    def test_explicit_night_return_cannot_be_planned_for_dusk(self):
+    def test_timed_return_phase_defaults_to_current_day(self):
         observed = state()["companion"]
         observed["capabilities"].append("timed_return")
         observed["world"] = {"day": 1, "phase": "day", "time": .3}
         raw = {"goal": "Return", "reply": "我会回来。", "tasks": [
             {"id": "back", "title": "Return", "target": {"type": "return_owner"},
-             "at": {"day": 1, "phase": "dusk"}}]}
-        interaction = {"mode": "instruction", "instruction": "先收集物资，天黑回到身边"}
-        ctx = {"observation": observed, "interaction": interaction}
-        with self.assertRaisesRegex(ValueError, "at.phase=night"):
-            validate_plan(raw, ctx)
-        interaction["messages"] = [{"text": "改成天黑前回来"}]
-        with self.assertRaisesRegex(ValueError, "at.phase=night"):
-            validate_plan(raw, ctx)
-        raw["tasks"][0]["at"] = {"phase": "night"}
-        self.assertEqual(validate_plan(raw, ctx)["tasks"][0]["at"], {"day": 1, "phase": "night"})
-        interaction["messages"] = [{"text": "等天黑了再回来找我"}]
+             "at": {"phase": "night"}}]}
+        ctx = {"observation": observed, "interaction": {"mode": "instruction", "instruction": "Return at night"}}
         self.assertEqual(validate_plan(raw, ctx)["tasks"][0]["at"], {"day": 1, "phase": "night"})
 
     def test_return_rejects_retired_timing_fields(self):
@@ -691,14 +682,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_mcp_tool_discovery_and_state(self):
         from mcp import Client
         from test_companion_team import single_member_state
-        from mcp_server.companion_team_bridge import CompanionTeamBridge
+        from mcp_server.companion_bridge import CompanionTeamBridge
 
         bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
         bridge.exchange({"token": TOKEN, "session_id": "sdk", "sequence": 1,
                          "state": single_member_state(state())})
         async with Client(create_server(bridge), read_timeout_seconds=3) as client:
             tools = await client.list_tools()
-            self.assertEqual({t.name for t in tools.tools}, {"buddy_observe", "buddy_action", "buddy_result", "buddy_reply", "buddy_recipes", "buddy_storage", "buddy_places", "get_planning_state", "send_planning_reply", "get_task_board", "submit_task", "update_task", "delete_task", "submit_task_board"})
+            self.assertEqual({t.name for t in tools.tools}, {"buddy_observe", "buddy_action", "buddy_result", "buddy_reply", "buddy_recipes", "buddy_storage", "buddy_places", "buddy_meals", "get_planning_state", "send_planning_reply", "get_task_board", "submit_task", "update_task", "delete_task", "submit_task_board"})
             observed = await client.call_tool("buddy_observe", {})
             self.assertEqual(set(observed.structured_content["state"]["members"]), {"buddy1"})
             actor = await client.call_tool("buddy_observe", {"buddy_id": "buddy1"})

@@ -11,7 +11,6 @@ from unittest.mock import patch
 from mcp_server.game_bridge import GameBridge, BridgeError
 from mcp_agent.mcp_agent import MCPAgent, MCPRejected, PlayerDead, SessionChanged, IncompatibleBridge
 from mcp_agent.model_state import model_game_state
-from mcp_agent.action_sequence import validate_sequence
 from mcp_agent.priority_board import validate_goals
 from mcp_agent.daily_planner import DailyPlanner
 from common import timing_log as timing
@@ -335,90 +334,6 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     await agent.cycle(); await agent.cycle()
                 self.assertEqual(submit.call_count, 1)
                 self.assertTrue(all(t["status"] in {"scheduled", "blocked"} for t in agent.plan["tasks"]))
-
-    async def test_sequence_collects_batch_then_crafts_without_board_sync(self):
-        plan = validate_sequence({"goal": "Make torch", "steps": [
-            {"id": "grass", "action": "collect", "prefab": "cutgrass", "count": 2},
-            {"id": "torch", "action": "craft", "prefab": "torch"}]}, 1)
-        plan["sequence_id"] = "sequence:1"
-        handled, choices = set(), []
-        self.client.state["bridge"]["available_actions"]["craft_torch"] = {"kind": "craft_torch"}
-        def tick(client):
-            aid = client.bridge.active
-            if not aid or aid in handled:
-                return
-            handled.add(aid)
-            choice = client.bridge.actions[aid]["choice"]
-            choices.append(choice)
-            inventory = client.state["player"]["inventory"]
-            if choice == "collect_grass":
-                inventory["items"] = [{"prefab": "cutgrass", "count": len(choices)}]
-            else:
-                inventory["items"] = [{"prefab": "torch", "count": 1}]
-        self.client.hook = tick
-        agent = self.agent(planner=FakePlanner(plan), execute=True)
-        for _ in range(4):
-            await agent.cycle()
-        self.assertEqual(choices, ["collect_grass", "collect_grass", "craft_torch"])
-        self.assertEqual(agent.sequence.status, "completed")
-        self.assertFalse(any(n == "submit_task_board" for n, _ in self.client.calls))
-
-    async def test_sequence_survey_ignores_new_resources_and_reaches_cell_goal(self):
-        plan = validate_sequence({"goal": "Survey", "steps": [
-            {"action": "explore_current_region", "cells": 16}]}, 1)
-        plan["sequence_id"] = "sequence:survey"
-        graph = self.client.state["navigation"]["graph"]
-        graph["current"] = {"observed_cells": 0}
-        actions = self.client.state["bridge"]["available_actions"]
-        actions["explore_current_region"] = {"kind": "explore", "mode": "region", "x": 4, "z": 0}
-        handled = set()
-        def tick(client):
-            aid = client.bridge.active
-            if aid and aid not in handled:
-                handled.add(aid)
-                graph["current"]["observed_cells"] += 4
-                actions["collect_berrybush"] = {"kind": "collect", "guid": 99, "prefab": "berrybush", "product": "berries"}
-        self.client.hook = tick
-        agent = self.agent(planner=FakePlanner(plan), execute=True)
-        for _ in range(5):
-            await agent.cycle()
-        self.assertEqual(agent.sequence.status, "completed")
-        self.assertEqual(len(handled), 4)
-        self.assertTrue(all(a["choice"] == "explore_current_region" for n, a in self.client.calls if n == "start_action"))
-
-    async def test_sequence_pauses_for_threat_then_resumes_same_step(self):
-        plan = validate_sequence({"goal": "Get grass", "steps": [
-            {"action": "collect", "prefab": "cutgrass", "count": 2}]}, 1)
-        plan["sequence_id"] = "sequence:danger"
-        self.client.state["nearby"] = [{"guid": 99, "activeThreat": True}]
-        actions = self.client.state["bridge"]["available_actions"]
-        actions["flee_from_nearest_hostile"] = {"kind": "flee_from_nearest_hostile"}
-        agent = self.agent(planner=FakePlanner(plan), execute=True)
-        await agent.cycle()
-        self.assertEqual(agent.sequence.index, 0)
-        self.client.state["nearby"] = []
-        await agent.cycle()
-        choices = [a["choice"] for n, a in self.client.calls if n == "start_action"]
-        self.assertEqual(choices, ["flee_from_nearest_hostile", "collect_grass"])
-
-    async def test_sequence_native_failure_stops_before_later_step(self):
-        plan = validate_sequence({"goal": "Get grass then twig", "steps": [
-            {"action": "collect", "prefab": "cutgrass", "count": 2},
-            {"action": "collect", "prefab": "twigs", "count": 2}]}, 1)
-        plan["sequence_id"] = "sequence:failed"
-        self.client.state["bridge"]["available_actions"]["collect_sapling"] = {
-            "kind": "collect", "guid": 21, "prefab": "sapling", "product": "twigs"}
-        def tick(client):
-            if client.bridge.active:
-                client.sequence += 1
-                client.bridge.exchange({"token": client.bridge.token, "session_id": client.session,
-                    "sequence": client.sequence, "state": client.state,
-                    "action_report": {"action_id": client.bridge.active, "status": "failed", "reason": "verification_timeout"}})
-        self.client.hook = tick
-        agent = self.agent(planner=FakePlanner(plan), execute=True)
-        await agent.cycle(); await agent.cycle()
-        self.assertEqual(agent.sequence.status, "failed")
-        self.assertEqual([a["choice"] for n, a in self.client.calls if n == "start_action"], ["collect_grass"])
 
     async def test_rejected_action_is_not_replaced_with_input_fallback(self):
         agent = self.agent(execute=True)

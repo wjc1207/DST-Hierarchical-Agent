@@ -13,8 +13,7 @@ import uuid
 from common import autonomy, timing_log
 from common.paths import PROJECT_ROOT
 from mcp_agent.compact_tasks import expand_tasks
-from mcp_agent.companion_planner import validate_plan as validate_companion
-from mcp_agent.companion_team_planner import expand_assignment
+from mcp_agent.companion_planner import expand_assignment, validate_plan as validate_companion
 from mcp_agent.companion_tasks import capabilities
 from mcp_agent.priority_board import merge_goals, idle_review_reason, task_signature, PriorityBoardExecutor
 from mcp_server.game_bridge import BridgeError
@@ -68,7 +67,7 @@ class TaskService:
     def make_host(self):
         client = LocalTools(self.server)
         if self.companion:
-            from mcp_agent.companion_team_agent import CompanionTeamAgent
+            from mcp_agent.companion_agent import CompanionTeamAgent
             return CompanionTeamAgent(client, None, execute=True, log_path=PROJECT_ROOT / "logs/companion_agent.jsonl")
         from mcp_agent.mcp_agent import MCPAgent
         host = MCPAgent(client, execute=True, poll=self.poll)
@@ -297,7 +296,8 @@ class TaskService:
             if self.companion:
                 return self.bridge.member_call("reply", identity, text, control["revision"], message_id, finish,
                                                control.get("dialogue_revision"))
-            return self.bridge.send_agent_feedback(text, control["revision"], message_id, finish)
+            return self.bridge.send_agent_feedback(text, control["revision"], message_id, finish,
+                                                   control.get("dialogue_revision"))
 
     def stop_changed_action(self, actor, packet, board):
         active = actor.active if self.companion else actor.goal_actions.get(actor.active_id)

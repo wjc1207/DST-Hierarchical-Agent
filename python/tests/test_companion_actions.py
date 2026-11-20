@@ -163,9 +163,9 @@ class NativePeer(FakePeer):
 class NativeAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_planning_worker_queries_the_real_mcp_without_blocking_observation(self):
         from mcp import Client
-        from mcp_agent.companion_team_agent import ActorClient
+        from mcp_agent.companion_agent import ActorClient
         from test_companion_team import single_member_state
-        from mcp_server.companion_team_bridge import CompanionTeamBridge
+        from mcp_server.companion_bridge import CompanionTeamBridge
 
         bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
         data = state();data["companion"] = snapshot();seq = [0]
@@ -233,7 +233,7 @@ class NativeAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_recipe_mcp_roundtrip_is_read_only_and_rejects_old_intents(self):
         from mcp import Client
         from test_companion_team import single_member_state
-        from mcp_server.companion_team_bridge import CompanionTeamBridge
+        from mcp_server.companion_bridge import CompanionTeamBridge
 
         bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
         data = state();data["companion"] = snapshot();seq = [0]

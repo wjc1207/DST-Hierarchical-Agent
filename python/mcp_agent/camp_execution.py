@@ -65,12 +65,27 @@ def choices(task, actions, state):
     return wanted or [(k, a) for k, a in offers if a["kind"] == "explore"]
 
 
+def _transferred_count(reason: str) -> int:
+    if reason == "one_item_transferred":
+        return 1
+    if isinstance(reason, str) and reason.startswith("items_transferred:"):
+        try:
+            value = int(reason.split(":", 1)[1])
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 0
+
+
 def on_completed(target, record, action, reason, state):
     kind = target["type"]
     operation = action.get("kind")
-    if ((kind == "ignite_tree" and operation == "ignite_tree" and reason == "tree_ignited")
-            or (kind in {"deposit", "withdraw"} and operation == {"deposit": "store_item", "withdraw": "take_item"}[kind]
-                and reason == "one_item_transferred")
+    if kind in {"deposit", "withdraw"} and operation == {"deposit": "store_item", "withdraw": "take_item"}[kind]:
+        moved = _transferred_count(reason)
+        if moved > 0:
+            record["camp_count"] = record.get("camp_count", 0) + moved
+    elif ((kind == "ignite_tree" and operation == "ignite_tree" and reason == "tree_ignited")
             or (kind == "cook_meal" and operation == "harvest_meal" and reason == "meal_harvested:" + target["product"])):
         record["camp_count"] = record.get("camp_count", 0) + 1
     if kind == "cook_meal" and operation == "harvest_meal" and reason != "meal_harvested:" + target["product"]:

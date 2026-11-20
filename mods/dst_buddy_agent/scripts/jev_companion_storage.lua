@@ -1,7 +1,7 @@
 -- Local chest facts and explicit outgoing handoffs. Never remove owner items.
 local M={}
 M.ops={give_owner=true,drop_item=true,deposit=true,withdraw=true}
-local CHESTS={treasurechest=true,dragonflychest=true}
+local CHESTS={treasurechest=true,dragonflychest=true,icebox=true}
 local function guid(v) return type(v)=="number" and v>=1 and v<=9007199254740991 and v%1==0 end
 local function size(item) return item.components.stackable and item.components.stackable:StackSize() or 1 end
 local function transferable(item)
@@ -161,25 +161,37 @@ function M.new(G,E)
                 or dropped.components.inventoryitem.owner~=nil or before-inventory_count(inv,q.args.prefab)~=1 then return "failed","drop_not_confirmed",data() end
         else
             local c=target.components.container
-            local dest,slot=destination(q.op=="deposit" and {c} or stores(inv),item)
-            if not dest then return "failed","destination_full_or_rejected",data() end
+            local want=math.max(1,q.args.total_count-row.count)
             local chest_before=count(c,q.args.prefab)
             local was_open=c:IsOpenedBy(a)
             if not was_open then c:Open(a) end
             if not c:IsOpenedBy(a) then return "failed","chest_open_rejected",data() end
-            local part=src:RemoveItem(item,false)
-            if part then
+            local moved=0
+            for _=1,want do
+                local ssrc,sitem,sslot=source(q.op=="withdraw" and {c} or stores(inv),q.args.prefab)
+                if not sitem then break end
+                local dest,slot=destination(q.op=="deposit" and {c} or stores(inv),sitem)
+                if not dest then break end
+                local part=ssrc:RemoveItem(sitem,false)
+                if not part then break end
                 part.prevslot=nil;part.prevcontainer=nil
                 dest:GiveItem(part,slot,nil,false)
                 -- Native containers can reject; restore an unaccepted unit to its source.
                 if part:IsValid() and part.components.inventoryitem.owner==nil then
-                    part.prevslot=nil;part.prevcontainer=nil;src:GiveItem(part,srcslot,nil,false)
+                    part.prevslot=nil;part.prevcontainer=nil;ssrc:GiveItem(part,sslot,nil,false)
+                    break
                 end
+                moved=moved+1
             end
             if not was_open then c:Close(a) end
             local direction=q.op=="deposit" and 1 or -1
-            if not part or direction*(before-inventory_count(inv,q.args.prefab))~=1
-                or direction*(count(c,q.args.prefab)-chest_before)~=1 then return "failed","storage_transfer_not_confirmed",data() end
+            local inv_delta=direction*(before-inventory_count(inv,q.args.prefab))
+            local chest_delta=direction*(count(c,q.args.prefab)-chest_before)
+            if moved==0 or inv_delta~=moved or chest_delta~=moved then
+                return "failed",moved==0 and "destination_full_or_rejected" or "storage_transfer_not_confirmed",data()
+            end
+            row.count=row.count+moved
+            return "completed",moved==1 and "one_item_transferred" or ("items_transferred:"..tostring(moved)),data()
         end
         row.count=row.count+1
         return "completed",q.op=="drop_item" and "one_item_dropped" or "one_item_transferred",data()

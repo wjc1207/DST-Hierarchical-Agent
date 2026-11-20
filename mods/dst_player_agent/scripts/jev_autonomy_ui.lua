@@ -39,7 +39,8 @@ function M.install(G,postconstruct)
                         local message,status=autonomy.submit_message(player,request)
                         if not message then respond(status);return end
                         respond(status=="paused" and "已暂停动作，角色由你控制。"
-                            or "已收到消息，暂停当前安排并请 DeepSeek 重新规划。")
+                            or status=="dialogue" and "已收到消息，正在后台异步规划。"
+                            or "已收到消息，正在请规划器安排。")
                     end
                 end
             end

@@ -259,6 +259,33 @@ function M.available(s,blocked_escapes,now)
     for id,action in pairs(places.actions(s.places)) do
         if action.kind~="explore" or not night or torch then result[id]=action end
     end
+    local inv=(s.player or {}).inventory or {}
+    local seen_equip,seen_eat,seen_drop={},{},{}
+    for _,item in ipairs(inv.items or {}) do
+        local p=item.prefab
+        if type(p)=="string" and p~="" then
+            if not seen_equip[p] and (item.durability_percent==nil or item.durability_percent>0) then
+                seen_equip[p]=true
+                add("equip_item:"..p,"equip_item","Equip carried "..p..".",{prefab=p,guid=item.guid,planner_only=true})
+            end
+            if not seen_eat[p] and (cooked[p] or safe_raw[p] or raw[p]) then
+                seen_eat[p]=true
+                add("eat_item:"..p,"eat_item","Eat one carried "..p..".",{prefab=p,guid=item.guid,planner_only=true})
+            end
+            if not seen_drop[p] then
+                seen_drop[p]=true
+                add("drop_item:"..p,"drop_item","Drop one carried "..p..".",{prefab=p,guid=item.guid,planner_only=true})
+            end
+        end
+    end
+    local seen_unequip={}
+    for _,item in ipairs(inv.equipped or {}) do
+        local p=item.prefab
+        if type(p)=="string" and p~="" and not seen_unequip[p] and (p~="torch" or not night or lit) then
+            seen_unequip[p]=true
+            add("unequip_item:"..p,"unequip_item","Unequip "..p.." into inventory.",{prefab=p,guid=item.guid,slot=item.slot,planner_only=true})
+        end
+    end
     return result
 end
 
@@ -561,6 +588,13 @@ function M.new(adapter)
         end
         if requested.residence~=nil and (not residence.valid(requested.residence,s)
             or not residence.allowed(a,s,requested.residence)) then return reject("residence_boundary") end
+        if requested.transfer_count~=nil and (a.kind=="store_item" or a.kind=="take_item") then
+            if type(requested.transfer_count)~="number" or requested.transfer_count<1 or requested.transfer_count>40 or requested.transfer_count%1~=0 then
+                return reject("invalid_transfer_count")
+            end
+            local bound={};for k,v in pairs(a) do bound[k]=v end;a=bound
+            a.transfer_count=requested.transfer_count
+        end
         -- Use the current route/recipe facts, never stale request coordinates.
         -- Target GUID/node identity is preserved; this is not a new AI choice.
         local position=s.player.position
@@ -872,6 +906,9 @@ function M.new(adapter)
         elseif a.kind=="collect" then done=count(s,a.product)>count(b,a.product)
         elseif a.kind=="equip_torch" then done=count(s,"torch",true)>0
         elseif a.kind=="unequip_torch" then done=count(s,"torch",true)==0 and count(s,"torch")>=count(b,"torch")
+        elseif a.kind=="equip_item" then done=count(s,a.prefab,true)>0
+        elseif a.kind=="unequip_item" then done=count(s,a.prefab,true)==0 and count(s,a.prefab)>=count(b,a.prefab)
+        elseif a.kind=="eat_item" or a.kind=="drop_item" then done=count(s,a.prefab)<count(b,a.prefab)
         elseif a.kind=="set_home" then
             done=s.places and s.places.home and s.places.home.anchor_id==a.anchor_id
         elseif a.kind=="craft" then

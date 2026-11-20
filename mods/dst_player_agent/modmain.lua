@@ -1797,6 +1797,9 @@ local function make_state(player, timings)
         },
         world =
         {
+            world_id = (G.TheWorld and G.TheWorld.meta and G.TheWorld.meta.session_identifier)
+                or (G.TheNet and G.TheNet.GetSessionIdentifier and G.TheNet:GetSessionIdentifier()) or nil,
+            owner_userid = player.userid,
             day = (world.cycles or 0) + 1,
             cycles = world.cycles or 0,
             phase = world.phase or "unknown",
@@ -2818,6 +2821,45 @@ start_bridge = function(player)
             return recipes.issue(G,player,action,function(reason)
                 if executor.active and executor.active.id==id then executor:finish("failed",reason) end
             end)
+        elseif action.kind == "equip_item" or action.kind == "eat_item" or action.kind == "drop_item" then
+            local inv = player.replica and player.replica.inventory
+            if not inv then executor:finish("failed", "inventory_unavailable"); return false end
+            local item, fallback
+            local function scan_items(container)
+                if not container or not container.GetItems then return end
+                for _, cand in pairs(safe_call(function() return container:GetItems() end, {}) or {}) do
+                    if cand ~= nil and cand:IsValid() and cand.prefab == action.prefab then
+                        if action.guid and cand.GUID == action.guid then item = cand; return end
+                        if not fallback then fallback = cand end
+                    end
+                end
+            end
+            scan_items(inv)
+            if not item and inv.GetOverflowContainer then scan_items(inv:GetOverflowContainer()) end
+            item = item or fallback
+            if not item then executor:finish("failed", "item_not_carried:" .. tostring(action.prefab)); return false end
+            if action.kind == "drop_item" then inv:DropItemFromInvTile(item, true)
+            else inv:UseItemFromInvTile(item) end
+            return true
+        elseif action.kind == "unequip_item" then
+            local inv = player.replica and player.replica.inventory
+            if not inv then executor:finish("failed", "inventory_unavailable"); return false end
+            local slot = action.slot and G.EQUIPSLOTS[string.upper(tostring(action.slot))] or nil
+            if not slot then
+                for _, candidate in pairs(G.EQUIPSLOTS or {}) do
+                    local eq = inv:GetEquippedItem(candidate)
+                    if eq and eq.prefab == action.prefab then slot = candidate; break end
+                end
+            end
+            local eq = slot and inv:GetEquippedItem(slot)
+            if not eq or eq.prefab ~= action.prefab then executor:finish("failed", "item_not_equipped:" .. tostring(action.prefab)); return false end
+            inv:TakeActiveItemFromEquipSlot(slot)
+            player:DoTaskInTime(0.1, function()
+                if player:IsValid() and player.replica and player.replica.inventory then
+                    player.replica.inventory:ReturnActiveItem()
+                end
+            end)
+            return true
         elseif action.kind == "build_sciencemachine" then return build_science_machine(action.placement)
         elseif action.kind == "craft_axe" then craft_item("axe")
         elseif action.kind == "craft_pickaxe" then craft_item("pickaxe")
@@ -2874,6 +2916,7 @@ start_bridge = function(player)
         end,
     },executor)
     autonomy.get(player).on_change=function(reason)
+        if reason == "player_dialogue" then return end
         if executor.active then executor:finish("interrupted",reason) end
         executor.board_paused=true
     end

@@ -1,20 +1,29 @@
 """Companion facts/actions adapted to the same priority board used by the player."""
+from collections import Counter
 import copy
 import math
 import re
 import time
 import uuid
 
+from common.camp_work import (fixture as camp_fixture, loaded as camp_loaded,
+                              target_error as camp_error, validate_target as validate_camp_target)
 from common.coordinates import validate_point
 from common.task_timing import number, seconds_to
-from common.places import target_progress as building_progress
+from common.places import PLACE_TARGETS, target_progress as building_progress
+from common.placement import validate as validate_placement, resolve as placement_area, inside as inside_placement
+from common.refueling import (validate_target as validate_refuel, maintenance_state as fire_maintenance_state,
+                              target_error as refuel_error, has_fuel)
+from common.thermal import refuel_pause
+from mcp_agent import camp_execution
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
 from mcp_agent.companion_search import ResourceSearch
 from common.companion_transfer import (COUNTED_TARGETS, STORAGE_TARGETS, TRANSFER_TARGETS,
-                                       validate_target as validate_transfer)
+                                       container_guid_for, validate_target as validate_transfer)
 
 CAPABILITIES = {"collect", "move", "follow", "stay", "recipes", "equip", "unequip", "work", "craft", "place", "search",
-                "storage", "give_owner", "drop_item", "receive_item", "visit_building", "timed_return", "eat"}
+                "storage", "give_owner", "drop_item", "receive_item", "visit_building", "timed_return", "eat",
+                "refuel", "home", "hunger", "cook_meal", "ignite_tree"}
 RESOURCE_NAMES = {"grass": "cutgrass", "sapling": "twigs", "berrybush": "berries", "berrybush2": "berries",
                   "carrot_planted": "carrot", "reeds": "cutreeds", "logs": "log"}
 STORAGE_WAIT_SECONDS = 60
@@ -45,13 +54,25 @@ def validate_target(target, *, supported=CAPABILITIES):
         if required not in supported:
             raise ValueError("Unsupported companion capability: " + required)
         return validate_transfer(target)
-    required = {"inventory": "craft" if "recipe_id" in target else "collect", "structure": "place", "equip": "equip", "unequip": "unequip", "visit_building": "visit_building",
+    if kind == "refuel":
+        if "refuel" not in supported:
+            raise ValueError("Unsupported companion capability: refuel")
+        return validate_refuel(target)
+    if kind in {"cook_meal", "ignite_tree"}:
+        if kind not in supported:
+            raise ValueError("Unsupported companion capability: " + kind)
+        return {"type": kind, **validate_camp_target(target)}
+    required = {"inventory": "craft" if "recipe_id" in target else "collect", "structure": "place", "equip": "equip",
+                "unequip": "unequip", "visit_building": "visit_building", "set_home": "home", "return_home": "home",
+                "stay_home": "home", "hunger_ratio": "hunger",
                 "move_to": "move", "return_owner": "follow", "follow": "follow", "stay": "stay"}
     if kind not in required or required[kind] not in supported:
         raise ValueError("Unsupported companion task target/capability: " + str(kind))
     fields = {"inventory": {"type", "prefab", "count", "recipe_id", "allow_search"}, "move_to": {"type", "x", "z", "arrival_radius"},
-              "structure": {"type", "prefab", "recipe_id", "x", "z", "radius"},
-              "equip": {"type", "prefab"}, "unequip": {"type", "prefab"}, "visit_building": {"type", "building_id"}}
+              "structure": {"type", "prefab", "recipe_id", "x", "z", "radius", "placement"},
+              "equip": {"type", "prefab"}, "unequip": {"type", "prefab"}, "visit_building": {"type", "building_id"},
+              "set_home": {"type", "anchor_id"}, "return_home": {"type", "home_id"}, "stay_home": {"type", "home_id", "radius"},
+              "hunger_ratio": {"type", "at_least"}}
     allowed = fields.get(kind, {"type"})
     extra = set(target) - allowed
     if extra:
@@ -66,6 +87,25 @@ def validate_target(target, *, supported=CAPABILITIES):
         if not isinstance(identity, str) or not re.fullmatch(r"building:[0-9]{1,16}", identity):
             raise ValueError("Visit requires a remembered building_id")
         return {"type": kind, "building_id": identity}
+    if kind in {"set_home", "return_home", "stay_home"}:
+        field = "anchor_id" if kind == "set_home" else "home_id"
+        value = target.get(field)
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_:.-]{1,100}", value):
+            raise ValueError("Place target requires an observed " + field)
+        if kind == "set_home" and not re.fullmatch(r"building:[0-9]+", value):
+            raise ValueError("Set home requires a building:<GUID> anchor")
+        clean = {"type": kind, field: value}
+        if kind == "stay_home":
+            radius = target.get("radius", 12)
+            if type(radius) not in {int, float} or not math.isfinite(radius) or not 6 <= radius <= 30:
+                raise ValueError("stay_home radius must be 6-30 world units")
+            clean["radius"] = radius
+        return clean
+    if kind == "hunger_ratio":
+        ratio = target.get("at_least")
+        if not number(ratio) or not 0 < ratio <= 1:
+            raise ValueError("Invalid hunger target")
+        return {"type": kind, "at_least": float(ratio)}
     if kind == "inventory":
         prefab, count = target.get("prefab"), target.get("count")
         if (not isinstance(prefab, str) or not re.fullmatch(r"[a-z0-9_]{1,60}", prefab)
@@ -89,6 +129,11 @@ def validate_target(target, *, supported=CAPABILITIES):
     if kind == "structure":
         clean = validate_target({"type": "inventory", "prefab": target.get("prefab"), "count": 1,
                                  "recipe_id": target.get("recipe_id")}, supported=CAPABILITIES)
+        if "placement" in target:
+            if any(k in target for k in ("x", "z", "radius")):
+                raise ValueError("Structure target accepts either placement or x/z/radius, not both")
+            return {"type": kind, "prefab": clean["prefab"], "recipe_id": clean["recipe_id"],
+                    "placement": validate_placement(target["placement"])}
         point = validate_point(target)
         radius = target.get("radius", 6)
         if not number(radius) or not 2 <= radius <= 8:
@@ -97,8 +142,6 @@ def validate_target(target, *, supported=CAPABILITIES):
                 "x": point["x"], "z": point["z"], "radius": radius}
     if kind == "move_to":
         point = validate_point({"arrival_radius": 2.5, **target})
-        if point["arrival_radius"] != 2.5:
-            raise ValueError("Companion move arrival_radius must match native radius 2.5")
         return {"type": kind, **point}
     return {"type": kind}
 
@@ -111,11 +154,21 @@ def validate_board(raw, day, *, observed=None):
 def actor_state(observed):
     """Only normalize observed facts; never invent a map, hunger maximum or recipes."""
     buddy = observed.get("buddy") or {}
-    return {"player": {"guid": buddy.get("guid"), "position": copy.deepcopy(buddy.get("position")),
-                       "vitals": {"dead": buddy.get("dead")}, "inventory": {"items": [
-                           {"prefab": name, "count": count} for name, count in (buddy.get("inventory") or {}).items()]}},
-            "world": copy.deepcopy(observed.get("world") or {}), "_companion": observed,
-            "observed_at": observed.get("version")}
+    vitals = {"dead": buddy.get("dead")}
+    for key in ("health", "health_max", "hunger", "hunger_max", "sanity", "temperature"):
+        if key in buddy:
+            vitals[key] = buddy.get(key)
+    inventory = buddy.get("inventory") or {}
+    result = {"player": {"guid": buddy.get("guid"), "position": copy.deepcopy(buddy.get("position")),
+                         "vitals": vitals, "inventory": {"items": [
+                             {"prefab": name, "count": count} for name, count in inventory.items()]}},
+              "recipe_inventory": dict(inventory),
+              "world": copy.deepcopy(observed.get("world") or {}), "_companion": observed,
+              "observed_at": observed.get("version")}
+    for key in ("places", "refueling", "thermal", "camp_work"):
+        if key in observed:
+            result[key] = copy.deepcopy(observed[key])
+    return result
 
 
 def evaluate_target(target, state):
@@ -124,14 +177,30 @@ def evaluate_target(target, state):
     kind = target["type"]
     if kind in COUNTED_TARGETS:
         return 0, target["count"], True, ""  # Only per-task confirmed receipts count.
+    if kind in {"cook_meal", "ignite_tree"}:
+        err = camp_error(target, state)
+        return 0, 1, not bool(err), err
     if kind in {"inventory", "receive_item"}:
         return (buddy.get("inventory") or {}).get(target["prefab"], 0), target["count"], True, ""
-    if kind == "visit_building":
+    if kind in PLACE_TARGETS:
         done, reason = building_progress(target, observed.get("places"))
-        return int(done), 1, not bool(reason), reason
+        return (0 if kind == "stay_home" else int(done)), 1, not bool(reason), reason
+    if kind == "hunger_ratio":
+        hunger, maximum = buddy.get("hunger"), buddy.get("hunger_max")
+        if number(hunger) and number(maximum) and maximum > 0:
+            ratio = hunger / maximum
+            return round(ratio, 3), target["at_least"], True, ""
+        return 0, target["at_least"], False, "hunger telemetry missing"
+    if kind == "refuel":
+        if "at_least" in target:
+            status = fire_maintenance_state(target, state)
+            return int(status["satisfied"]), 1, status["available"], status["reason"]
+        error = refuel_error(target, observed.get("places"))
+        return 0, target["count"], not bool(error), error
     if kind == "inspect_storage":
+        cguid = container_guid_for(target, observed.get("places"))
         known = "containers" in observed
-        done = any(r["guid"] == target["container_guid"] and r.get("contents_known") for r in observed.get("containers", []))
+        done = cguid is not None and any(r["guid"] == cguid and r.get("contents_known") for r in observed.get("containers", []))
     elif kind == "equip":
         known = "equipment" in observed
         done = any(row["prefab"] == target["prefab"] and row.get("equipped") and row.get("usable") for row in observed.get("equipment", []))
@@ -140,8 +209,16 @@ def evaluate_target(target, state):
         done = known and not any(row["prefab"] == target["prefab"] and row.get("equipped") for row in observed.get("equipment", []))
     elif kind == "structure":
         known = "structures" in observed
-        done = any(row["prefab"] == target["prefab"] and math.hypot(row["x"]-target["x"], row["z"]-target["z"]) <= target["radius"]
-                   for row in observed.get("structures", []))
+        if "placement" in target:
+            try:
+                area = placement_area(target["placement"], state)
+            except ValueError as exc:
+                return 0, 1, False, str(exc)
+            done = any(row["prefab"] == target["prefab"] and inside_placement(row, area)
+                       for row in observed.get("structures", []))
+        else:
+            done = any(row["prefab"] == target["prefab"] and math.hypot(row["x"]-target["x"], row["z"]-target["z"]) <= target["radius"]
+                       for row in observed.get("structures", []))
     elif kind == "move_to":
         point = buddy.get("position") or {}
         known = all(number(point.get(k)) for k in ("x", "z"))
@@ -206,13 +283,40 @@ class CompanionTasks:
     def progress(task, record, state):
         if task.get("timing_error"):
             return
-        if task["target"]["type"] == "return_owner" and task.get("at"):
+        kind = task["target"]["type"]
+        if kind == "return_owner" and task.get("at"):
             CompanionTasks.return_progress(task, record, state)
             return
-        if task["target"]["type"] == "visit_building" and record.get("arrival_receipt"):
+        if kind == "visit_building" and record.get("arrival_receipt"):
             task.update(progress={"current": 1, "required": 1}, status="done", blocked_reason="")
             return
-        if task["target"]["type"] not in COUNTED_TARGETS:
+        if kind in {"cook_meal", "ignite_tree"}:
+            camp_execution.progress(task, record, state)
+            return
+        if kind == "hunger_ratio":
+            record.setdefault("transfer_key", uuid.uuid4().hex)
+            key = record["transfer_key"]
+            for receipt in state["_companion"].get("transfer_receipts", []):
+                if receipt.get("task_key") == key and type(receipt.get("count")) is int:
+                    record["hunger_eaten"] = max(record.get("hunger_eaten", 0), receipt["count"])
+            return
+        if kind == "refuel":
+            record.setdefault("transfer_key", uuid.uuid4().hex)
+            key = record["transfer_key"]
+            for receipt in state["_companion"].get("transfer_receipts", []):
+                if receipt.get("task_key") == key and type(receipt.get("count")) is int:
+                    record["fuel_added"] = max(record.get("fuel_added", 0), receipt["count"])
+            added = record.get("fuel_added", 0)
+            task["fuel_added"] = added
+            if "count" in task["target"]:
+                required = task["target"]["count"]
+                task["progress"] = {"current": added, "required": required}
+                if added >= required:
+                    task.update(status="done", blocked_reason="")
+                elif task["status"] != "blocked" and added:
+                    task["status"] = "in_progress"
+            return
+        if kind not in COUNTED_TARGETS:
             return
         if "transfer_key" not in record:
             record["transfer_key"] = uuid.uuid4().hex
@@ -313,9 +417,14 @@ class CompanionTasks:
             return True
         record = self.goals.records.get(task_id)
         data = action.get("data") or {}
-        if record and data.get("task_key") == record.get("transfer_key") and type(data.get("count")) is int:
-            record["camp_count"] = max(record.get("camp_count", 0), data["count"])
         task = next((t for t in (self.plan or {}).get("tasks", []) if t["id"] == task_id), None)
+        if record and data.get("task_key") == record.get("transfer_key") and type(data.get("count")) is int:
+            if task and task["target"]["type"] == "refuel":
+                record["fuel_added"] = max(record.get("fuel_added", 0), data["count"])
+            elif task and task["target"]["type"] == "hunger_ratio":
+                record["hunger_eaten"] = max(record.get("hunger_eaten", 0), data["count"])
+            else:
+                record["camp_count"] = max(record.get("camp_count", 0), data["count"])
         if record and task and task.get("at") and action["status"] == "completed" and action.get("reason") == "follow":
             record["return_departed"] = True
         if (record and task and task["target"]["type"] == "visit_building" and action["status"] == "completed"
@@ -323,12 +432,19 @@ class CompanionTasks:
                 and data.get("building_id") == task["target"]["building_id"]):
             record.update(done=True, arrival_receipt=dict(data))
             return True
+        if record and task and task["target"]["type"] in {"cook_meal", "ignite_tree"} and action["status"] == "completed":
+            op = action.get("op") or ""
+            synthetic = {"kind": op, **data}
+            camp_execution.on_completed(task["target"], record, synthetic, action.get("reason", ""), actor_state(observed))
+            return True
         if record and task and task["target"]["type"] in STORAGE_TARGETS:
             if action["status"] == "failed" and action.get("reason") == "chest_busy":
                 record.setdefault("storage_wait_started", self.clock())
                 record.update(storage_retry_at=self.clock()+.5, storage_busy_version=observed.get("version"))
                 return True  # An occupancy race is a transient wait, not an action failure.
-            if action["status"] == "completed" and action.get("reason") in {"one_item_transferred", "transfer_total_already_met"}:
+            if action["status"] == "completed" and (
+                    action.get("reason") in {"one_item_transferred", "transfer_total_already_met"}
+                    or str(action.get("reason", "")).startswith("items_transferred:")):
                 self.clear_storage_wait(record)
         if not self.search.inflight or self.search.inflight["task_id"] != task_id:
             return False
@@ -357,7 +473,16 @@ class CompanionTasks:
             return "needs_replan", {"reason": "query_supported_recipe:" + target["recipe_id"]}
         if not row.get("ready"):
             return "needs_replan", {"reason": row.get("reason", "recipe_not_ready"), "recipe_id": target["recipe_id"]}
-        return ("place", {k: target[k] for k in ("recipe_id", "x", "z", "radius")}) if placement else ("craft", {"recipe_id": target["recipe_id"]})
+        if not placement:
+            return "craft", {"recipe_id": target["recipe_id"]}
+        if "placement" in target:
+            try:
+                area = placement_area(target["placement"], actor_state(observed))
+            except ValueError as exc:
+                return "needs_replan", {"reason": str(exc)}
+            return "place", {"recipe_id": target["recipe_id"], "x": area["x"], "z": area["z"],
+                             "radius": min(8, max(2, area["radius"]))}
+        return "place", {k: target[k] for k in ("recipe_id", "x", "z", "radius")}
 
     @staticmethod
     def unequip_action(item, observed):
@@ -400,7 +525,9 @@ class CompanionTasks:
             target = task["target"]
             kind = target["type"]
             required = {"inventory": "craft" if target.get("recipe_id") else "collect", "structure": "place",
-                        "move_to": "move", "return_owner": "follow", **{t: "storage" for t in STORAGE_TARGETS}}.get(kind, kind)
+                        "move_to": "move", "return_owner": "follow", "set_home": "home", "return_home": "home",
+                        "stay_home": "home", "hunger_ratio": "hunger", "refuel": "refuel",
+                        **{t: "storage" for t in STORAGE_TARGETS}}.get(kind, kind)
             if required not in capabilities(observed):
                 return task, "unsupported", {"reason": "capability_unavailable:" + required}
             if kind == "visit_building":
@@ -409,8 +536,113 @@ class CompanionTasks:
                     return task, "needs_replan", {"reason": "building_missing_or_unavailable"}
                 navigation.append((task, "visit_building", {"building_id": target["building_id"]}))
                 continue
+            if kind == "set_home":
+                building = next((r for r in (observed.get("places") or {}).get("buildings", []) if r["id"] == target["anchor_id"]), None)
+                if not building or building.get("status") in {"missing", "unavailable"}:
+                    return task, "needs_replan", {"reason": "home_anchor_missing_or_unavailable"}
+                if not building.get("arrived"):
+                    navigation.append((task, "visit_building", {"building_id": target["anchor_id"]}))
+                    continue
+                return task, "set_home", {"anchor_id": target["anchor_id"]}
+            if kind in {"return_home", "stay_home"}:
+                home = (observed.get("places") or {}).get("home") or {}
+                if home.get("id") != target["home_id"]:
+                    return task, "needs_replan", {"reason": "home_unset_or_changed"}
+                if kind == "stay_home" and (view.get("residence_constraint") or {}).get("holding"):
+                    navigation.append((task, "waiting", {}))
+                    continue
+                anchor_id = home.get("anchor_id")
+                if anchor_id and any(r.get("id") == anchor_id and r.get("status") not in {"missing", "unavailable"}
+                                     for r in (observed.get("places") or {}).get("buildings", [])):
+                    navigation.append((task, "visit_building", {"building_id": anchor_id}))
+                elif number(home.get("x")) and number(home.get("z")):
+                    navigation.append((task, "move", {"x": home["x"], "z": home["z"]}))
+                else:
+                    return task, "needs_replan", {"reason": "home_coordinates_unavailable"}
+                continue
+            if kind == "hunger_ratio":
+                foods = [row for row in observed.get("foods", []) if number(row.get("hunger_delta")) and row["hunger_delta"] > 0]
+                safe = [row for row in foods if (row.get("health_delta", 0) or 0) >= 0 and (row.get("sanity_delta", 0) or 0) >= 0]
+                reserved = {
+                    t["target"].get("product") or t["target"].get("prefab")
+                    for t in view["tasks"]
+                    if t["id"] != task["id"] and t["target"].get("type") in {"cook_meal", "give_owner", "deposit", "drop_item"}
+                }
+                unreserved = [row for row in (safe or foods) if row.get("prefab") not in reserved]
+                chosen = max(unreserved or safe or foods, key=lambda r: r["hunger_delta"], default=None)
+                if not chosen:
+                    return task, "needs_replan", {"reason": "food_not_carried_or_inedible"}
+                record = self.goals.records[task["id"]]
+                record.setdefault("transfer_key", uuid.uuid4().hex)
+                return task, "eat", {"prefab": chosen["prefab"], "total_count": record.get("hunger_eaten", 0) + 1,
+                                     "task_key": record["transfer_key"]}
+            if kind == "refuel":
+                state = actor_state(observed)
+                err = refuel_error(target, observed.get("places"))
+                if err:
+                    return task, "needs_replan", {"reason": err}
+                pause = refuel_pause(target, state)
+                if pause == "fuel_settling":
+                    navigation.append((task, "waiting", {}))
+                    continue
+                if pause:
+                    return task, "needs_replan", {"reason": pause}
+                if not has_fuel(target, state):
+                    return task, "needs_replan", {"reason": "fuel_missing:" + target["fuel_prefab"]}
+                building = next((r for r in (observed.get("places") or {}).get("buildings", []) if r["id"] == target["building_id"]), None)
+                if not building or building.get("status") in {"missing", "unavailable"}:
+                    return task, "needs_replan", {"reason": "refuel_building_missing_or_unavailable"}
+                if not building.get("arrived"):
+                    navigation.append((task, "visit_building", {"building_id": target["building_id"]}))
+                    continue
+                record = self.goals.records[task["id"]]
+                record.setdefault("transfer_key", uuid.uuid4().hex)
+                total = target["count"] if "count" in target else record.get("fuel_added", 0) + 1
+                return task, "refuel", {"building_id": target["building_id"], "fuel_prefab": target["fuel_prefab"],
+                                        "total_count": total, "task_key": record["transfer_key"]}
+            if kind == "cook_meal":
+                state = actor_state(observed)
+                err = camp_error(target, state)
+                if err:
+                    return task, "needs_replan", {"reason": err}
+                building = next((r for r in (observed.get("places") or {}).get("buildings", []) if r["id"] == target["building_id"]), None)
+                if not building or building.get("status") in {"missing", "unavailable"}:
+                    return task, "needs_replan", {"reason": "cookpot_missing_or_unavailable"}
+                if not building.get("arrived"):
+                    navigation.append((task, "visit_building", {"building_id": target["building_id"]}))
+                    continue
+                row = camp_fixture(state, target["building_id"]) or {}
+                if task.get("meal_started"):
+                    if row.get("phase") == "ready":
+                        return task, "harvest_meal", {"building_id": target["building_id"], "product": target["product"]}
+                    navigation.append((task, "waiting", {}))
+                    continue
+                if not row.get("contents_known"):
+                    return task, "needs_replan", {"reason": "cookpot_unavailable"}
+                missing = Counter(target["ingredients"]) - camp_loaded(row)
+                if missing:
+                    inv = observed["buddy"].get("inventory") or {}
+                    prefab = next((name for name, need in sorted(missing.items()) if need > 0 and inv.get(name, 0) > 0), None)
+                    if not prefab:
+                        first = next(name for name, need in sorted(missing.items()) if need > 0)
+                        return task, "needs_replan", {"reason": "meal_ingredient_missing:" + first}
+                    return task, "cook_load", {"building_id": target["building_id"], "prefab": prefab}
+                return task, "start_meal", {"building_id": target["building_id"], "product": target["product"]}
+            if kind == "ignite_tree":
+                trees = (observed.get("camp_work") or {}).get("trees", [])
+                tree = next((r for r in trees if r.get("guid") == target["tree_guid"]), None)
+                if not tree or tree.get("status") != "ignitable":
+                    return task, "needs_replan", {"reason": "tree_not_ignitable"}
+                torches = [r for r in observed.get("equipment", []) if r.get("prefab") == "torch" and r.get("usable")]
+                if not torches:
+                    return task, "needs_replan", {"reason": "torch_required_for_ignition"}
+                equipped = next((r for r in torches if r.get("equipped")), None)
+                if not equipped:
+                    return task, "equip", {"item_guid": torches[0]["guid"]}
+                return task, "ignite_tree", {"tree_guid": target["tree_guid"]}
             if kind in STORAGE_TARGETS:
-                chest = next((r for r in observed.get("containers", []) if r["guid"] == target["container_guid"]), None)
+                cguid = container_guid_for(target, observed.get("places"))
+                chest = next((r for r in observed.get("containers", []) if r["guid"] == cguid), None)
                 record = self.goals.records[task["id"]]
                 retry_stale = (self.clock() < record.get("storage_retry_at", 0)
                                and observed.get("version") == record.get("storage_busy_version"))
@@ -421,6 +653,12 @@ class CompanionTasks:
                     navigation.append(waiting)
                     continue
                 if not chest or not chest.get("contents_known"):
+                    building_id = target.get("building_id")
+                    building = next((r for r in (observed.get("places") or {}).get("buildings", [])
+                                     if building_id and r["id"] == building_id), None)
+                    if building and building.get("status") not in {"missing", "unavailable"} and not building.get("arrived"):
+                        navigation.append((task, "visit_building", {"building_id": building_id}))
+                        continue
                     return task, "needs_replan", {"reason": "chest_unavailable"}
             if kind in COUNTED_TARGETS:
                 if kind == "eat" and not any(row.get("prefab") == target["prefab"] for row in observed.get("foods", [])):
@@ -474,6 +712,24 @@ class CompanionTasks:
                     if target["prefab"] not in HAND_GATHERED_TOOL_MATERIALS:
                         return task, "needs_replan", {"reason": "tool_required:" + work["work"]}
                 if not candidates:
+                    if target["prefab"] == "charcoal" and camp_execution.burning(actor_state(observed)):
+                        burning_trees = [
+                            r for r in (observed.get("camp_work") or {}).get("trees", [])
+                            if r.get("status") == "burning"
+                        ]
+                        nearest = min(burning_trees, key=lambda r: r.get("distance", 99), default=None)
+                        pos = (observed.get("buddy") or {}).get("position") or {}
+                        if (nearest and number(nearest.get("distance")) and nearest["distance"] < 5.0
+                                and number(nearest.get("x")) and number(nearest.get("z"))
+                                and number(pos.get("x")) and number(pos.get("z"))):
+                            dx, dz = pos["x"] - nearest["x"], pos["z"] - nearest["z"]
+                            norm = math.hypot(dx, dz) or 1.0
+                            rx = round(nearest["x"] + (dx / norm) * 7.0, 2)
+                            rz = round(nearest["z"] + (dz / norm) * 7.0, 2)
+                            navigation.append((task, "move", {"x": rx, "z": rz}))
+                        else:
+                            navigation.append((task, "waiting" if observed.get("mode") == "stay" else "stay", {}))
+                        continue
                     if target["prefab"] in observed.get("_team_claimed_products",[]):
                         navigation.append((task,"waiting_resource",{}))
                         continue

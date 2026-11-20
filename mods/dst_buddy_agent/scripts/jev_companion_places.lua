@@ -36,16 +36,45 @@ function M.new(G,E)
             row.name=(((G.STRINGS or {}).NAMES or {})[string.upper(building.prefab)]) or building.prefab
             visible[id]=true
         end
-        local rows={};local x,z=E.position(a)
+        local rows,anchors={},{};local x,z=E.position(a)
         for _,id in ipairs(memory.order) do
             local known=memory.rows[id]
             local distance=math.sqrt((known.x-x)^2+(known.z-z)^2)
+            local arrived=visible[id]==true and not known.invalid and distance<=3
+            local status=known.invalid or (visible[id] and "observed" or "unconfirmed")
             rows[#rows+1]={id=id,guid=known.guid,prefab=known.prefab,name=known.name,x=known.x,z=known.z,
                 last_seen_at=known.last_seen_at,shared_from=known.shared_from,distance=math.floor(distance*10+.5)/10,
-                status=known.invalid or (visible[id] and "observed" or "unconfirmed"),
-                arrived=visible[id]==true and not known.invalid and distance<=3}
+                status=status,arrived=arrived}
+            if status~="missing" and status~="unavailable" then
+                anchors[#anchors+1]={id=id,prefab=known.prefab,name=known.name,x=known.x,z=known.z,ready=arrived}
+            end
         end
-        return {available=true,scope="companion_observed_buildings",identity="server_guid",buildings=rows}
+        local home
+        if memory.home then
+            local anchor=memory.rows[memory.home.anchor_id]
+            if anchor and anchor.invalid~="missing" then
+                memory.home.x,memory.home.z=anchor.x,anchor.z
+                local distance=math.sqrt((anchor.x-x)^2+(anchor.z-z)^2)
+                home={id=memory.home.id,anchor_id=memory.home.anchor_id,prefab=anchor.prefab,
+                    x=anchor.x,z=anchor.z,distance=math.floor(distance*10+.5)/10,
+                    arrived=visible[memory.home.anchor_id]==true and not anchor.invalid and distance<=3}
+            else
+                memory.home=nil
+            end
+        end
+        return {available=true,scope="companion_observed_buildings",identity="server_guid",
+            buildings=rows,anchors=anchors,home=home}
+    end
+    function P.set_home(a,anchor_id)
+        if type(anchor_id)~="string" or #anchor_id>64 then return false,"invalid_anchor_id" end
+        local e,reason=P.target(a,anchor_id)
+        if not e then return false,reason end
+        if E.distance(a,e)>3 then return false,"home_anchor_too_far" end
+        local memory=book(a)
+        local x,z=E.position(e)
+        memory.home_revision=(memory.home_revision or 0)+1
+        memory.home={id="home:"..tostring(memory.home_revision),anchor_id=anchor_id,prefab=e.prefab,x=x,z=z}
+        return true,memory.home.id
     end
     function P.target(a,id)
         local known=type(id)=="string" and book(a).rows[id]
@@ -57,7 +86,7 @@ function M.new(G,E)
         if e:HasTag("burnt") or e:HasTag("INLIMBO") then
             known.invalid="unavailable";return nil,"building_unavailable"
         end
-        if e.components.burnable and e.components.burnable:IsBurning() then return nil,"building_burning" end
+        if e.components.burnable and e.components.burnable:IsBurning() and e.prefab~="campfire" and e.prefab~="firepit" then return nil,"building_burning" end
         return e
     end
     function P.start(a,q)

@@ -336,6 +336,15 @@ class PriorityBoardExecutor:
                 if task["status"] == "blocked":
                     task.update(status="ready", blocked_reason="")
                 camp_execution.progress(task, record, state)
+            elif task["target"]["type"] in {"eat", "drop_item"} and self.progress_evaluator is None and (
+                    task["status"] != "blocked" or (
+                        task.get("blocked_reason", "").startswith("dependencies:") and
+                        all(self.records.get(d, {}).get("done") for d in task["depends_on"]))):
+                done_count = record.get("camp_count", 0)
+                required = task["target"]["count"]
+                task.update(progress={"current": done_count, "required": required},
+                            status="done" if done_count >= required else "in_progress" if done_count else "ready",
+                            blocked_reason="")
             if task["status"] == "done" and not predicted:
                 record["done"] = True
             elif task["status"] == "done" and predicted and not record["done"]:
@@ -418,6 +427,20 @@ class PriorityBoardExecutor:
                 return choices
             return [(k,a) for k,a in actions.items() if a.get("kind")=="explore" and a.get("planner_only")
                     and a.get("building_id")==target["building_id"]]
+        if target["type"] == "equip":
+            return [(k, a) for k, a in actions.items()
+                    if (a.get("kind") == "equip_item" and a.get("prefab") == target["prefab"])
+                    or (target["prefab"] == "torch" and a.get("kind") == "equip_torch")]
+        if target["type"] == "unequip":
+            return [(k, a) for k, a in actions.items()
+                    if (a.get("kind") == "unequip_item" and a.get("prefab") == target["prefab"])
+                    or (target["prefab"] == "torch" and a.get("kind") == "unequip_torch")]
+        if target["type"] == "eat":
+            return [(k, a) for k, a in actions.items()
+                    if a.get("kind") == "eat_item" and a.get("prefab") == target["prefab"]]
+        if target["type"] == "drop_item":
+            return [(k, a) for k, a in actions.items()
+                    if a.get("kind") == "drop_item" and a.get("prefab") == target["prefab"]]
         if target["type"] == "hunger_ratio":
             if "eat_safe_food" in actions:
                 return [("eat_safe_food", actions["eat_safe_food"])]
@@ -629,6 +652,10 @@ class PriorityBoardExecutor:
             target = signature.get("target", signature)
             if target["type"] in CAMP_TARGETS and status == "completed":
                 camp_execution.on_completed(target, record, action, reason, state)
+            elif (status == "completed" and target["type"] in {"eat", "drop_item"}
+                  and action.get("kind") in {"eat_item", "drop_item"}
+                  and target.get("prefab") == action.get("prefab")):
+                record["camp_count"] = record.get("camp_count", 0) + 1
             elif isinstance(reason, str) and reason.startswith("camp_effect_unconfirmed:"):
                 record["camp_error"] = "action issued but effect unconfirmed; inspect before retrying"
                 reason = reason.split(":", 1)[1]

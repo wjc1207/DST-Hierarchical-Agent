@@ -12,13 +12,15 @@
 
 伙伴通过 `companion_tasks.py` 接入同一个 `PriorityBoardExecutor`，不再自行维护顺序任务调度规则。两端的异步主循环、查询工具和原生动作选择仍分别维护。
 
-## 多伙伴仍复用任务层
+## 多伙伴与共用主循环
 
-0.6.0 在原 `CompanionAgent` 外增加 `CompanionTeamAgent`。本机只有一个真实 `CompanionTeamPlanner`：各角色请求先进入统一队列，一次模型响应包含每名待规划伙伴的原格式看板，校验完整批次后分发。每名伙伴仍用原来的 `CompanionTasks`、`PriorityBoardExecutor` 与原生执行器；模型调用串行，动作并行，等待中的角色不会冻结另一名角色。
+历史拆分的 `companion_team_planner.py` / `companion_team_bridge.py` / `companion_team_agent.py` 与 `jev_companion_team_*.lua` 已合并回 `companion_planner.py`、`companion_bridge.py`、`companion_agent.py` 及 `jev_companion_client.lua` / `jev_companion_server.lua`。玩家端与伙伴端现在共用 `planning_client.py` 中的 `PlanningClient`、`run_planning_loop()`、`AgentMemoryStore`、`ContextHarness` 与 `ExternalAgentBackend`。
 
-团队模型响应按伙伴 ID 提交简化任务，适配层转换成内部 `team_plan`，各角色继续使用 `task_board` 或 `agent_reply`。每人最多六任务、两专注，任务依赖限于自己看板；队伍状态只共享建筑事实，库存与科技按角色隔离。`@名字` 只递增指定成员版本并暂停其动作，过期规划不会覆盖新指令。详见[多伙伴说明](COMPANION_TEAM.md)。
+本机只有一个真实 `CompanionPlanner`：各角色请求先进入统一队列，一次模型响应包含每名待规划伙伴的原格式看板，校验完整批次后分发。每名伙伴仍用 `CompanionTasks`、`PriorityBoardExecutor` 与原生执行器；模型调用串行，动作并行，等待中的角色不会冻结另一名角色。
 
-请求仍复用 `request_json_plan`、历史裁剪和公共知识。首次推理为 medium，修复为 none；单角色原输出预算 4096 不变，团队响应预算为 8192，历史仍保留三轮并受字符上限裁剪。
+团队模型响应按伙伴 ID 提交简化任务，适配层转换成内部 `team_plan`，各角色继续使用 `task_board` 或 `agent_reply`。每人最多六任务、两专注，任务依赖限于自己看板；队伍状态只共享建筑事实，库存与科技按角色隔离。玩家端与伙伴端现在均通过 `dialogue_revision` 支持后台异步规划。详见[多伙伴说明](COMPANION_TEAM.md)与[Agent 记忆与外部回调](AGENT_MEMORY_AND_BACKENDS.md)。
+
+请求仍复用 `request_json_plan` 和公共知识，上下文管理已升级为按 `world_id` 隔离的 Append-Only + 阈值触发压缩 Harness（默认 128K 窗口，75% 触发压缩并保留最近 4 轮）。首次推理为 medium，修复为 none；单角色原输出预算 4096 不变，团队响应预算为 8192。
 
 0.6.2 的团队外层不再输出玩家可见回复。各 `LOCAL_PLAN.reply` 为对应伙伴的第一人称发言，经原 `buddy_reply` 及原生实体输出；共同任务各说分工，指定角色重新规划不会使未指定角色重复发言。公共任务格式与单角色执行器保持复用。
 
@@ -40,9 +42,9 @@
 
 收集数量是背包总量。先后关系用 `depends_on`，优先级本身不表达依赖。普通任务可以带 `start_at`，专注任务最多两项。这些规则都直接使用公共任务层。
 
-伙伴适配支持：`inventory {prefab,count,recipe_id?,allow_search?}`、`structure {prefab,recipe_id,x,z,radius?}`、`equip {prefab}`、`move_to {x,z,arrival_radius:2.5}`、`return_owner`、`follow`、`stay`。`return_owner` 要实际进入主人 4 单位内；库存、装备、建筑与位置以真实观察判断。依赖满足前，即使后续目标恰好已满足，也不能提前锁定完成，避免出发前就把“采集后返回”标记完成。参见[动作迁移](COMPANION_ACTIONS.md)。
+伙伴适配现已与玩家端基本对齐，支持：`inventory {prefab,count,recipe_id?,allow_search?}`、`structure {prefab,recipe_id,placement|{x,z,radius?}}`、`equip {prefab}`、`unequip {prefab}`、`eat {prefab,count?}`、`hunger_ratio {at_least}`、`drop_item {prefab,count}`、`give_owner {prefab,count}`、`receive_item {prefab,count}`、`inspect_storage` / `deposit` / `withdraw`（支持 `treasurechest` / `dragonflychest` / `icebox` 与统一 `building_id` 批量搬运）、`visit_building {building_id}`、`set_home` / `return_home` / `stay_home`（含 `duration` / `end_at`）、`refuel`（份数与比例维护）、`cook_meal`、`ignite_tree`、`move_to {x,z,arrival_radius?}`、`return_owner`、`follow`、`stay`。参见[动作迁移](COMPANION_ACTIONS.md)与[Agent 记忆与外部回调](AGENT_MEMORY_AND_BACKENDS.md)。
 
-最新服务端 `capabilities` 决定可计划的能力。没有完整地图或饥饿上限遥测时，适配器不会伪造字段。烹饪、战斗、家、全图导航等未实现的伙伴动作仍不开放；0.3.0 提供局部资源搜索，0.4.0 提供物品交接和箱子查存取，0.5.0 提供已见建筑记忆与返回。伙伴当前目标不支持 `duration/end_at`，错误时间属性由公共校验标记为任务失败。旧伙伴原型格式仅保留入口转换兼容，执行仍用公共看板。
+最新服务端 `capabilities` 决定可计划的能力；战斗与全图区域图导航仍暂不开放。旧伙伴原型格式仅保留入口转换兼容，执行仍用公共看板。
 
 ## 中断与重新规划
 

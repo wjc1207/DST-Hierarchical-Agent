@@ -9,12 +9,16 @@ import time
 from collections import OrderedDict
 
 from common import autonomy
+from common.camp_work import SAFE_MEALS, query_meals
 from common.companion_transfer import COUNTED_TARGETS, guid, query_storage
 from common.places import query_places
+from common.refueling import FUEL_PREFABS
 from mcp_server.game_bridge import BridgeError
 
 TERMINAL = {"completed", "failed", "interrupted"}
-OPS = {"summon", "bind", "follow", "stay", "stop", "move", "collect", "recipes", "equip", "unequip", "work", "craft", "place", "search", "visit_building"} | COUNTED_TARGETS
+OPS = {"summon", "bind", "follow", "stay", "stop", "move", "collect", "recipes", "equip", "unequip", "work", "craft",
+       "place", "search", "visit_building", "refuel", "set_home",
+       "cook_load", "start_meal", "harvest_meal", "ignite_tree"} | COUNTED_TARGETS
 
 
 class CompanionBridge:
@@ -198,8 +202,47 @@ class CompanionBridge:
             if not isinstance(args, dict):
                 raise BridgeError("Invalid action arguments")
             snapshot = self.state.get("companion") or {}
-            if op in {"recipes", "equip", "unequip", "work", "craft", "place", "search", "visit_building"} and op not in snapshot.get("capabilities", []):
+            if op in {"recipes", "equip", "unequip", "work", "craft", "place", "search", "visit_building", "refuel", "ignite_tree"} and op not in snapshot.get("capabilities", []):
                 raise BridgeError("Companion capability unavailable; update the server mod")
+            if op in {"cook_load", "start_meal", "harvest_meal"}:
+                if "cook_meal" not in snapshot.get("capabilities", []):
+                    raise BridgeError("Companion capability unavailable; update the server mod")
+                if (not isinstance(args.get("building_id"), str)
+                        or not re.fullmatch(r"building:[0-9]{1,30}", args["building_id"])
+                        or not any(r.get("id") == args["building_id"] and r.get("status") not in {"missing", "unavailable"}
+                                   for r in (snapshot.get("places") or {}).get("buildings", []))):
+                    raise BridgeError("Cooking action requires a remembered available cookpot building_id")
+                if op == "cook_load":
+                    if (set(args) != {"building_id", "prefab"} or not isinstance(args.get("prefab"), str)
+                            or not re.fullmatch(r"[a-z0-9_]{1,60}", args["prefab"])):
+                        raise BridgeError("cook_load requires building_id and canonical ingredient prefab")
+                else:
+                    if set(args) != {"building_id", "product"} or args.get("product") not in SAFE_MEALS:
+                        raise BridgeError(op + " requires building_id and supported meal product")
+            if op == "ignite_tree":
+                if (set(args) != {"tree_guid"} or type(args.get("tree_guid")) is not int
+                        or not any(r.get("guid") == args["tree_guid"] and r.get("status") == "ignitable"
+                                   for r in (snapshot.get("camp_work") or {}).get("trees", []))):
+                    raise BridgeError("ignite_tree requires an offered ignitable tree_guid")
+            if op == "set_home":
+                if "home" not in snapshot.get("capabilities", []):
+                    raise BridgeError("Companion capability unavailable; update the server mod")
+                if (set(args) != {"anchor_id"} or not isinstance(args.get("anchor_id"), str)
+                        or not re.fullmatch(r"building:[0-9]{1,30}", args["anchor_id"])
+                        or not any(r.get("id") == args["anchor_id"] and r.get("status") not in {"missing", "unavailable"}
+                                   for r in (snapshot.get("places") or {}).get("buildings", []))):
+                    raise BridgeError("set_home requires a remembered available anchor_id")
+            if op == "refuel":
+                if (set(args) != {"building_id", "fuel_prefab", "total_count", "task_key"}
+                        or not isinstance(args.get("building_id"), str)
+                        or not re.fullmatch(r"building:[0-9]{1,30}", args["building_id"])
+                        or args.get("fuel_prefab") not in FUEL_PREFABS
+                        or not isinstance(args.get("task_key"), str)
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args["task_key"])
+                        or type(args.get("total_count")) is not int or not 1 <= args["total_count"] <= 100
+                        or not any(r.get("id") == args["building_id"] and r.get("status") not in {"missing", "unavailable"}
+                                   for r in (snapshot.get("places") or {}).get("buildings", []))):
+                    raise BridgeError("Invalid refuel action arguments")
             if op == "visit_building":
                 if (set(args) != {"building_id"} or not isinstance(args.get("building_id"), str)
                         or not any(r.get("id") == args["building_id"] and r.get("status") not in {"missing", "unavailable"}
@@ -284,14 +327,14 @@ class CompanionBridge:
                 raise BridgeError("Unknown companion action")
             return copy.deepcopy(self.actions[action_id])
 
-    def storage(self, container_guid=None):
+    def storage(self, container_guid=None, building_id=None):
         with self.lock:
             self._fresh()
             snapshot = self.state.get("companion") or {}
             age = self.state.get("snapshot_age_ms", math.inf)+(self.clock()-self.received)*1000
             if not self.state.get("ready") or age > 2000 or "storage" not in snapshot.get("capabilities", []):
                 raise BridgeError("Current companion storage observation unavailable")
-            return query_storage(snapshot, container_guid)
+            return query_storage(snapshot, container_guid=container_guid, building_id=building_id)
 
     def places(self, query="", building_id=None, offset=0, limit=12):
         with self.lock:
@@ -301,6 +344,15 @@ class CompanionBridge:
             if not self.state.get("ready") or age > 2000 or "visit_building" not in snapshot.get("capabilities", []):
                 raise BridgeError("Current companion building memory unavailable")
             return query_places(snapshot.get("places"), query, building_id, offset, limit)
+
+    def meals(self, product=None):
+        with self.lock:
+            self._fresh()
+            snapshot = self.state.get("companion") or {}
+            age = self.state.get("snapshot_age_ms", math.inf)+(self.clock()-self.received)*1000
+            if not self.state.get("ready") or age > 2000 or "cook_meal" not in snapshot.get("capabilities", []):
+                raise BridgeError("Current companion meal catalog unavailable")
+            return query_meals(snapshot.get("camp_work") or {}, product)
 
     def expire_query(self, action_id):
         with self.lock:
@@ -335,3 +387,124 @@ class CompanionBridge:
                 self.actions[self.active].update(status="interrupted", reason="instruction_finished")
                 self.active = None
             return {"queued": True}
+
+
+IDS = {"buddy1", "buddy2"}
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+class CompanionTeamBridge:
+    """One authenticated owner connection managing 1..2 independent companion slot bridges."""
+    def __init__(self, token, *, clock=time.monotonic):
+        self.token, self.clock = token, clock
+        self.lock = threading.RLock()
+        self.members = {}
+        self.state = None
+        self.session = None
+        self.sequence = 0
+        self.received = -math.inf
+        self.server_id = secrets.token_hex(12)
+
+    def _fresh(self):
+        if self.state is None or self.clock() - self.received > 2:
+            raise BridgeError("Companion team disconnected/stale")
+
+    def exchange(self, payload, measurements=None):
+        with self.lock:
+            if not isinstance(payload.get("token"), str) or not hmac.compare_digest(payload["token"], self.token):
+                raise PermissionError("Unauthorized")
+            session, sequence = payload.get("session_id"), payload.get("sequence")
+            state = payload.get("state")
+            if not isinstance(state, dict) or state.get("team") is not True:
+                raise BridgeError("Companion team snapshot required; update DST Buddy Agent")
+            paused = state.get("paused", False)
+            if type(paused) is not bool:
+                raise BridgeError("Invalid companion pause state")
+            members = state.get("members")
+            if members == []:
+                members = {}
+            control = autonomy.settings({"autonomy": state.get("control")})
+            if (not isinstance(session, str) or not 1 <= len(session) <= 80 or type(sequence) is not int or sequence < 1
+                    or not isinstance(members, dict) or not set(members) <= IDS or control is None
+                    or control.get("mode") not in {"instruction", "autonomous"}
+                    or (control["mode"] == "autonomous" and not control["goal"])):
+                raise BridgeError("Invalid companion team envelope")
+            if session != self.session and self.session is not None and self.clock() - self.received < 3:
+                raise BridgeError("Another local client owns this team")
+            if session == self.session and sequence <= self.sequence:
+                raise BridgeError("Out-of-order team exchange")
+            target_ids = state["control"].get("target_ids", [])
+            if (not isinstance(target_ids, list) or any(not isinstance(i, str) for i in target_ids)
+                    or len(set(target_ids)) != len(target_ids) or not set(target_ids) <= IDS):
+                raise BridgeError("Invalid team scope")
+            kind = state["control"].get("request_kind", "manual")
+            if kind not in {"message", "manual", "autonomy"}:
+                raise BridgeError("Invalid team intent")
+            control.update(target_ids=target_ids, request_kind=kind)
+            roster = state.get("roster", [])
+            if not isinstance(roster, list) or len(roster) > 2:
+                raise BridgeError("Invalid roster")
+            seen_ids, seen_names = set(), set()
+            for row in roster:
+                name = row.get("name") if isinstance(row, dict) else None
+                if (not isinstance(row, dict) or row.get("id") not in IDS or row["id"] in seen_ids
+                        or not isinstance(name, str) or not 1 <= len(name) <= 12 or name.translate(ASCII_LOWER) in seen_names
+                        or any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "@/,[]\"'" for c in name)
+                        or name.translate(ASCII_LOWER) in {"all", "全体"}):
+                    raise BridgeError("Invalid or duplicate companion name")
+                seen_ids.add(row["id"])
+                seen_names.add(name.translate(ASCII_LOWER))
+            if not set(members) <= seen_ids:
+                raise BridgeError("Member absent from roster")
+            results = payload.get("results", [])
+            if not isinstance(results, list) or len(results) > 64:
+                raise BridgeError("Invalid team results")
+            staged = {}
+            commands = []
+            feedback = []
+            for identity, entry in members.items():
+                if not isinstance(entry, dict):
+                    raise BridgeError("Invalid member state")
+                member_control = entry.get("control")
+                if (isinstance(member_control, dict) and member_control.get("mode") == "autonomous"
+                        and (control["mode"] != "autonomous" or member_control.get("goal") != control["goal"])):
+                    raise BridgeError("Autonomous member does not match team goal")
+                observed = entry.get("companion") or {}
+                if observed.get("buddy_id", identity) != identity:
+                    raise BridgeError("Mismatched companion identity")
+                candidate = CompanionBridge(self.token, clock=self.clock)
+                old = self.members.get(identity) if session == self.session else None
+                if old:
+                    for key, value in old.__dict__.items():
+                        if key != "lock":
+                            setattr(candidate, key, copy.deepcopy(value))
+                response = candidate.exchange({"token": self.token, "session_id": session + "|" + identity, "sequence": sequence,
+                    "state": {**entry, "paused": paused},
+                    "results": [r for r in results if isinstance(r, dict) and r.get("buddy_id") == identity]})
+                staged[identity] = candidate
+                if response["command"]:
+                    commands.append({**response["command"], "buddy_id": identity})
+                feedback.extend({**r, "buddy_id": identity} for r in response["feedback"])
+            self.members = staged
+            self.session = session
+            self.sequence = sequence
+            self.received = self.clock()
+            self.state = {"team": True, "paused": paused, "control": copy.deepcopy(control), "roster": copy.deepcopy(roster),
+                          "members": {key: copy.deepcopy(value.state) for key, value in staged.items()}}
+            return {"server_id": self.server_id, "session_id": session, "sequence": sequence, "commands": commands, "feedback": feedback}
+
+    def observe(self):
+        with self.lock:
+            self._fresh()
+            return {"session_id": self.session, "state": copy.deepcopy(self.state), "connection_age_ms": (self.clock() - self.received) * 1000}
+
+    def member_call(self, method, buddy_id=None, *args, **kwargs):
+        with self.lock:
+            self._fresh()
+            if buddy_id is None:
+                if len(self.members) != 1:
+                    raise BridgeError("Specify buddy_id when controlling a team")
+                buddy_id = next(iter(self.members))
+            if buddy_id not in self.members:
+                raise BridgeError("Unknown/unbound companion")
+            return getattr(self.members[buddy_id], method)(*args, **kwargs)

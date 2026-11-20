@@ -33,7 +33,6 @@ from mcp_agent.model_state import model_game_state
 from mcp_agent.region_resources import room_resources
 from common.task_board import (validate_board, board_view, format_board,
                         INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
-from mcp_agent.action_sequence import SequenceExecutor, is_sequence, validate_sequence, format_sequence
 from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, validate_goals, merge_goals, idle_review_reason, idle_review_marker
 
 
@@ -45,7 +44,7 @@ STATIC_REFERENCE_MARKER = "\n\nStatic reference JSON (background, not a live obs
 PLANNING_POLICY = {"quarters_per_day": 4, "mode": "review_not_reset"}
 CONTROL_CONTRACT = {
     "transport": "mcp", "execution_owner": "lua", "navigation_intent_owner": "python",
-    "unsupported": ["attack", "equip_weapon", "automatic_tool_prerequisite_solver"],
+    "unsupported": ["attack", "automatic_tool_prerequisite_solver"],
 }
 PLAN_ERROR_LOG = LOG_DIR / "planner_errors.jsonl"
 
@@ -65,7 +64,8 @@ SUPPORTED_CAPABILITIES = {
     "execution_policy": "priority_goals",
     "inventory_target_prefabs": sorted(INVENTORY_TARGET_PREFABS),
     "inventory_prefab_aliases": dict(INVENTORY_PREFAB_ALIASES),
-    "target_types": ["inventory", "structure", "hunger_ratio", "visit_region", "survey_region", "known_regions",
+    "target_types": ["inventory", "structure", "hunger_ratio", "equip", "unequip", "eat", "drop_item",
+                     "visit_region", "survey_region", "known_regions",
                      "visit_building", "set_home", "return_home", "stay_home", "move_to", "refuel", *sorted(CAMP_TARGETS)],
     "constraints": {"max_carried_tools_or_torches": 1, "campfire_build_phase": "night", "max_focus_tasks": 2},
 }
@@ -176,6 +176,7 @@ PLAYER_TASK_FORMAT = (
     'Return {"goal":"short objective","tasks":[{"type":"collect","prefab":"cutgrass","count":4}]}. '
     'Put type and its arguments directly on each task. Omit target, schema, day and generated titles. '
     'Use inventory with recipe_id for crafting; collect is shorthand for a raw inventory goal. '
+    'Supported item tasks: equip {prefab}, unequip {prefab}, eat {prefab,count?:1}, drop_item {prefab,count?:1}. '
     'Use 1-6 tasks. Priority is 1 (highest) to 5, default 3. Optional fields include focus, reason, '
     'start_at, duration, end_at, search_budget_seconds (10-600), and search_budget_distance (8-2000). '
     'Use explicit stable IDs for edits, counted batches and tasks referenced by depends_on. '
@@ -204,9 +205,6 @@ def validate_plan(raw: object, day: int) -> dict:
     """Keep only a small, well-formed advisory plan in the planning context."""
     if not isinstance(raw, dict):
         raise ValueError("DeepSeek plan must be a JSON object")
-    if raw.get("kind") == "action_sequence" or (isinstance(raw.get("steps"), list)
-            and raw["steps"] and isinstance(raw["steps"][0], dict)):
-        return validate_sequence(raw, day)
     if "tasks" in raw:
         return validate_goals(raw, day) if is_priority_board(raw) else validate_board(raw, day)
     goal = _short_text(raw.get("goal"), 160)
@@ -315,7 +313,8 @@ def validate_player_board(raw, day, context, *, map_seen):
 
 def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict,
                  conversation: Optional[list[tuple[str, str]]] = None,
-                 reference: Optional[dict] = None, *, cancel_event=None) -> dict:
+                 reference: Optional[dict] = None, *, cancel_event=None,
+                 memory_store=None, on_usage=None, preserve_history: bool = False) -> dict:
     # Goal scheduling is deterministic. The model supplies needs, not movement legs.
     system_prompt = PLANNING_RULES + PLAYER_TASK_FORMAT + TASK_START_RULES + (
         "Ordinary tasks accept start_at. hunger_ratio and refuel ratio targets optionally accept task-level duration (game days, >0..7) to maintain the target. "
@@ -351,7 +350,8 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "A supported but not-ready recipe can be a future goal after prerequisites. Unknown/unsupported recipes cannot. "
         "hunger_ratio {at_least:0..1}; visit_region {node_id} for a known node; known_regions {count}. "
         "When camp_work_summary.available, query_places finds known treasurechest and cookpot IDs. "
-        "inspect_storage {building_id} travels to and opens a chest; query_storage reads observed slots only. Unknown or closed is not empty. "
+        "inspect_storage {building_id} travels to and opens a chest or icebox; query_storage reads observed slots only. Unknown or closed is not empty. "
+        "equip/unequip {prefab} manage carried equipment explicitly; eat {prefab,count?} eats a named carried food; drop_item {prefab,count} drops carried items at your feet. "
         "deposit/withdraw {building_id,prefab,count} move a counted batch once; use new IDs for new batches. "
         "count is the TOTAL for that batch, not the remaining quantity. Changing count on the same task ID "
         "retains verified transfers; do not subtract already moved items from count. "
@@ -468,7 +468,8 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         "this is a runtime action limitation, not a general DST rule or a ban on other dusk work. "
         "Generic place actions follow their live queried recipe and placement conditions. "
         "tools must be carried with adequate durability before work. Craftability is not current action availability. "
-        "No wait-second or equip-torch goals: illumination is handled by safety decisions when phase changes. "
+        "No wait-second goals; automatic night lighting is still handled by safety decisions when phase changes, "
+        "while explicit player equip/unequip/eat/drop_item requests are supported via equip, unequip, eat, and drop_item targets. "
         "Read the FINAL user snapshot as current truth; older user snapshots and assistant plans are "
         "history, not evidence of execution. Use observed facts, recent outcomes and DSTKnowledge. "
         "Static reference JSON below supplies DSTKnowledge, supported_capabilities, control_contract, "
@@ -489,6 +490,8 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         'Example: {"goal":"Recover hunger","tasks":['
         '{"type":"hunger_ratio","priority":1,"focus":true,"at_least":0.6}]}'
     )
+    if memory_store is not None:
+        system_prompt += "\n\n" + memory_store.index_prompt()
     if reference is None:
         # Compatibility for direct callers; runtime passes a separate local reference.
         reference = planning_reference(knowledge=context.get("dst_knowledge"))
@@ -503,11 +506,12 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
         if isinstance(old_context, dict):
             user = snapshot_message(old_context)
         history.append((user, assistant))
+    prior_turns = history if preserve_history else recent_exchanges(history)
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            *[message for user, assistant in recent_exchanges(history)
+            *[message for user, assistant in prior_turns
               for message in ({"role": "user", "content": user},
                               {"role": "assistant", "content": assistant})],
             {"role": "user", "content": snapshot_message(context)},
@@ -535,14 +539,19 @@ def request_plan(api_url: str, api_key: str, model: str, day: int, context: dict
     if isinstance(camp_catalog, dict) and camp_catalog.get("available"):
         functions["query_storage"] = lambda **args: query_storage(camp_catalog, **args)
         functions["query_meals"] = lambda **args: query_meals(camp_catalog, **args)
-    if functions:
-        body["tools"] = [tool for tool in (RECIPE_TOOL, PLACE_TOOL, MAP_TOOL, STORAGE_TOOL, MEALS_TOOL)
-                         if tool["function"]["name"] in functions]
+    tools = [tool for tool in (RECIPE_TOOL, PLACE_TOOL, MAP_TOOL, STORAGE_TOOL, MEALS_TOOL)
+             if tool["function"]["name"] in functions]
+    if memory_store is not None:
+        functions.update(memory_store.tool_functions())
+        tools.extend(memory_store.tool_specs())
+    if tools:
+        body["tools"] = tools
     def validate_response(raw, map_seen):
         return validate_player_board(raw, day, context, map_seen=map_seen)
     return request_json_plan(api_url, api_key, body, validate_response,
                              functions=functions, map_images=map_images, cancel_event=cancel_event,
-                             on_error=lambda stage, detail: record_plan_error(day, stage, detail), day=day,
+                             on_error=lambda stage, detail: record_plan_error(day, stage, detail),
+                             on_usage=on_usage, day=day,
                              repair_instruction=PLAYER_TASK_FORMAT + "For chat or completion use agent_reply.")
 
 
@@ -592,8 +601,6 @@ class DailyPlanner:
         self.board_console_at = 0.0
         self.completion_replan_slot = None
         self.last_completion_request = None
-        self.sequence = SequenceExecutor()
-        self.sequence_replan_reason = None
         self.goals = PriorityBoardExecutor()
         self.pending_basis = None
         self.goal_replan_reason = None
@@ -654,7 +661,6 @@ class DailyPlanner:
                 self.plan = self.previous_board = None
                 self.conversation.clear()
                 self.goals = PriorityBoardExecutor()
-                self.sequence = SequenceExecutor()
                 self.legacy_mode = False
             if message_changed and self.plan is not None and not is_priority_board(self.plan):
                 self.plan = self.previous_board = None
@@ -665,18 +671,12 @@ class DailyPlanner:
         if is_priority_board(self.plan):
             plan = {**self.plan, "verified_structures": ["sciencemachine"] if self.science_machine_built else []}
             return self.goals.view(plan, state)
-        if is_sequence(self.plan):
-            plan = {**self.plan, "verified_structures": ["sciencemachine"] if self.science_machine_built else []}
-            return self.sequence.view(plan, state)
         if self.plan is None or self.plan.get("kind") != "task_board":
             return self.plan
         facts = ["sciencemachine"] if self.science_machine_built else []
         return board_view(self.plan, state, verified_structures=facts)
 
     def _publish_board(self, board):
-        if is_sequence(board):
-            self._publish_sequence(board)
-            return
         if not board or board.get("kind") != "task_board":
             return
         signature = json.dumps({k: v for k, v in board.items() if k != "observed_at"}, sort_keys=True, ensure_ascii=False)
@@ -703,25 +703,6 @@ class DailyPlanner:
                 stream.write(json.dumps(packet, ensure_ascii=False, separators=(",", ":")) + "\n")
         except OSError as exc:
             print(f"task_board_log_unavailable error={type(exc).__name__}")
-
-    def _publish_sequence(self, plan):
-        signature = json.dumps(plan, sort_keys=True, ensure_ascii=False)
-        if signature == self.board_signature:
-            return
-        self.board_signature = signature
-        print(format_sequence(plan))
-        if self.board_log_dir is None:
-            return
-        try:
-            self.board_log_dir.mkdir(parents=True, exist_ok=True)
-            packet = {"run_id": self.board_run_id, "event": "sequence_updated", "action_sequence": plan}
-            temporary = self.board_log_dir / (".action_sequence_" + self.board_run_id + ".tmp")
-            temporary.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(self.board_log_dir / "action_sequence.json")
-            with (self.board_log_dir / "action_sequence.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(packet, ensure_ascii=False, separators=(",", ":")) + "\n")
-        except OSError as exc:
-            print(f"action_sequence_log_unavailable error={type(exc).__name__}")
 
     def request_review(self, state: dict, reason: str, *, immediate: bool = False) -> Optional[dict]:
         """One asynchronous evaluation; repeated polls keep the existing request/backoff."""
@@ -873,7 +854,7 @@ class DailyPlanner:
         if slot is None:
             return None
         day, quarter = slot
-        if self.plan is not None and not is_sequence(self.plan) and (
+        if self.plan is not None and (
             self.plan["day"] != day or self.plan.get("quarter") != quarter + 1
         ):
             if self.plan.get("kind") == "task_board":
@@ -906,9 +887,6 @@ class DailyPlanner:
                     if result.get("kind") == "task_board":
                         self.board_revision += 1
                         result["board_id"] = f"{self.board_run_id}:{self.board_revision}"
-                    elif is_sequence(result):
-                        self.board_revision += 1
-                        result["sequence_id"] = f"{self.board_run_id}:{self.board_revision}"
                     self.plan = result
                     serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
                     preview = serialized[:PLAN_PREVIEW_CHARS]
@@ -920,14 +898,6 @@ class DailyPlanner:
                     )
 
         view = self._board(state) if self.plan else None
-        if is_sequence(view) and view["status"] in {"completed", "failed"}:
-            self.previous_board = view
-            self._publish_board(view)
-            self.plan = None
-            self.requested_slot = None
-            self.sequence_replan_reason = "sequence_completed" if view["status"] == "completed" else "sequence_failed"
-            self.completion_replan_slot = slot
-            print(f"action_sequence_finished id={view.get('sequence_id')} status={view['status']} reason={view.get('reason', '')}")
         if (view and view.get("kind") == "task_board" and view.get("status") == "active"
                 and view.get("state_basis") == "observed" and view.get("tasks")
                 and all(t["status"] == "done" for t in view["tasks"])
@@ -945,15 +915,13 @@ class DailyPlanner:
         completing = self.completion_replan_slot == slot
         completion_ready = (not completing or self.last_completion_request is None
                             or time.monotonic() - self.last_completion_request >= COMPLETION_REPLAN_INTERVAL)
-        if self.requested_slot != slot and self.future is None and completion_ready and not is_sequence(self.plan):
+        if self.requested_slot != slot and self.future is None and completion_ready:
             self.requested_slot = slot
-            reason = self.sequence_replan_reason or ("all_tasks_completed" if completing else "quarter_window_or_invalidation")
-            self.sequence_replan_reason = None
+            reason = "all_tasks_completed" if completing else "quarter_window_or_invalidation"
             context = planning_context(state, list(self.history))
             context["replan_reason"] = reason
             context["science_machine_built_this_run"] = self.science_machine_built
             context["previous_task_board"] = self._board(state) or self.previous_board
-            context["previous_action_sequence"] = self.previous_board if is_sequence(self.previous_board) else None
             context["planning_window"] = {"day": day, "quarter": quarter + 1}
             reference = planning_reference(self.knowledge_path)
             # Snapshot the actual request, not a later observation or mutated board.
@@ -1003,10 +971,6 @@ class DailyPlanner:
             if major_change:
                 self.goal_replan_reason = "science_machine_completed"
             # Route failure is handled locally; do not invalidate the board.
-            return
-        if is_sequence(self.plan):
-            # SequenceExecutor owns exact step failures/completion. A milestone
-            # must not discard the remaining ordered steps during native work.
             return
         repeated_failure = self.failure_count >= 2
         if (major_change or repeated_failure) and time.monotonic() - self.last_replan >= 60:

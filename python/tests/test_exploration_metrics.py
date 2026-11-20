@@ -4,7 +4,6 @@ import unittest
 from common.exploration_metrics import observed_cells, survey_cells
 from common.task_board import format_board
 from mcp_agent.priority_board import validate_goals, PriorityBoardExecutor
-from mcp_agent.action_sequence import validate_sequence, SequenceExecutor
 from mcp_agent.model_state import model_game_state
 from test_priority_board import state, board, task
 
@@ -59,15 +58,9 @@ class GridUnitTests(unittest.TestCase):
         runner.room_search[('grass','A:FlowerPatch')]['seconds']=30
         self.assertEqual(runner.navigation_review_reason(b,s,'grass',signature,targets),'room_search_budget')
 
-    def test_old_sequence_is_normalized_and_missing_counts_do_not_finish(self):
-        seq=validate_sequence({'goal':'Survey','steps':[{'action':'explore_current_region','area':512}]},1)
-        self.assertEqual(seq['steps'][0]['cells'],32);self.assertNotIn('area',seq['steps'][0])
-        s=state();s['navigation']['graph']['current']={'observed_cells':10}
-        runner=SequenceExecutor();runner.view(seq,s)
-        s['navigation']['graph']['current']['observed_cells']=42
-        self.assertEqual(runner.view(seq,s)['status'],'completed')
+    def test_missing_observed_cell_counts_block_survey_goal(self):
+        s=state();s['navigation']['graph']['current']={}
         b=validate_goals({'goal':'Survey','tasks':[{'id':'survey','title':'Survey',
             'target':{'type':'survey_region','node_id':'A:FlowerPatch','cells':32}}]},1)
-        s['navigation']['graph']['current']={}
         view=PriorityBoardExecutor().view(b,s)
         self.assertEqual(view['tasks'][0]['status'],'blocked')

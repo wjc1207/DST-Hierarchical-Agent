@@ -9,10 +9,10 @@ from unittest.mock import patch
 
 from test_companion import state,TOKEN
 from test_shared_planning import Response
-from mcp_server.companion_team_bridge import CompanionTeamBridge
+from mcp_server.companion_bridge import CompanionTeamBridge
 from mcp_server.companion_server import create_server
-from mcp_agent.companion_team_planner import CompanionTeamPlanner,validate_team_plan
-from mcp_agent.companion_team_agent import CompanionTeamAgent
+from mcp_agent.companion_planner import CompanionPlanner as CompanionTeamPlanner,validate_team_plan
+from mcp_agent.companion_agent import CompanionTeamAgent
 
 
 def team_state():
@@ -336,7 +336,7 @@ class TeamPlannerTests(unittest.TestCase):
             with self.assertRaises(ValueError):functions["query_places"](buddy_id="stranger")
             return validator(assignments(ctx),False)
         planner=CompanionTeamPlanner("https://offline.invalid","fake","fake")
-        with patch("mcp_agent.companion_team_planner.request_json_plan",request):
+        with patch("mcp_agent.companion_planner.request_json_plan",request):
             result=planner(ctx,[],threading.Event())
         self.assertEqual(len(seen),1);self.assertEqual(len(result["assignments"]),2)
 

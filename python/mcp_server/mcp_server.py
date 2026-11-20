@@ -87,16 +87,18 @@ def create_server(bridge, *, poll=.2, timing_path=None):
                 **invoke(search, packet["state"].get("camp_work") or {}, product)}
 
     @server.tool()
-    def send_agent_feedback(text: str, revision: int, message_id: str, finish: bool = False) -> dict[str, Any]:
-        """Queue one DeepSeek reply through native player chat. finish stops instruction mode only."""
-        return invoke(bridge.send_agent_feedback, text, revision, message_id, finish)
+    def send_agent_feedback(text: str, revision: int, message_id: str, finish: bool = False,
+                            dialogue_revision: int | None = None) -> dict[str, Any]:
+        """Queue one reply through native player chat. finish stops instruction mode only."""
+        return invoke(bridge.send_agent_feedback, text, revision, message_id, finish, dialogue_revision)
 
     @server.tool()
     def start_action(choice: str, observation_id: str,
                      navigation_targets: list[dict[str, Any]] | None = None,
                      residence: dict[str, Any] | None = None,
                      destination: dict[str, Any] | None = None,
-                     placement: dict[str, Any] | None = None) -> dict[str, Any]:
+                     placement: dict[str, Any] | None = None,
+                     transfer_count: int | None = None) -> dict[str, Any]:
         """Queue one offered action; returns an ID, not completion. No arbitrary code.
 
         For navigation only, navigation_targets watches up to six local inventory,
@@ -110,9 +112,10 @@ def create_server(bridge, *, poll=.2, timing_path=None):
         placement={anchor_id:building:<GUID>,radius:4..20(default10)} bounds building
         actions to the observed anchor; travel there first. Lua selects a legal
         point inside this area and verifies it again before actual placement.
+        transfer_count (1..40) batches store_item / take_item from one slot.
         """
         invoke(tasks.check_manual_action)
-        return invoke(bridge.start_action, choice, observation_id, navigation_targets, residence, destination, placement)
+        return invoke(bridge.start_action, choice, observation_id, navigation_targets, residence, destination, placement, transfer_count)
 
     @server.tool()
     def move_to(x: float, z: float, observation_id: str, arrival_radius: float = 2) -> dict[str, Any]:

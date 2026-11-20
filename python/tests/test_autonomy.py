@@ -30,6 +30,23 @@ class AutonomyTests(unittest.TestCase):
                 autonomy.settings({"autonomy": value})
         self.assertEqual(autonomy.settings(controlled(goal="中" * 256))["goal"], "中" * 256)
 
+    def test_player_dialogue_revision_accepted_and_scopes_feedback(self):
+        bridge = GameBridge("local-autonomy-test-token" * 2)
+        snap = controlled(True, 1)
+        snap["autonomy"].update(
+            mode="instruction",
+            instruction="砍树",
+            dialogue_revision=2,
+            messages=[{"id": 1, "text": "砍树"}, {"id": 2, "text": "顺便采草"}],
+        )
+        bridge.exchange({"token": bridge.token, "session_id": "world", "sequence": 1, "state": snap})
+        self.assertEqual(autonomy.settings(snap)["dialogue_revision"], 2)
+        with self.assertRaises(BridgeError):
+            bridge.send_agent_feedback("旧回复", 1, "m-old", False, dialogue_revision=1)
+        bridge.send_agent_feedback("收到，边砍边规划", 1, "m-new", False, dialogue_revision=2)
+        reply = bridge.exchange({"token": bridge.token, "session_id": "world", "sequence": 2, "state": snap})
+        self.assertEqual(reply["agent_feedback"][0]["dialogue_revision"], 2)
+
     def test_bridge_rejects_disabled_and_obsolete_observations(self):
         bridge = GameBridge("local-autonomy-test-token" * 2)
         def exchange(snapshot, seq):

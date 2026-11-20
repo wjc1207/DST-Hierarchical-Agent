@@ -60,11 +60,13 @@ function M.snapshot(player)
     local messages={}
     for i,message in ipairs(state.messages or {}) do messages[i]={id=message.id,text=message.text} end
     return {enabled=state.enabled,goal=state.goal,revision=state.revision,
+        dialogue_revision=state.dialogue_revision,
         mode=state.mode or "autonomous",messages=messages,instruction=state.instruction}
 end
 
 local function changed(state,reason)
     state.revision=state.revision+1
+    state.dialogue_revision=nil
     if state.on_change then state.on_change(reason) end
 end
 
@@ -113,15 +115,21 @@ function M.submit_message(player,text)
         changed(state,"player_paused")
         return message,"paused"
     end
-    if not state.enabled or (state.mode=="instruction" and not state.instruction) then
-        state.instruction=state.mode=="instruction" and message or nil
-        state.messages={}
+    local running=state.enabled and not (state.mode=="instruction" and not state.instruction)
+    if running then
+        state.messages=state.messages or {}
+        local last=state.messages[#state.messages]
+        state.dialogue_revision=math.max(state.dialogue_revision or 0,last and last.id or 0)+1
+        state.messages[#state.messages+1]={id=state.dialogue_revision,text=message}
+        while #state.messages>8 do table.remove(state.messages,1) end
+        if state.on_change then state.on_change("player_dialogue") end
+        return message,"dialogue"
     end
+    state.instruction=state.mode=="instruction" and message or nil
+    state.messages={}
     state.enabled=true
     state.paused=false
-    state.messages=state.messages or {}
     state.messages[#state.messages+1]={id=state.revision+1,text=message}
-    while #state.messages>8 do table.remove(state.messages,1) end
     changed(state,"player_message")
     return message,"submitted"
 end
@@ -132,8 +140,8 @@ function M.apply_feedback(player,feedback,respond)
     local state=M.get(player)
     state.feedback_seen=state.feedback_seen or {}
     if state.feedback_seen[feedback.id] then return false end
-    -- Old replies cannot speak for, or stop, a newer instruction.
-    if feedback.revision~=state.revision then return false end
+    -- Old replies cannot speak for, or stop, a newer instruction or dialogue turn.
+    if feedback.revision~=state.revision or feedback.dialogue_revision~=state.dialogue_revision then return false end
     local text=M.validate_goal(feedback.text)
     if not text then return false end
     if feedback.finish and state.mode~="instruction" then return false end

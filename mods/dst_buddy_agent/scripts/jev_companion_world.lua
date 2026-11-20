@@ -10,7 +10,9 @@ local function round(v) return math.floor(v*100+.5)/100 end
 local function world_time(G)
     local world=G.TheWorld
     local state=world.state
-    local time={day=(state.cycles or 0)+1,phase=state.phase,time=state.time}
+    local world_id=(world.meta and world.meta.session_identifier)
+        or (G.TheNet and G.TheNet.GetSessionIdentifier and G.TheNet:GetSessionIdentifier()) or nil
+    local time={world_id=world_id,day=(state.cycles or 0)+1,phase=state.phase,time=state.time}
     local clock=world.net and world.net.components and world.net.components.clock
     local segment=G.TUNING and G.TUNING.SEG_TIME
     if not (clock and clock.OnSave and type(segment)=="number" and segment>0) then return time end
@@ -227,6 +229,7 @@ function M.new(G,reply,validate_text,encoded_size,trace)
     local storage=Storage.new(G,E)
     local places=Places.new(G,E)
     E.visit_start=places.start;E.visit_progress=places.progress
+    E.set_home=places.set_home;E.place_target=places.target
     function E.begin(a,q,r) return (Storage.ops[q.op] and storage.start or native.start)(a,q,r) end
     function E.progress(a,q,r) return (Storage.ops[q.op] and storage.progress or native.progress)(a,q,r) end
     E.query=native.query
@@ -297,7 +300,7 @@ function M.new(G,reply,validate_text,encoded_size,trace)
     end
     function E.snapshot(player,a,r)
         local px,pz=E.position(player)
-        local state={owner={guid=player.GUID,position={x=round(px),z=round(pz)}},bound=a~=nil,revision=r.revision or 0,
+        local state={owner={guid=player.GUID,userid=player.userid,position={x=round(px),z=round(pz)}},bound=a~=nil,revision=r.revision or 0,
             token=r.token,mode=r.mode or "stay",sampled_at=G.GetTime(),capabilities={"follow","stay","move","collect","stop","say"}}
         if not a or not a:IsValid() then state.bound=false;return state end
         local x,z=E.position(a);local c=a.components;local items,counts=inventory(a);local nearby={}
@@ -312,16 +315,22 @@ function M.new(G,reply,validate_text,encoded_size,trace)
         while #selected>48 do table.remove(selected) end
         state.buddy={guid=a.GUID,prefab=a.prefab,position={x=round(x),z=round(z)},inventory=counts,items=items,
             owner_distance=round(E.distance(a,player)),health=c.health.currenthealth,health_max=c.health.maxhealth,dead=E.dead(a),
-            hunger=c.hunger and c.hunger.current,sanity=c.sanity and c.sanity.current}
+            hunger=c.hunger and c.hunger.current,hunger_max=c.hunger and c.hunger.max,
+            sanity=c.sanity and c.sanity.current,
+            temperature=c.temperature and c.temperature.GetCurrent and round(c.temperature:GetCurrent()) or nil}
         if state.buddy.dead then
             state.buddy.health=0
             state.buddy.hunger=nil
+            state.buddy.hunger_max=nil
             state.buddy.sanity=nil
             state.capabilities={}
             return state
         end
         state.foods=native.foods(a)
-        if state.foods then state.capabilities[#state.capabilities+1]="eat" end
+        if state.foods then
+            state.capabilities[#state.capabilities+1]="eat"
+            if c.hunger and c.hunger.max and c.hunger.max>0 then state.capabilities[#state.capabilities+1]="hunger" end
+        end
         state.nearby=selected;state.resources_complete=#nearby<=48
         state.escape=r.escape and {status=r.escape.status,threat_prefab=r.escape.threat_prefab} or nil
         state.action=r.active and {id=r.active.id,op=r.active.op,status="running",
@@ -336,7 +345,13 @@ function M.new(G,reply,validate_text,encoded_size,trace)
         state.follow_state=r.follow_state
         for name,value in pairs(native.snapshot(a,entities)) do state[name]=value end
         state.places=places.snapshot(a,state.structures)
+        state.refueling=native.refueling(a,entities)
+        state.camp_work=native.camp_work(a,entities)
         state.capabilities[#state.capabilities+1]="visit_building"
+        state.capabilities[#state.capabilities+1]="home"
+        state.capabilities[#state.capabilities+1]="refuel"
+        state.capabilities[#state.capabilities+1]="cook_meal"
+        state.capabilities[#state.capabilities+1]="ignite_tree"
         for name,value in pairs(storage.snapshot(a,entities,r)) do state[name]=value end
         for _,name in ipairs({"storage","give_owner","drop_item"}) do state.capabilities[#state.capabilities+1]=name end
         if c.trader then state.capabilities[#state.capabilities+1]="receive_item" end

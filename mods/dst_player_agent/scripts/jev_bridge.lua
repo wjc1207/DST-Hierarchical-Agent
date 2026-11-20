@@ -11,7 +11,7 @@ local function state_signature(s,status)
         tostring(math.floor((v.hunger or 0)/math.max(v.hunger_max or 1,1)*10)),
         tostring(math.floor((v.sanity or 0)/math.max(v.sanity_max or 1,1)*4)),
         tostring(graph.current_node),tostring(graph.known_nodes),tostring(status.board_ready),tostring(s.recipe_version)}
-    if s.autonomy then parts[#parts+1]="autonomy:"..tostring(s.autonomy.revision) end
+    if s.autonomy then parts[#parts+1]="autonomy:"..tostring(s.autonomy.revision)..":"..tostring(s.autonomy.dialogue_revision) end
     local inventory=p.inventory or {}; local counts={}
     for _,group in ipairs({"items","equipped"}) do for _,item in ipairs(inventory[group] or {}) do
         local key=group..":"..tostring(item.prefab)..":"..tostring(item.slot)

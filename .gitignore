@@ -7,3 +7,4 @@ mods/dst_player_agent/scripts/jev_bridge_config.lua
 mods/dst_buddy_agent/scripts/jev_companion_config.lua
 dist/
 .vscode/
+data/agent_memory/

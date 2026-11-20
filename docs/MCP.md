@@ -65,43 +65,9 @@ DeepSeek 输出 `tasks`，验证后标记为 `schema=2, execution_policy=priorit
 
 完整 JSON 格式、约束、搜索预算和更新文件见 [Goal scheduling and navigation](GOAL_NAVIGATION.md)。请同步新增的 `python/mcp_agent/priority_board.py`、`python/mcp_agent/region_resources.py`、`data/worldgen_resources.json`、`scripts/jev_resource_memory.lua`，以及更新后的 Python 文件、`modmain.lua`、`scripts/jev_exploration.lua`、`scripts/jev_native_executor.lua` 和 `modinfo.lua`，重新进入世界并重启 Python。保留原 `.env`、桥接令牌和 `scripts/jev_bridge_config.lua`。协议仍为 4，不需要重新生成令牌。
 
-## DeepSeek 动作序列（旧版兼容）
+## DeepSeek 动作序列（已移除）
 
-以下仅描述此前的严格序列，当前 DeepSeek 不再生成此格式。
-
-旧序列输出 `steps`，严格按数组顺序执行。示例：
-
-```json
-{
-  "kind": "action_sequence",
-  "goal": "收集材料并准备火把",
-  "steps": [
-    {"id": "grass", "action": "collect", "prefab": "cutgrass", "count": 2},
-    {"id": "twigs", "action": "collect", "prefab": "twigs", "count": 2},
-    {"id": "torch", "action": "craft", "prefab": "torch", "count": 1},
-    {"id": "survey", "action": "explore_current_region", "cells": 16}
-  ]
-}
-```
-
-每批 1–12 步；每步 `timeout_seconds` 默认 120 秒、允许 5–300 秒。执行器持续推进当前步，不因材料被后面的制作消耗而重启已完成步骤，不越过失败步骤。原生动作仍逐次通过 MCP 的观察凭据和 Lua 完成验证，不是一次盲发所有按键。重规划带上已完成步骤、当前步和失败原因。跨四分之一天不会取消正在执行的序列；没有活动序列时保留原来的规划时间窗，完成／失败后异步申请下一批。
-
-| action | 参数与完成条件 |
-| --- | --- |
-| `collect` | `prefab,count`：达到当前库存目标；可采集、砍伐／采矿，缺来源时复用 BFS/DFS 寻找 |
-| `craft` | `prefab,count`：达到斧子、镐子或火把库存目标 |
-| `build` | `prefab`：已观察或验证建成营火／科学机器 |
-| `eat_safe_food` | `hunger_ratio`：达到目标饥饿比例，默认 0.7 |
-| `cook_food` | `count`：本步新增指定数量的熟食 |
-| `equip_torch` / `unequip_torch` | 观察到指定装备状态 |
-| `travel_region` | `node_id`：实际进入已观测拓扑节点；历史 `entered` 不算完成本次前往 |
-| `explore_current_region` | `area`：本步在当前区域新增指定观察面积，默认 256；或边界已完整调查 |
-| `explore_other_region` | `new_regions`：本步新发现指定数量的拓扑节点，默认 1；不是前往任意旧区域 |
-| `wait` | `seconds`：有界等待 1–30 秒，安全事件仍能中断 |
-
-不会自动发明工具／配方前置任务；DeepSeek 必须明确把前置操作排在前面。暂时没有合法动作或失败／超时会停止这批并要求重规划，而不是偷偷执行后面的步骤。事件快照可能使验证晚一个上传周期，但不能靠预测状态完成步骤。原生探索可能为资源事件返回控制，Python 会继续当前步而不调用模型。
-
-升级此旧版功能需要同步新增的 `python/mcp_agent/action_sequence.py` 及更新后的 `python/mcp_agent/daily_planner.py`、`python/mcp_agent/mcp_agent.py`、`python/mcp_agent/navigation_intents.py`、`data/DSTKnowledge.txt`，重启 Python。桥接协议仍为 4；此功能不修改 Lua 协议。这些纯语义序列仅保留 MCP 兼容，不包含键鼠路径。
+早期的严格 `action_sequence` 序列模块（`action_sequence.py`）已移除，玩家端与伙伴端现在统一使用优先级任务看板（`schema=2, execution_policy=priority_goals`）进行调度。
 
 ## 其他 MCP 客户端与连接检查
 

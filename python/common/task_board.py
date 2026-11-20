@@ -161,6 +161,19 @@ def validate_board(raw: dict, day: int, *, target_validator=None) -> dict:
                 if type(ratio) not in {int, float} or not math.isfinite(ratio) or not 0 < ratio <= 1:
                     raise ValueError("Invalid hunger target")
                 cleaned["at_least"] = float(ratio)
+            elif kind in {"equip", "unequip"}:
+                prefab = text(target.get("prefab"), 60)
+                if not re.fullmatch(r"[a-z0-9_]{1,60}", prefab):
+                    raise ValueError("Equipment target requires a canonical item prefab")
+                cleaned["prefab"] = prefab
+            elif kind in {"eat", "drop_item"}:
+                prefab = text(target.get("prefab"), 60)
+                if not re.fullmatch(r"[a-z0-9_]{1,60}", prefab):
+                    raise ValueError("Item action target requires a canonical item prefab")
+                count = target.get("count", 1 if kind == "eat" else None)
+                if type(count) is not int or not 1 <= count <= 100:
+                    raise ValueError("Item count must be 1-100")
+                cleaned.update(prefab=prefab, count=count)
             elif kind in {"visit_region", "survey_region"}:
                 cleaned["node_id"] = text(target.get("node_id"), 160)
                 if not cleaned["node_id"]:
@@ -280,6 +293,18 @@ def board_view(board: dict, state: dict, *, verified_structures=None, target_eva
         elif kind == "known_regions":
             known = graph.get("known_nodes") is not None
             current, needed = int(graph.get("known_nodes") or 0), target["count"]
+        elif kind == "equip":
+            known = "equipped" in inventory or "items" in inventory
+            current = int(any(i.get("prefab") == target["prefab"]
+                              and (i.get("durability_percent") is None or i.get("durability_percent", 1) > 0)
+                              for i in inventory.get("equipped", [])))
+        elif kind == "unequip":
+            known = "equipped" in inventory or "items" in inventory
+            current = int(known and not any(i.get("prefab") == target["prefab"]
+                                            for i in inventory.get("equipped", [])))
+        elif kind in {"eat", "drop_item"}:
+            needed = target["count"]
+            current, known = 0, True
         elif kind == "hunger_ratio":
             known = number(vitals.get("hunger")) and number(vitals.get("hunger_max")) and vitals["hunger_max"] > 0
             current = vitals["hunger"] / vitals["hunger_max"] if known else 0

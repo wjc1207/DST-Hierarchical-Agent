@@ -104,7 +104,7 @@ class PlanningHTTPError(RuntimeError):
 
 
 def request_json_plan(api_url, api_key, body, validate, *, functions=None, map_images=None,
-                      cancel_event=None, on_error=None, day=1, log_prefix="daily_plan", repair_instruction=None):
+                      cancel_event=None, on_error=None, on_usage=None, day=1, log_prefix="daily_plan", repair_instruction=None):
     """Use one bounded request/repair loop; profiles supply facts, tools and validation."""
     functions = functions or {}
     map_images = map_images if map_images is not None else []
@@ -143,6 +143,8 @@ def request_json_plan(api_url, api_key, body, validate, *, functions=None, map_i
         usage = payload.get("usage") or {}
         if not isinstance(usage, dict):
             usage = {}
+        if on_usage and usage:
+            on_usage(usage)
         cache_counts = {key: usage[key] for key in (
             "prompt_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
             if type(usage.get(key)) is int and usage[key] >= 0}
@@ -171,6 +173,8 @@ def request_json_plan(api_url, api_key, body, validate, *, functions=None, map_i
                     if function["name"] not in functions:
                         raise ValueError("Unknown planner tool")
                     result = functions[function["name"]](**json.loads(function["arguments"]))
+                    if function["name"].startswith("memory_"):
+                        print(f"agent_memory_tool name={function['name']} result={json.dumps(result, ensure_ascii=False)[:180]}")
                 except (ValueError, TypeError, KeyError) as exc:
                     result = {"error": str(exc)}
                 body["messages"].append({"role": "tool", "tool_call_id": call["id"],

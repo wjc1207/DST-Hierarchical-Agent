@@ -55,11 +55,11 @@ python.exe .\python\mcp_agent\companion_agent.py --execute
 
 最后一条命令会向游戏发送实际操作；按 `Ctrl+C` 停止。
 
-[MCP服务器](docs/MCP.md)提供面向agent的接口，可以连接原生agent、DSH、CodeX或者Claude Code.
+[MCP服务器](docs/MCP.md)提供纯游戏 I/O 接口，上层可接自研 DeepSeek Harness，也可通过 `--backend claude|codex|dsh|dsh-http` 事件驱动回调外部 Agent CLI，或在 DSH / Codex 桌面端中直接作为 MCP 服务挂载。详见[Agent 记忆、上下文压缩与外部 Agent 回调](docs/AGENT_MEMORY_AND_BACKENDS.md)。
 
-[角色操控 HUD 与聊天](docs/DIALOGUE.md)：在游戏右侧切换指令／自主、编辑长期目标或暂停接管。开启聊天监听后，用 `@自己 需求` 在游戏聊天框派活。指令完成后待命，自主模式持续生存。
+[角色操控 HUD 与聊天](docs/DIALOGUE.md)：在游戏右侧切换指令／自主、编辑长期目标或暂停接管。开启聊天监听后，用 `@自己 需求` 在游戏聊天框派活，执行中发新消息会在后台异步规划并平滑更新；显式发送 `停止/暂停/取消` 或点击暂停立即接管。
 
-[服务端伙伴](docs/COMPANION.md)：支持[两个命名伙伴与统一规划](docs/COMPANION_TEAM.md)，`/buddy summon 名字` 自行生成并绑定威尔逊，无需其他模组；用 `@名字` 指定指令，各伙伴独立执行；支持跟随、拾取／采集、装备、砍树、挖矿、普通配方制作及陆地建造。模型费用由使用伙伴的各客户端承担。见[动作实测说明](docs/COMPANION_ACTIONS.md)。
+[服务端伙伴](docs/COMPANION.md)：支持[两个命名伙伴与统一规划](docs/COMPANION_TEAM.md)，`/buddy summon 名字` 自行生成并绑定威尔逊，无需其他模组；用 `@名字` 指定指令，各伙伴独立执行；支持跟随、拾取／采集、装备／卸下、砍树、挖矿、制作建造、箱子／冰箱／龙蝇箱批量存取、添燃料、设家驻留、烹饪锅做饭与烧树制炭。模型费用由使用伙伴的各客户端承担。见[动作实测说明](docs/COMPANION_ACTIONS.md)。
 
 [共用规划与任务层](docs/SHARED_PLANNING.md)：客户端与伙伴共用模型请求、上下文和完成规则、优先级看板与任务调度，分别适配状态和动作。
 

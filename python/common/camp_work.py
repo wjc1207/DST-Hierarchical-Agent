@@ -52,6 +52,9 @@ def recipe_option(state, target):
                  if row["product"] == target["product"] and sorted(row["ingredients"]) == target["ingredients"]), None)
 
 
+STORAGE_PREFABS = {"treasurechest", "dragonflychest", "icebox"}
+
+
 def target_error(target, state):
     work = state.get("camp_work") or {}
     if work.get("available") is not True:
@@ -59,11 +62,12 @@ def target_error(target, state):
     kind = target["type"]
     if kind == "ignite_tree":
         return ""
-    expected = "cookpot" if kind == "cook_meal" else "treasurechest"
+    expected = {"cookpot"} if kind == "cook_meal" else STORAGE_PREFABS
     found = next((row for row in (state.get("places") or {}).get("buildings", [])
                   if row.get("id") == target["building_id"]), None)
-    if not found or found.get("prefab") != expected or found.get("status") == "missing":
-        return f"target requires a known {expected}; query_places"
+    if not found or found.get("prefab") not in expected or found.get("status") == "missing":
+        label = "cookpot" if kind == "cook_meal" else "treasurechest"
+        return f"target requires a known {label}; query_places"
     if (fixture(state, target["building_id"]) or {}).get("phase") == "burnt":
         return "camp building burnt"
     if kind == "cook_meal" and not recipe_option(state, target):

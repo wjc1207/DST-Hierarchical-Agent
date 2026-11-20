@@ -1,7 +1,7 @@
 package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 local Names=require("jev_companion_roster")
-local Server=require("jev_companion_team_server")
-local Client=require("jev_companion_team_client")
+local Server=require("jev_companion_server")
+local Client=require("jev_companion_client")
 local Places=require("jev_companion_places")
 local World=require("jev_companion_world")
 local passed=0
@@ -28,8 +28,8 @@ local function fixture()
         set_name=function(a,name) a.displayed_name=name end,
         say=function(a,text) w.spoken={guid=a.GUID,text=text};w.speeches=w.speeches or {};w.speeches[#w.speeches+1]=w.spoken end,validate_text=Client.validate_text,
         collect_target=function(_,id) return {guid=id,product="cutgrass"} end,count=function() return 0 end,collect=function() return true end}
-    w.env=env;w.network={};w.server=Server.new(env)
-    w.client=Client.new({nonce="client",now=function() return w.wall or w.time end,sim_now=env.now,http_enabled=true,notice=function(text) w.notices[#w.notices+1]=text end,
+    w.env=env;w.network={};w.server=Server.new_team(env)
+    w.client=Client.new_team({nonce="client",now=function() return w.wall or w.time end,sim_now=env.now,http_enabled=true,notice=function(text) w.notices[#w.notices+1]=text end,
         send=function(q) w.sent[#w.sent+1]=q;if w.delay then w.network[#w.network+1]=q else w.server:request(w.owner,q) end end,
         http=function(payload,callback) w.http=payload;callback({session_id=payload.session_id,sequence=payload.sequence,commands={},feedback=w.feedback or {}}) end})
     function w:record(id) return self.server.owners.A.slots[id].engine.owners.A end
@@ -142,7 +142,7 @@ test("world save restores named companions, ghost state, inventory references an
     local saved,refs=w.server:save()
     assert(#saved.buddies==2 and #refs==1 and refs[1]==99)
     local newents={[99]={entity="world entity"}}
-    local reloaded=Server.new(w.env)
+    local reloaded=Server.new_team(w.env)
     reloaded:load(saved,newents)
     reloaded:load(saved,newents)
     assert(newents[alive.GUID]==nil and newents[ghost.GUID]==nil)

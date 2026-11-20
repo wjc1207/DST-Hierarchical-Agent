@@ -21,7 +21,6 @@ from mcp_agent.navigation_intents import ExplorationExecutor
 from common.config import load_dotenv, resolve_env_path
 from common.game_rules import survival_dangers
 from mcp_server.game_bridge import TERMINAL, finite_time, BridgePortUnavailable, check_bridge_port
-from mcp_agent.action_sequence import SequenceExecutor, is_sequence
 from mcp_agent.priority_board import PriorityBoardExecutor, is_priority_board, task_signature, idle_review_reason, progress_signatures_match
 from common.residence import allowed as residence_allowed
 from common.thermal import heat_risk
@@ -63,8 +62,6 @@ class MCPAgent:
         self.seen_actions = set()
         self.status_marks = set()
         self.last_terminal = None
-        self.sequence = getattr(planner, "sequence", None) or SequenceExecutor()
-        self.sequence_actions = {}
         self.goals = getattr(planner, "goals", None) or PriorityBoardExecutor()
         self.goal_actions = {}
         self.goal_gap_marker = None
@@ -113,9 +110,6 @@ class MCPAgent:
         timing.event("action.terminal_observed", action_id=identity, choice=choice,
                      status=status, reason=reason, **details)
         self.last_terminal = (identity, time.monotonic())
-        owner = self.sequence_actions.pop(identity, None)
-        if owner and owner[0] == self.sequence.identity and (status == "interrupted" or owner[1] not in self.sequence.completed):
-            self.sequence.on_result(status, reason)
         goal_owner = self.goal_actions.pop(identity, None)
         if goal_owner:
             task_id, signature, action = goal_owner
@@ -203,11 +197,9 @@ class MCPAgent:
             self.autonomy_revision = control_revision
             self.active_policy = None
             self.goal_actions.clear()
-            self.sequence_actions.clear()
             self.goal_gap_marker = self.goal_light = None
             if self.planner:
                 self.goals = getattr(self.planner, "goals", self.goals)
-                self.sequence = getattr(self.planner, "sequence", self.sequence)
         if isinstance(self.planner, DailyPlanner):
             while self.planner.feedback:
                 message = self.planner.feedback[0]
@@ -317,7 +309,7 @@ class MCPAgent:
                     raise RuntimeError("Native action exceeded its bound; cancellation requested, awaiting confirmation")
                 await asyncio.sleep(self.poll)
 
-    async def perform(self, choice, packet, sequence_step=None, goal_task=None, *, safety=False):
+    async def perform(self, choice, packet, goal_task=None, *, safety=False):
         timing.annotate(action=choice, current_action=choice)
         if not self.execute:
             print(f"dry_run choice={choice}: no game command sent")
@@ -344,12 +336,17 @@ class MCPAgent:
         if (goal_task is not None and goal_task["target"].get("placement")
                 and packet["actions"][choice]["kind"] in {"place","build_campfire","build_sciencemachine"}):
             arguments["placement"] = copy.deepcopy(goal_task["target"]["placement"])
+        if (goal_task is not None and goal_task["target"].get("type") in {"deposit", "withdraw"}
+                and packet["actions"][choice]["kind"] in {"store_item", "take_item"}):
+            remaining = max(1, goal_task["progress"]["required"] - goal_task["progress"]["current"])
+            available = packet["actions"][choice].get("available")
+            batch = min(remaining, available) if isinstance(available, int) and available >= 1 else remaining
+            if batch > 1:
+                arguments["transfer_count"] = min(batch, 40)
         result = await self.rpc("start_action", **arguments)
         self.active_id, self.active_started = result["action_id"], time.monotonic()
         self.active_autonomy_revision = autonomy.revision(packet["state"])
         self.active_policy = policy
-        if sequence_step is not None:
-            self.sequence_actions[self.active_id] = (self.sequence.identity, sequence_step)
         if goal_task is not None:
             owned_action = copy.deepcopy(packet["actions"][choice])
             if "navigation_targets" in arguments:
@@ -395,16 +392,6 @@ class MCPAgent:
             if is_priority_board(self.plan):
                 await self.run_priority_board(packet)
                 return False
-        if is_sequence(self.plan):
-            # Old local boards must release ownership before a new sequence.
-            if self.execute and self.uploaded and not self.board_acked:
-                await self.sync_board(None, self.auto_enabled)
-            if self.execute and self.auto_enabled:
-                await self.sync_board(None, False)
-                packet = await self.observe()
-            if is_sequence(self.plan):
-                await self.run_sequence_step(packet)
-                return False
         # A prior pause acknowledgement may have timed out. Finish that handshake
         # before considering either manual work or re-enabling a board.
         if self.execute and self.uploaded and not self.board_acked:
@@ -437,38 +424,6 @@ class MCPAgent:
             await self.handle_safety(packet, self.goals, "idle_safety")
         await asyncio.sleep(self.poll)
         return False
-
-    async def run_sequence_step(self, packet):
-        if packet["state"]["bridge"].get("executor_busy"):
-            timing.annotate(outcome="skipped", decision_source="native_busy")
-            await asyncio.sleep(self.poll)
-            return
-        if packet.get("state_age_ms", 0) > 1000:
-            packet = await self.observe(refresh=True)
-        if not is_sequence(self.plan):
-            return
-        state, actions = packet["state"], packet["actions"]
-        view = self.sequence.view(self.plan, state)
-        if view["status"] != "active":
-            timing.annotate(outcome=view["status"], decision_source="sequence", sequence_reason=view.get("reason"))
-            await asyncio.sleep(self.poll)
-            return
-        step_id = view["current_step_id"]
-        timing.annotate(sequence_id=self.plan.get("sequence_id"), sequence_step_id=step_id,
-                        sequence_step_index=view["step_index"], decision_source="sequence")
-        if await self.handle_safety(packet, self.sequence, "sequence_safety"):
-            return
-        choice = self.sequence.choose(self.plan, state, actions, self.navigator)
-        if choice is None:
-            print(f"action_sequence_blocked step={step_id} reason={self.sequence.reason}")
-            timing.annotate(outcome="failed", sequence_reason=self.sequence.reason)
-            # Observe once to publish verified failure and launch replanning;
-            # Leave the next step untouched until a new plan is accepted.
-            await self.observe()
-            await asyncio.sleep(self.poll)
-            return
-        print(f"action_sequence_step index={view['step_index'] + 1}/{len(view['steps'])} id={step_id} choice={choice}")
-        await self.perform(choice, packet, sequence_step=step_id)
 
     async def handle_thermal(self, packet):
         state,actions=packet["state"],packet["actions"]
@@ -610,21 +565,15 @@ async def run(args, planner):
 
         from mcp_agent.planning_client import PlanningClient
 
-        planning = PlanningClient(client, player_model=planner)
-        cycle = 0
-        try:
-            while not args.max_cycles or cycle < args.max_cycles:
-                cycle += 1
-                try:
-                    await planning.cycle()
-                except Exception as exc:
-                    print(f"planning_cycle_error: {exc}")
-                await asyncio.sleep(args.poll)
-        finally:
-            planning.close()
+        from mcp_agent.planning_client import run_planning_loop
+        is_external = hasattr(planner, "plan_player")
+        await run_planning_loop(client, poll=args.poll, max_cycles=args.max_cycles,
+                                player_model=None if is_external else planner,
+                                external_backend=planner if is_external else None)
 
 
 def main():
+    from mcp_agent.external_backends import BACKENDS, ExternalAgentBackend
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", type=Path)
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "logs" / "mcp_bridge.json")
@@ -634,6 +583,10 @@ def main():
     parser.add_argument("--poll", type=float, default=0.25)
     parser.add_argument("--max-cycles", type=int, default=0)
     parser.add_argument("--timing-log", type=Path, default=PROJECT_ROOT / "logs" / "mcp_timing.jsonl")
+    parser.add_argument("--backend", choices=BACKENDS, default="deepseek")
+    parser.add_argument("--backend-cmd", help="Custom executable/command for claude/codex/dsh backend")
+    parser.add_argument("--backend-model", help="Optional model name passed to external CLI backend")
+    parser.add_argument("--dsh-url", help="Local DSH HTTP callback URL for --backend dsh-http")
     args = parser.parse_args()
     if not 0.1 <= args.poll <= 2 or args.max_cycles < 0 or not 1 <= args.port <= 65535:
         parser.error("--poll must be 0.1..2 seconds; --max-cycles must be nonnegative; --port must be 1..65535")
@@ -641,10 +594,15 @@ def main():
     key = os.getenv("DEEPSEEK_API_KEY")
     if args.execute and not args.loop:
         parser.error("--execute requires --loop")
-    if args.execute and not key:
-        parser.error("DEEPSEEK_API_KEY is required with --execute")
-    planner = (key, os.getenv("DEEPSEEK_API_URL", DS_URL),
-               os.getenv("DEEPSEEK_MODEL", DS_MODEL)) if args.execute else None
+    planner = None
+    if args.execute:
+        if args.backend == "deepseek":
+            if not key:
+                parser.error("DEEPSEEK_API_KEY is required with --execute --backend deepseek")
+            planner = (os.getenv("DEEPSEEK_API_URL", DS_URL), key, os.getenv("DEEPSEEK_MODEL", DS_MODEL))
+        else:
+            planner = ExternalAgentBackend(args.backend, role="player", command=args.backend_cmd,
+                                           model=args.backend_model, dsh_url=args.dsh_url)
     try:
         asyncio.run(run(args, planner))
     except KeyboardInterrupt:

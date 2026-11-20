@@ -28,7 +28,7 @@ function M.allowed(action,s,area,walk)
         for _,b in ipairs((s.places or {}).buildings or {}) do
             if b.id==action.building_id and b.status~="missing"
                 and ((action.refuel_approach and (b.prefab=="campfire" or b.prefab=="firepit"))
-                    or (action.camp_approach and (b.prefab=="cookpot" or b.prefab=="treasurechest"))) then
+                    or (action.camp_approach and (b.prefab=="cookpot" or b.prefab=="treasurechest" or b.prefab=="icebox" or b.prefab=="dragonflychest"))) then
                 local route=b.route or {};local length=route.distance
                 return route.status=="ready" and action.mode=="place" and finite(length) and length>=0
                     and M.inside(b,area,2) and M.inside(action,area,2) and M.inside(p,area,length+2)
@@ -54,5 +54,6 @@ function M.allowed(action,s,area,walk)
     end
     return kind=="wait" or kind=="craft" or kind=="craft_torch" or kind=="craft_axe" or kind=="craft_pickaxe"
         or kind=="eat_safe_food" or kind=="cook_food" or kind=="equip_torch" or kind=="unequip_torch" or kind=="set_home"
+        or kind=="equip_item" or kind=="unequip_item" or kind=="eat_item" or kind=="drop_item"
 end
 return M
