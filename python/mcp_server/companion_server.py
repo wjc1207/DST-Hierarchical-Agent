@@ -12,6 +12,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common.pairing import ensure_bridge_token, format_pair_command
 from common.paths import PROJECT_ROOT
 from mcp_server.task_service import TaskService
 from mcp_server.companion_bridge import CompanionTeamBridge
@@ -22,7 +23,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
     tasks = TaskService(bridge, companion=True, poll=poll, timing_path=timing_path)
     from mcp.server import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
-    server = MCPServer("DSTCompanion", version="0.7.0", lifespan=tasks.lifespan, instructions=(
+    server = MCPServer("DSTCompanion", version="0.8.0", lifespan=tasks.lifespan, instructions=(
         "Companion tools control up to two named bound Wilsons, not your human player. Observe first. Without buddy_id, buddy_observe returns the team; specify buddy_id for other tools when two members exist. Use buddy_reply for each companion's own first-person speech. A member finish ends only that contribution. "
         "Use only offered collection target GUIDs. Poll buddy_result: queued/running are not success. "
         "follow completes when follow mode is set, not when arrival occurs. Read owner_distance for arrival. "
@@ -116,29 +117,38 @@ def main():
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--write-mod-config", type=Path)
     parser.add_argument("--configure-only", action="store_true")
+    parser.add_argument("--print-pair-command", action="store_true",
+                        help="Print the in-game /buddy pair command for Steam Workshop pairing and exit")
     parser.add_argument("--bridge-only", action="store_true")
     parser.add_argument("--poll", type=float, default=.2)
     args = parser.parse_args()
 
     if not 1 <= args.port <= 65535:
         parser.error("Invalid port")
-    if args.config.exists():
-        token = json.loads(args.config.read_text(encoding="utf-8-sig"))["token"]
-    else:
-        token = secrets.token_hex(32)
-        args.config.parent.mkdir(parents=True, exist_ok=True)
-        args.config.write_text(json.dumps({"token": token}), encoding="utf-8")
+    token, created = ensure_bridge_token(args.config)
+    pair_cmd = format_pair_command(token, args.port, prefix="/buddy", default_port=8766)
     bridge = CompanionTeamBridge(token)
     if args.write_mod_config:
         args.write_mod_config.parent.mkdir(parents=True, exist_ok=True)
         args.write_mod_config.write_text('return {enabled=true,url="http://127.0.0.1:' + str(args.port)
                                          + '/v1/exchange",token=' + json.dumps(token) + '}\n', encoding="utf-8")
         print("Local companion transport configured; re-enter the world.", file=sys.stderr)
+    if args.print_pair_command:
+        print(pair_cmd)
+        return 0
     if args.configure_only:
+        if not args.write_mod_config:
+            print("Steam Workshop in-game pairing command (local only, keep private):", file=sys.stderr)
+            print(pair_cmd, file=sys.stderr)
         return 0
     service = None if args.bridge_only else create_server(bridge, poll=args.poll)
     listener = serve_bridge(bridge, args.port, metrics_path=args.config.parent / "companion_transport.jsonl")
     print(f"Companion bridge: 127.0.0.1:{listener.server_port}; no model API calls.", file=sys.stderr)
+    if created:
+        print("First-time Workshop pairing (paste in DST chat, local only, keep private):", file=sys.stderr)
+        print(f"  {pair_cmd}", file=sys.stderr)
+    else:
+        print("Workshop pairing: run with --print-pair-command to display /buddy pair <token>.", file=sys.stderr)
     try:
         if service:
             service.run(transport="stdio")

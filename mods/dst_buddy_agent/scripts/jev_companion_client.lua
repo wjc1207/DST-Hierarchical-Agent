@@ -264,7 +264,17 @@ function M.new_team(env)
                 if q.op=="summon" or q.op=="bind" then q.args.name=row.name end
                 env.send(q)
             end}
-        c=M.new(ce);c.team_name=row.name;self.children[row.id]=c;return c
+        c=M.new(ce);c.team_name=row.name;c._jev_env=ce;self.children[row.id]=c;return c
+    end
+    function self:set_http_enabled(enabled)
+        env.http_enabled=enabled==true
+        self.inflight=false
+        self.http_generation=(self.http_generation or 0)+1
+        self.retry_at=0
+        self.last_ok=env.now()
+        for _,c in pairs(self.children) do
+            if c._jev_env then c._jev_env.http_enabled=env.http_enabled end
+        end
     end
     local function any_enabled()
         for _,c in pairs(self.children) do if c.control.enabled then return true end end;return false
@@ -311,7 +321,7 @@ function M.new_team(env)
             notice("用法：/buddy auto 长期目标（单行，最多 256 字）")
             return
         end
-        if enabled and not env.http_enabled then notice("本机桥接未配置。");return end
+        if enabled and not env.http_enabled then notice("本机桥接未配置，输入 /buddy setup 查看安装目录，或使用 /buddy pair <token> 配对。");return end
         if not enabled and control.mode~="autonomous" then notice("当前为伙伴指令模式。");return end
         local ids={}
         for _,row in ipairs(self.roster) do
@@ -443,7 +453,7 @@ function M.new_team(env)
         for _,id in ipairs(ids) do
             if not self.children[id] or not self.children[id].token then notice("伙伴尚未绑定，请先 /buddy summon 对应名字。");return end
         end
-        if not manual and not env.http_enabled then notice("本机桥接未配置。");return end
+        if not manual and not env.http_enabled then notice("本机桥接未配置，输入 /buddy setup 查看安装目录，或使用 /buddy pair <token> 配对。");return end
         local c=self.control
         if not manual and not c.enabled and c.mode=="instruction" then c.instruction=body;c.messages={} end
         c.revision=c.revision+1;c.target_ids=ids;c.request_kind=manual and "manual" or "message"
@@ -481,7 +491,7 @@ function M.new_team(env)
             end
         end)
         elseif name=="ai" then self:set_listening(body:lower()~="off")
-        else notice("用法：/buddy summon 名字 | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
+        else notice("用法：/buddy setup | pair <token> [8766] | unpair | summon 名字 | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
     end
     function self:accepts_chat(text)
         if not self.listening then return false end

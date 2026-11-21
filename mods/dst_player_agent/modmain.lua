@@ -1611,7 +1611,11 @@ end
 
 local emit_state
 local bridge_client
+local bridge_config
+local bridge_pairing = require("jev_bridge_pairing")
+local bridge_pairing_version = 0
 local start_bridge
+local stop_bridge
 
 local function read_execution(player)
     execution_observer.attach(player, G.GetTime, function()
@@ -2002,8 +2006,11 @@ local function start_telemetry(player)
             G.TheFrontEnd:StopUpdatingWidget(player._jev_frame_probe)
             player._jev_frame_probe=nil
         end
-        if bridge_client then bridge_client:stop(); bridge_client = nil end
-        if player._jev_bridge_tick then player._jev_bridge_tick:Cancel(); player._jev_bridge_tick = nil end
+        if stop_bridge then stop_bridge(player)
+        else
+            if bridge_client then bridge_client:stop(); bridge_client = nil end
+            if player._jev_bridge_tick then player._jev_bridge_tick:Cancel(); player._jev_bridge_tick = nil end
+        end
         if player._jev_dst_telemetry_task ~= nil then
             player._jev_dst_telemetry_task:Cancel()
             player._jev_dst_telemetry_task = nil
@@ -2693,14 +2700,25 @@ local function cancel_native_work()
     print("[JEV_DST_ACTION]cancel_work:requested")
 end
 
-start_bridge = function(player)
-    local loaded, config = protected_call(function() return require("jev_bridge_config") end)
-    if not loaded or type(config) ~= "table" or config.enabled ~= true then return end
-    if type(config.url) ~= "string" or not string.match(config.url, "^http://127%.0%.0%.1:%d+/v1/exchange$")
-        or type(config.token) ~= "string" or #config.token < 32 then
-        print("[JEV_DST_BRIDGE]invalid_local_configuration")
-        return
+stop_bridge = function(player)
+    if bridge_client then bridge_client:stop(); bridge_client = nil end
+    if player and player._jev_bridge_tick then
+        player._jev_bridge_tick:Cancel()
+        player._jev_bridge_tick = nil
     end
+    bridge_config = nil
+end
+
+local function start_bridge_with_config(player, raw_config)
+    local config = bridge_pairing.validate_config(raw_config)
+    if not config then
+        print("[JEV_DST_BRIDGE]invalid_local_configuration")
+        return false
+    end
+    if player == nil or not player:IsValid() or player ~= G.ThePlayer then return false end
+    stop_bridge(player)
+    config.source = raw_config.source or "persistent"
+    bridge_config = config
     local native = require("jev_native_executor")
     local transport = require("jev_bridge")
     local function controller()
@@ -2929,8 +2947,50 @@ start_bridge = function(player)
             end
         end
     end)
-    print("[JEV_DST_BRIDGE]enabled_loopback_http native_mcp_only")
+    print("[JEV_DST_BRIDGE]enabled_loopback_http native_mcp_only port=" .. tostring(config.port) .. " source=" .. tostring(config.source))
+    return true
 end
+
+start_bridge = function(player)
+    local version = bridge_pairing_version
+    bridge_pairing.load(G, "jev_player_bridge_v1", "jev_bridge_config", function(loaded_cfg)
+        if version ~= bridge_pairing_version then return end
+        if loaded_cfg and player and player:IsValid() and player == G.ThePlayer then
+            start_bridge_with_config(player, loaded_cfg)
+        end
+    end)
+end
+
+local bridge_control = {
+    mod_root = type(MODROOT) == "string" and MODROOT or "",
+    pair = function(cfg)
+        bridge_pairing_version = bridge_pairing_version + 1
+        cfg.source = "persistent"
+        bridge_pairing.save(G, "jev_player_bridge_v1", cfg)
+        local player = G.ThePlayer
+        if player and player:IsValid() then
+            start_bridge_with_config(player, cfg)
+            return true, true
+        end
+        bridge_config = cfg
+        return true, false
+    end,
+    unpair = function()
+        bridge_pairing_version = bridge_pairing_version + 1
+        bridge_pairing.clear(G, "jev_player_bridge_v1")
+        stop_bridge(G.ThePlayer)
+        return true
+    end,
+    status = function()
+        return {
+            paired = bridge_config ~= nil,
+            port = bridge_config and bridge_config.port or nil,
+            source = bridge_config and bridge_config.source or nil,
+            masked = bridge_config and bridge_pairing.mask(bridge_config.token) or nil,
+            connected = bridge_client ~= nil and bridge_client.connected == true,
+        }
+    end,
+}
 
 -- ThePlayer is often still nil while player prefabs are being initialized on a
 -- joining client. Poll from the world instead of making a one-shot comparison.
@@ -2951,7 +3011,7 @@ local function try_start_telemetry(player)
 end
 
 if AddClassPostConstruct then
-    require("jev_autonomy_ui").install(G,AddClassPostConstruct)
+    require("jev_autonomy_ui").install(G, AddClassPostConstruct, bridge_control)
 end
 
 AddPlayerPostInit(function(player)

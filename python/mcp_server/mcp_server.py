@@ -12,6 +12,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common.pairing import ensure_bridge_token, format_pair_command
 from common.paths import PROJECT_ROOT
 from mcp_server.task_service import TaskService
 
@@ -27,7 +28,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
             return function(*args, **kwargs)
         except ValueError as exc:
             raise ToolError(str(exc)) from None
-    server = MCPServer("decisionLimitedDST", version="1.8.8", lifespan=tasks.lifespan, instructions=(
+    server = MCPServer("decisionLimitedDST", version="1.9.0", lifespan=tasks.lifespan, instructions=(
         "Read get_state and get_available_actions before acting. Pass its observation_id. "
         "Queued/running is NOT completed. Poll get_action_status. One action owns the executor. "
         "Submit the original observation_id/choice that informed your decision; do not retarget silently. "
@@ -163,23 +164,22 @@ def main():
                         help="Explicit output path for the installed Mod's scripts/jev_bridge_config.lua")
     parser.add_argument("--bridge-only", action="store_true", help="Connectivity testing without an MCP host")
     parser.add_argument("--configure-only", action="store_true", help="Write configuration and exit, without serving")
+    parser.add_argument("--print-pair-command", action="store_true",
+                        help="Print the in-game /agent pair command for Steam Workshop pairing and exit")
     parser.add_argument("--poll", type=float, default=.25)
     parser.add_argument("--timing-log", type=Path)
     args = parser.parse_args()
 
-    if not args.configure_only:
+    if not 1 <= args.port <= 65535:
+        parser.error("Invalid port")
+    if not args.configure_only and not args.print_pair_command:
         try:
             check_bridge_port(args.port)
         except BridgePortUnavailable as exc:
             print(f"mcp_startup_error {exc}", file=sys.stderr)
             return 2
-    if args.config.exists():
-        config = json.loads(args.config.read_text(encoding="utf8"))
-        token = config["token"]
-    else:
-        token = secrets.token_hex(32)
-        args.config.parent.mkdir(parents=True, exist_ok=True)
-        args.config.write_text(json.dumps({"token": token}), encoding="utf8")
+    token, created = ensure_bridge_token(args.config)
+    pair_cmd = format_pair_command(token, args.port, prefix="/agent", default_port=8765)
     if args.write_mod_config:
         # Only ASCII literals are written; never load model API credentials into the Mod.
         args.write_mod_config.parent.mkdir(parents=True, exist_ok=True)
@@ -187,8 +187,14 @@ def main():
             'return { enabled = true, url = "http://127.0.0.1:' + str(args.port)
             + '/v1/exchange", token = ' + json.dumps(token) + ' }\n', encoding="utf8")
         print("Mod bridge configuration written; re-enter the world to enable it.", file=sys.stderr)
+    if args.print_pair_command:
+        print(pair_cmd)
+        return 0
     if args.configure_only:
-        return
+        if not args.write_mod_config:
+            print("Steam Workshop in-game pairing command (local only, keep private):", file=sys.stderr)
+            print(pair_cmd, file=sys.stderr)
+        return 0
     bridge = GameBridge(token)
     try:
         mcp = None if args.bridge_only else create_server(bridge, poll=args.poll, timing_path=args.timing_log)
@@ -201,6 +207,11 @@ def main():
         return 2
     print(f"DST Lua bridge listening on 127.0.0.1:{server.server_port}; no model APIs or keyboard input.", file=sys.stderr)
     print(f"HTTP timing log: {args.config.parent / 'mcp_transport.jsonl'}", file=sys.stderr)
+    if created:
+        print("First-time Workshop pairing (paste in DST chat, local only, keep private):", file=sys.stderr)
+        print(f"  {pair_cmd}", file=sys.stderr)
+    else:
+        print("Workshop pairing: run with --print-pair-command to display /agent pair <token>.", file=sys.stderr)
     try:
         if mcp:
             mcp.run(transport="stdio")

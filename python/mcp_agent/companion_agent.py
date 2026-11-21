@@ -860,9 +860,16 @@ def main():
     parser.add_argument("--backend-cmd", help="Custom executable/command for claude/codex/dsh backend")
     parser.add_argument("--backend-model", help="Optional model name passed to external CLI backend")
     parser.add_argument("--dsh-url", help="Local DSH HTTP callback URL for --backend dsh-http")
+    parser.add_argument("--print-pair-command", action="store_true",
+                        help="Print the in-game /buddy pair command for Steam Workshop pairing and exit")
     args = parser.parse_args()
     if not .1 <= args.poll <= 1 or not 1 <= args.port <= 65535 or args.max_cycles < 0:
         parser.error("Invalid poll, port or max-cycles")
+    if args.print_pair_command:
+        from common.pairing import ensure_bridge_token, format_pair_command
+        token, _ = ensure_bridge_token(args.config)
+        print(format_pair_command(token, args.port, prefix="/buddy", default_port=8766))
+        return 0
     planner = None
     if args.execute:
         if args.backend == "deepseek":

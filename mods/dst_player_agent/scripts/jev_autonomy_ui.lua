@@ -1,9 +1,10 @@
 -- Client HUD and local chat-command integration.
 local autonomy=require("jev_autonomy")
 local Hud=require("jev_hud_dock")
+local Pairing=require("jev_bridge_pairing")
 local M={}
 
-function M.install(G,postconstruct)
+function M.install(G,postconstruct,bridge_control)
     local function respond(message)
         if G.ChatHistory then G.ChatHistory:SendCommandResponse("[Agent] "..message) end
     end
@@ -16,6 +17,37 @@ function M.install(G,postconstruct)
         local run=screen.Run
         screen.Run=function(self,...)
             local text=self.chat_edit:GetString()
+            local p_matched,p_action,p_cfg,p_err=Pairing.parse(text,"/agent",8765,true)
+            if p_matched then
+                if not bridge_control then respond("桥接控制未就绪。");return end
+                if p_err then respond(p_err);return end
+                if p_action=="pair" then
+                    local _,started=bridge_control.pair(p_cfg)
+                    respond("已配对本机角色桥接（127.0.0.1:"..tostring(p_cfg.port).."，"..Pairing.mask(p_cfg.token).."），"
+                        ..(started and "已立即生效，工坊更新不会覆盖。" or "进入世界后生效。"))
+                elseif p_action=="unpair" then
+                    bridge_control.unpair()
+                    respond("已解除本机角色桥接配对并停止连接。")
+                elseif p_action=="setup" then
+                    local root=bridge_control.mod_root or ""
+                    if root~="" then
+                        respond("模组目录："..root)
+                    else
+                        respond("模组目录：请在 Steam 创意工坊目录 steamapps/workshop/content/322330/ 下找到本模组文件夹。")
+                    end
+                    respond("安装步骤：打开该目录双击 1_install_agent.bat（macOS/Linux 运行 1_install_agent.sh），再双击 2_run_player.bat，最后粘贴配对口令 /agent pair <token> 即可。")
+                elseif p_action=="status" then
+                    local st=bridge_control.status()
+                    if not st.paired then
+                        respond("本机角色桥接：未配对（输入 /agent setup 查看安装目录，或使用 /agent pair <token> 配对）。")
+                    else
+                        respond("本机角色桥接：已配对（127.0.0.1:"..tostring(st.port).."，"..tostring(st.masked)
+                            .."，来源："..(st.source=="persistent" and "本地持久化" or "配置文件")
+                            .."，状态："..(st.connected and "已连接" or "等待本机 Python 启动").."）。")
+                    end
+                end
+                return
+            end
             if self._jev_companion_accepts_chat and self._jev_companion_accepts_chat(text) then
                 return run(self,...)
             end

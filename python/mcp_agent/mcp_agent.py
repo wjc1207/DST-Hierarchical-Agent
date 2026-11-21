@@ -587,9 +587,16 @@ def main():
     parser.add_argument("--backend-cmd", help="Custom executable/command for claude/codex/dsh backend")
     parser.add_argument("--backend-model", help="Optional model name passed to external CLI backend")
     parser.add_argument("--dsh-url", help="Local DSH HTTP callback URL for --backend dsh-http")
+    parser.add_argument("--print-pair-command", action="store_true",
+                        help="Print the in-game /agent pair command for Steam Workshop pairing and exit")
     args = parser.parse_args()
     if not 0.1 <= args.poll <= 2 or args.max_cycles < 0 or not 1 <= args.port <= 65535:
         parser.error("--poll must be 0.1..2 seconds; --max-cycles must be nonnegative; --port must be 1..65535")
+    if args.print_pair_command:
+        from common.pairing import ensure_bridge_token, format_pair_command
+        token, _ = ensure_bridge_token(args.config)
+        print(format_pair_command(token, args.port, prefix="/agent", default_port=8765))
+        return 0
     load_dotenv(resolve_env_path(args.env))
     key = os.getenv("DEEPSEEK_API_KEY")
     if args.execute and not args.loop:

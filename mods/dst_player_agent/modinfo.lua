@@ -1,10 +1,19 @@
 name = "DST Player Agent"
 description = [[
-Control your player character through a local bridge. Open the Player Control HUD
-to give chat instructions or pursue a long-term survival goal.
+通过本机回环 MCP 桥接让 AI 操控你的角色：支持角色操控 HUD、@自己 聊天指令、长期生存目标与原版动作执行（采集、砍树、挖矿、生火、烹饪、存取箱子、建造、撤退等）。
+
+【创意工坊自包含一键安装（无需另去 GitHub 下载）】
+1. 进游戏聊天栏输入 /agent setup 查看本模组在电脑上的精确目录路径；
+2. 打开该目录双击 1_install_agent.bat（macOS/Linux 运行 1_install_agent.sh），将内置 Python 控制器安装到本机独立目录（支持创建桌面快捷方式，工坊更新不丢配置）；
+3. 双击 2_run_player.bat（或桌面快捷方式）启动并自动复制配对口令，回游戏按 Y 粘贴 /agent pair <token> 回车即可（纯本地拦截，绝不发到公屏）。
+
+Control your DST character through a local loopback MCP bridge with HUD controls, @自己 chat instructions, and long-term survival goals.
+Self-contained Workshop setup: type /agent setup in-game to see the mod folder, run 1_install_agent.bat (or .sh), then 2_run_player.bat, and paste /agent pair <token> in chat (local-only, persists across Workshop updates).
+Open-source repo: https://github.com/wjc1207/DST-Hierarchical-Agent
 ]]
 author = "Retard Wang"
-version = "1.8.8"
+version = "1.9.0"
+forumthread = ""
 
 icon_atlas = "modicon.xml"
 icon = "modicon.tex"

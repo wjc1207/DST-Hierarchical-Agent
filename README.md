@@ -1,6 +1,6 @@
 # DST Hierarchical Agent
 
-[English](README.EN.md) · [技术说明](docs/TECHNICAL.md)
+[English](README.EN.md) · [技术说明](docs/TECHNICAL.md) · [创意工坊指南](docs/WORKSHOP.md)
 
 本仓库包含两套《饥荒联机版》模组，共用 `python/` 下的规划和任务执行代码。
 
@@ -78,11 +78,22 @@ python.exe .\python\mcp_agent\companion_agent.py --execute
 
 [温度安全与火势控制](docs/THERMAL.md)：记录体温与火势，按需暂停添料，体温过高时沿安全照明路线避让。
 
-## 打包
+## 打包与创意工坊
 
-在仓库根目录运行 `python python/tools/package_mods.py`，生成 `dist/dst_player_agent.zip` 和 `dist/dst_buddy_agent.zip`。首次安装时，把所选压缩包解压到游戏的 `mods` 目录，再按对应安装说明配置桥接。Python 控制器从同一仓库启动。
+在仓库根目录运行 `python python/tools/package_mods.py`，同时生成相互独立的分发产物：
+- **Steam Mod Uploader 上传目录（自包含离线安装包）**：`dist/workshop/dst_player_agent/` 和 `dist/workshop/dst_buddy_agent/`（内含 Lua 模组、`preview.jpg`、空白无令牌配置、纯英文一键安装与运行脚本 `1_install_agent.bat/.sh` + `2_run_*.bat/.sh` 及离线 `runner/` 源码，工坊用户无需另去 GitHub 下载，游戏内输入 `/buddy setup` 或 `/agent setup` 即可查看精确目录）
+- **GitHub Releases 一键运行包**：`dist/dst_agent_runner.zip`（含 `setup_and_run.bat`、`setup_and_run.sh`、`scripts/launcher.ps1` 与本机 Python 控制器）
+- **离线模组压缩包**：`dist/dst_player_agent.zip` 和 `dist/dst_buddy_agent.zip`
 
-从旧名称升级时，将旧游戏模组目录里的 `scripts/jev_bridge_config.lua`（玩家操控）或 `scripts/jev_companion_config.lua`（伙伴）复制到对应新目录的 `scripts/` 下，保留原令牌。进入存档前，在模组菜单停用旧模组并启用新模组。
+GitHub 用户也可直接在 Windows PowerShell 运行一行命令或双击仓库根目录的 `setup_and_run.bat`（macOS / Linux 运行 `./setup_and_run.sh`）：
+
+```powershell
+irm https://raw.githubusercontent.com/wjc1207/DST-Hierarchical-Agent/main/install.ps1 | iex
+```
+
+完整发布步骤与商店页双语文案见 [docs/WORKSHOP.md](docs/WORKSHOP.md)。
+
+从旧名称升级时，将旧游戏模组目录里的 `scripts/jev_bridge_config.lua`（玩家操控）或 `scripts/jev_companion_config.lua`（伙伴）复制到对应新目录的 `scripts/` 下，保留原令牌；或直接在游戏内使用新的 `/agent pair` / `/buddy pair` 命令配对。进入存档前，在模组菜单停用旧模组并启用新模组。
 
 ## 测试与文档
 
