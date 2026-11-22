@@ -272,6 +272,12 @@ function M.new(G,reply,validate_text,encoded_size,trace)
                 end
             end
         end
+        if wanted.charcoal and E.count(a,"torch")>0 and native.camp_work then
+            local camp=native.camp_work(a)
+            for _,tree in ipairs(camp and camp.trees or {}) do
+                if tree.status=="ignitable" or tree.status=="burnt" then return true end
+            end
+        end
         return false
     end
     function E.say(a,text,r)

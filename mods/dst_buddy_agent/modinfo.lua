@@ -12,7 +12,7 @@ Self-contained Workshop setup: type /buddy setup in-game to see the mod folder, 
 Open-source repo: https://github.com/wjc1207/DST-Hierarchical-Agent
 ]]
 author = "Retard Wang"
-version = "0.8.0"
+version = "0.8.1"
 forumthread = ""
 
 icon_atlas = "modicon.xml"

@@ -98,7 +98,7 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
         self.assertIn("1_install_agent.bat", buddy_main)
         self.assertIn("2_run_buddy.bat", buddy_main)
         self.assertIn('"jev_buddy_bridge_v1"', buddy_main)
-        self.assertIn('version="0.8.0"', buddy_main)
+        self.assertIn('version="0.8.1"', buddy_main)
 
         player_main = (PROJECT_ROOT / "mods/dst_player_agent/modmain.lua").read_text(encoding="utf-8")
         self.assertIn('"jev_player_bridge_v1"', player_main)
@@ -114,8 +114,8 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
 
             expected_versions = {
-                "dst_player_agent": "1.9.0",
-                "dst_buddy_agent": "0.8.0",
+                "dst_player_agent": "1.9.1",
+                "dst_buddy_agent": "0.8.1",
             }
             for mod_id, meta in package_mods.MODS.items():
                 config_name = meta["config_name"]
@@ -217,7 +217,7 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                 self.assertTrue((install_dir / "python" / "mcp_agent" / "companion_agent.py").is_file())
                 self.assertEqual(
                     (install_dir / ".workshop_runner_version").read_text(encoding="utf-8").strip(),
-                    "dst_buddy_agent:0.8.0",
+                    "dst_buddy_agent:0.8.1",
                 )
 
     def test_one_click_installer_scripts_encoding_and_syntax(self):

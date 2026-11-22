@@ -12,7 +12,7 @@ Self-contained Workshop setup: type /agent setup in-game to see the mod folder, 
 Open-source repo: https://github.com/wjc1207/DST-Hierarchical-Agent
 ]]
 author = "Retard Wang"
-version = "1.9.0"
+version = "1.9.1"
 forumthread = ""
 
 icon_atlas = "modicon.xml"

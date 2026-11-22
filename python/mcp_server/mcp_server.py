@@ -28,7 +28,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
             return function(*args, **kwargs)
         except ValueError as exc:
             raise ToolError(str(exc)) from None
-    server = MCPServer("decisionLimitedDST", version="1.9.0", lifespan=tasks.lifespan, instructions=(
+    server = MCPServer("decisionLimitedDST", version="1.9.1", lifespan=tasks.lifespan, instructions=(
         "Read get_state and get_available_actions before acting. Pass its observation_id. "
         "Queued/running is NOT completed. Poll get_action_status. One action owns the executor. "
         "Submit the original observation_id/choice that informed your decision; do not retarget silently. "

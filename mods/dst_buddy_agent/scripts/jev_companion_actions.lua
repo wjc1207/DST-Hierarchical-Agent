@@ -287,21 +287,38 @@ function M.new(G,E)
                 elseif (IGNITE_TREES[e.prefab] or (TREES[e.prefab] and (e:HasTag("burnt") or e:HasTag("fire") or (e.components.burnable and e.components.burnable:IsBurning()))))
                     and not e:HasTag("stump") and not e:HasTag("monster") and not e:HasTag("plantcreature") and E.distance(a,e)<=15 then
                     local dist=E.distance(a,e)
-                    local status="ignitable"
+                    local status,unsafe_reason="ignitable",nil
                     if e:HasTag("burnt") then status="burnt"
                     elseif e.components.burnable and e.components.burnable:IsBurning() or e:HasTag("fire") then status="burning"
-                    elseif dist>12 or not IGNITE_TREES[e.prefab] then status=nil
+                    elseif not IGNITE_TREES[e.prefab] then status=nil
                     else
                         local tx,tz=position(e)
-                        for _,other in ipairs(G.TheSim:FindEntities(tx,0,tz,7.5,nil,{"INLIMBO","FX","DECOR"})) do
-                            if other~=e and other~=a and other:IsValid() and (other:HasTag("structure") or other:HasTag("player") or IGNITE_TREES[other.prefab]) then
-                                status="unsafe";break
+                        local spring_mod=1
+                        if G.TheWorld and G.TheWorld.state and G.TheWorld.state.isspring then
+                            local f=G.TUNING and G.TUNING.SPRING_FIRE_RANGE_MOD
+                            if type(f)=="number" and f>1 and f<math.huge then spring_mod=f end
+                        end
+                        local struct_r=7.5*spring_mod
+                        local tree_r=4.5*spring_mod
+                        local player_r=4.0
+                        for _,other in ipairs(G.TheSim:FindEntities(tx,0,tz,struct_r,nil,{"INLIMBO","FX","DECOR"})) do
+                            if other~=e and other~=a and other:IsValid() then
+                                local ox,oz=position(other)
+                                local od=math.sqrt((ox-tx)^2+(oz-tz)^2)
+                                if other:HasTag("structure") then
+                                    status,unsafe_reason="unsafe","near_structure";break
+                                elseif other:HasTag("player") and od<=player_r then
+                                    status,unsafe_reason="unsafe","near_player";break
+                                elseif IGNITE_TREES[other.prefab] and od<=tree_r then
+                                    status,unsafe_reason="unsafe","near_tree";break
+                                end
                             end
                         end
                     end
                     if status then
                         local ex,ez=position(e)
-                        trees[#trees+1]={guid=e.GUID,prefab=e.prefab,distance=dist,status=status,x=ex,z=ez}
+                        trees[#trees+1]={guid=e.GUID,prefab=e.prefab,distance=dist,status=status,
+                            unsafe_reason=unsafe_reason,x=ex,z=ez}
                     end
                 end
             end
@@ -366,7 +383,7 @@ function M.new(G,E)
             if not target or not target:IsValid() or not IGNITE_TREES[target.prefab] or target:HasTag("burnt") or target:HasTag("stump") or target:HasTag("monster") or target:HasTag("plantcreature") then
                 return false,"tree_unavailable"
             end
-            if E.distance(a,target)>12 then return false,"tree_too_far" end
+            if E.distance(a,target)>15 then return false,"tree_too_far" end
             local torch=a.components.inventory:GetEquippedItem(G.EQUIPSLOTS.HANDS)
             if not torch or torch.prefab~="torch" or not healthy(torch) then return false,"equipped_torch_required" end
             q.ignite_target=target

@@ -730,6 +730,10 @@ class CompanionTasks:
                         else:
                             navigation.append((task, "waiting" if observed.get("mode") == "stay" else "stay", {}))
                         continue
+                    if (target["prefab"] == "charcoal" and "ignite_tree" in capabilities(observed)
+                            and any(r.get("status") == "ignitable" for r in (observed.get("camp_work") or {}).get("trees", []))
+                            and any(r.get("prefab") == "torch" and r.get("usable") for r in observed.get("equipment", []))):
+                        return task, "needs_replan", {"reason": "ignitable_tree_found"}
                     if target["prefab"] in observed.get("_team_claimed_products",[]):
                         navigation.append((task,"waiting_resource",{}))
                         continue
