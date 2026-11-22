@@ -223,7 +223,8 @@ function M.new(G,E)
     local function refuel(a,q,r)
         local args=q.args
         if type(args.building_id)~="string" or not FUEL_PREFABS[args.fuel_prefab] then return false,"invalid_refuel_args" end
-        local target,reason=E.place_target and E.place_target(a,args.building_id)
+        local target,reason
+        if E.place_target then target,reason=E.place_target(a,args.building_id) end
         if not target then return false,reason or "refuel_target_missing" end
         if not FIRE_PREFABS[target.prefab] then return false,"refuel_unsupported_structure" end
         if E.distance(a,target)>4 then return false,"refuel_target_too_far" end
@@ -318,11 +319,13 @@ function M.new(G,E)
         elseif op=="refuel" then
             return refuel(a,q,r)
         elseif op=="set_home" then
-            local ok,info=E.set_home and E.set_home(a,args.anchor_id)
+            local ok,info
+            if E.set_home then ok,info=E.set_home(a,args.anchor_id) end
             if not ok then return false,info or "set_home_unavailable" end
             q.home_id=info;return true
         elseif op=="cook_load" then
-            local target,reason=E.place_target and E.place_target(a,args.building_id)
+            local target,reason
+        if E.place_target then target,reason=E.place_target(a,args.building_id) end
             if not target or target.prefab~="cookpot" then return false,reason or "cookpot_missing" end
             if E.distance(a,target)>4 then return false,"cookpot_too_far" end
             local c=target.components and target.components.container
@@ -340,7 +343,8 @@ function M.new(G,E)
             if not c:GiveItem(single,slot) then a.components.inventory:GiveItem(single);return false,"cookpot_insert_failed" end
             q.cook_loaded=true;return true
         elseif op=="start_meal" then
-            local target,reason=E.place_target and E.place_target(a,args.building_id)
+            local target,reason
+        if E.place_target then target,reason=E.place_target(a,args.building_id) end
             if not target or target.prefab~="cookpot" then return false,reason or "cookpot_missing" end
             if E.distance(a,target)>4 then return false,"cookpot_too_far" end
             local stewer=target.components and target.components.stewer
@@ -348,7 +352,8 @@ function M.new(G,E)
             stewer:StartCooking(a)
             q.meal_started=true;q.cook_seconds=30;return true
         elseif op=="harvest_meal" then
-            local target,reason=E.place_target and E.place_target(a,args.building_id)
+            local target,reason
+        if E.place_target then target,reason=E.place_target(a,args.building_id) end
             if not target or target.prefab~="cookpot" then return false,reason or "cookpot_missing" end
             if E.distance(a,target)>4 then return false,"cookpot_too_far" end
             local stewer=target.components and target.components.stewer
@@ -431,7 +436,11 @@ function M.new(G,E)
             return "completed","meal_harvested:"..tostring(q.harvested_product),{building_id=q.args.building_id,product=q.harvested_product}
         elseif q.op=="ignite_tree" then
             local target=q.ignite_target
-            local lit=q.native_succeeded or (target and target:IsValid() and (target:HasTag("fire") or (target.components.burnable and target.components.burnable:IsBurning())))
+            local lit=target and target:IsValid() and (target:HasTag("burnt") or target:HasTag("fire")
+                or (target.components.burnable and target.components.burnable:IsBurning()))
+            if not lit and q.native_succeeded then
+                return "failed","tree_did_not_ignite"
+            end
             if lit then
                 if not q.retreat_started then
                     q.retreat_started=true

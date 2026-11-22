@@ -4,10 +4,10 @@
 
 This repository contains two Don't Starve Together mods with a shared controller under `python/`.
 
-| Mod | Use | Setup |
+| Mod | Type & Role | Setup |
 | --- | --- | --- |
-| DST Player Agent | AI controls your player character | [Player control quick start](#player-control-quick-start) |
-| DST Buddy Agent | Summon one or two AI companions | [Companion setup](mods/dst_buddy_agent/README.md) |
+| DST Player Agent | **Client-only mod** · AI controls your player character; designed as an LLM Agent benchmark preserving real client network latency and fog of war | [Player control quick start](#player-control-quick-start) |
+| DST Buddy Agent | **Server mod** · Summon one or two AI companions for co-op play | [Companion setup](mods/dst_buddy_agent/README.md) |
 
 An experimental Don't Starve Together agent. DeepSeek maintains prioritized resource goals. The executor completes visible tasks and searches for missing resources using Klei room-generation priors and observed map memory. The MCP executor handles urgent safety actions. Lua executes native actions and verifies effects. The long-term goal is an Alchemy Engine; Science Machine construction is currently supported.
 

@@ -1,13 +1,13 @@
 # DST Hierarchical Agent
 
-[English](README.EN.md) · [技术说明](docs/TECHNICAL.md) · [创意工坊指南](docs/WORKSHOP.md)
+[English](README.EN.md) · [系统架构](docs/ARCHITECTURE.md) · [技术说明](docs/TECHNICAL.md) · [创意工坊指南](docs/WORKSHOP.md)
 
 本仓库包含两套《饥荒联机版》模组，共用 `python/` 下的规划和任务执行代码。
 
-| 模组 | 用途 | 安装说明 |
+| 模组 | 形态与定位 | 安装说明 |
 | --- | --- | --- |
-| DST Player Agent | AI 操作玩家自己的角色 | [玩家操作快速开始](#玩家操作快速开始) |
-| DST Buddy Agent | 召唤一个或两个 AI 伙伴 | [伙伴安装说明](#ai伙伴快速开始) |
+| DST Player Agent | **客户端 Mod** · AI 操控玩家角色；定位为大模型 Agent 评测集 / Benchmark，保留真实客户端网络延迟与战争迷雾（详见[架构决策](docs/ARCHITECTURE.md#架构决策为什么玩家版坚持客户端-mod)） | [玩家操作快速开始](#玩家操作快速开始) |
+| DST Buddy Agent | **服务端 Mod** · 召唤 1~2 个 AI 伙伴与玩家联机协作 | [伙伴安装说明](#ai伙伴快速开始) |
 
 《饥荒联机版》智能体实验项目。DeepSeek 维护有优先级的多目标看板，执行器优先完成眼前任务，并结合 Klei 区域资源配置与探索记忆寻找所需物资。MCP 服务调度看板并处理紧急安全动作，Lua 模组执行和验证动作。长期目标是制作炼金引擎，当前已支持科学机器，并新增 DeepSeek 侧的[通用配方查询、制作与放置](docs/RECIPES.md)；炼金引擎尚待完整实机验证。
 
@@ -101,6 +101,29 @@ irm https://raw.githubusercontent.com/wjc1207/DST-Hierarchical-Agent/main/instal
 
 ```powershell
 python.exe .\python\run_tests.py
+```
+
+### 无头真引擎 E2E 沙箱（Klei `nullrenderer`）
+
+无需打开饥荒图形界面，直接调用本机 Steam 安装的 `dontstarve_dedicated_server_nullrenderer_x64.exe` 在真实 Klei C++/Lua 引擎里跑自动化实机回归（完全隔离在 `logs/headless_sandbox/`，不触碰真实存档和 Steam `mods/` 目录）：
+
+```powershell
+# 运行 6 场景全自动真引擎 E2E 回归（配对、采砍挖、烧桦树制炭、批量存取+交付、添料+煮肉丸、设家+驻留）
+python .\python\tools\headless_sandbox.py --suite
+
+# 仅跑单个场景（带详细动作回执）
+python .\python\tools\headless_sandbox.py --suite --only ignite_tree_charcoal --verbose
+
+# 启动无头常驻测试服（127.0.0.1:8766），可在另一终端直接接 companion_agent.py --execute 联调大模型
+python .\python\tools\headless_sandbox.py --serve --port 8766
+```
+
+### 小窗真客户端 E2E 沙箱（实机测试 `DST Player Agent` 客户端 Mod）
+
+自动拉起独立的本地 `-offline` 无头服（存档独立隔离在 `logs/client_sandbox/server/`，端口 `11010`，标准昼夜循环，与服务端伙伴沙箱 `logs/headless_sandbox/` 互不干扰）+ 静音 `800×450` 隔离窗口真客户端（配置与存档隔离在 `logs/client_sandbox/client/`），全程零点击跑完 6 个客户端实机场景（自动离线登录配对、采草树枝、砍树拾取、做火把+黑夜照明、黑夜建营火+烤浆果进食、建筑寻路+设家+开箱存取），退出自动清理临时测试 Mod：
+
+```powershell
+python .\python\tools\client_e2e_sandbox.py --suite
 ```
 
 状态格式、动作规则、候选裁剪、探索导航与规划机制见[技术说明](docs/TECHNICAL.md)。生存与探索策略可以在 [DSTKnowledge.txt](data/DSTKnowledge.txt) 中编辑；配方材料、科技和可制作性以 `query_recipes` 实时查询为准，不在知识文件中维护重复配方表。

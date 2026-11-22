@@ -1,4 +1,5 @@
 local json = require("json")
+local encode_json = json.encode_compliant or json.encode
 local exploration = require("jev_exploration")
 local resource_memory = require("jev_resource_memory")
 local campfire_siting = require("jev_campfire_siting")
@@ -1924,7 +1925,7 @@ emit_state = function(player)
         if bridge_client then state.bridge=bridge_client:status(state) end
         state._recipe_wire=nil
         state.recipes=nil -- full catalogue is available through MCP query_recipes
-        return json.encode(state)
+        return encode_json(state)
     end)
     if ok then
         if #encoded <= MAX_LOG_PAYLOAD_BYTES then
@@ -1993,7 +1994,7 @@ local function start_telemetry(player)
         probe.OnUpdate=function(_,dt)
             if player~=G.ThePlayer or not player:IsValid() then return end
             local stats=player._jev_performance:frame(dt)
-            if stats then print("[JEV_DST_PERF]"..json.encode(stats)) end
+            if stats then print("[JEV_DST_PERF]"..encode_json(stats)) end
         end
         player._jev_frame_probe=probe
         frontend:StartUpdatingWidget(probe)
@@ -2905,7 +2906,7 @@ local function start_bridge_with_config(player, raw_config)
         request=function(url,payload,callback,receipt)
             receipt=receipt or {}
             local encode_at=measurement_clock and measurement_clock()
-            local encoded = json.encode(payload)
+            local encoded = encode_json(payload)
             receipt.encode_ms=measurement.elapsed(measurement_clock,encode_at)
             receipt.request_bytes=#encoded
             local query_at=measurement_clock and measurement_clock()
