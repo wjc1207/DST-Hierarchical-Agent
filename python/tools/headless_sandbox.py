@@ -32,8 +32,8 @@ if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
 from common.pairing import ensure_bridge_token
-from mcp_agent.companion_planner import validate_plan
-from mcp_agent.companion_tasks import CompanionTasks, capabilities
+from executor.board_contract import validate_plan
+from executor.companion_tasks import CompanionTasks, capabilities
 from mcp_server.companion_bridge import CompanionTeamBridge
 from transport.http_bridge import serve_bridge
 

@@ -2,8 +2,8 @@ import copy
 import unittest
 
 from common.camp_work import query_meals, query_storage
-from mcp_agent.priority_board import PriorityBoardExecutor, merge_goals, progress_signatures_match, task_signature
-from mcp_agent.navigation_intents import ExplorationExecutor
+from executor.priority_board import PriorityBoardExecutor, merge_goals, progress_signatures_match, task_signature
+from executor.navigation_intents import ExplorationExecutor
 from test_priority_board import board, state, task
 
 

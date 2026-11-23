@@ -2,13 +2,11 @@
 import json
 import urllib.error
 import urllib.request
-from common import autonomy
+from executor.board_contract import PLAN_HISTORY_CHARS, PLAN_HISTORY_TURNS, recent_exchanges, validate_reply
 
 DEFAULT_API_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-flash"
 PLAN_MAX_TOKENS = 4096
-PLAN_HISTORY_TURNS = 3
-PLAN_HISTORY_CHARS = 48000
 MAX_KNOWLEDGE_CHARS = 12000
 
 PLANNING_RULES = (
@@ -55,46 +53,6 @@ PLANNING_CONTRACT = PLANNING_RULES + FULL_TASK_FIELDS + TASK_START_RULES
 
 def load_knowledge(path, *, limit=MAX_KNOWLEDGE_CHARS):
     return path.read_text(encoding="utf-8").strip()[:limit]
-
-
-def validate_reply(raw, context):
-    """Return a checked conversational/completion reply, or None for a board."""
-    if isinstance(raw, dict) and raw.get("kind") == "agent_reply":
-        interaction = context.get("interaction") or {}
-        if interaction.get("mode") not in {"instruction", "autonomous"}:
-            raise ValueError("Chat replies require a dialogue-capable client")
-        outcome = raw.get("outcome")
-        if outcome not in {"reply", "completed", "blocked"}:
-            raise ValueError("Invalid reply outcome")
-        try:
-            reply = autonomy.validate_text(raw.get("reply"))
-        except ValueError as exc:
-            raise ValueError(f"agent_reply.reply: {exc}") from None
-        evidence = raw.get("evidence")
-        if outcome == "completed":
-            if interaction["mode"] != "instruction":
-                raise ValueError("Autonomous mode continues planning after milestones")
-            board = context.get("current_task_board")
-            if board and any(task.get("status") != "done" for task in board.get("tasks", [])):
-                raise ValueError("Cannot complete while accepted tasks remain unfinished; revise/cancel obsolete tasks first")
-            try:
-                autonomy.validate_text(evidence)
-            except ValueError as exc:
-                raise ValueError(f"agent_reply.evidence: {exc}") from None
-        return {"kind": "agent_reply", "outcome": outcome, "reply": reply, "evidence": evidence}
-    return None
-
-
-def recent_exchanges(exchanges, *, turns=PLAN_HISTORY_TURNS, max_chars=PLAN_HISTORY_CHARS):
-    """Keep a chronological suffix of complete user/assistant pairs, never fragments."""
-    retained, size = [], 0
-    for user, assistant in reversed(list(exchanges)[-turns:]):
-        pair_size = len(user) + len(assistant)
-        if size + pair_size > max_chars:
-            break
-        retained.append((user, assistant))
-        size += pair_size
-    return list(reversed(retained))
 
 
 class PlanningHTTPError(RuntimeError):

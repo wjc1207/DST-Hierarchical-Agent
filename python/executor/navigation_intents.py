@@ -8,7 +8,7 @@ from common import timing_log as timing
 from common.game_rules import MINE_PRODUCTS
 from common.task_board import board_view
 from common.resource_events import resource_types
-from mcp_agent.region_resources import expected_sources
+from executor.region_resources import expected_sources
 
 
 # Same conservative whole-target workloads as the Mod's work bridge. A recipe

@@ -12,7 +12,7 @@ from test_shared_planning import Response
 from mcp_server.companion_bridge import CompanionTeamBridge
 from mcp_server.companion_server import create_server
 from mcp_agent.companion_planner import CompanionPlanner as CompanionTeamPlanner,validate_team_plan
-from mcp_agent.companion_agent import CompanionTeamAgent
+from executor.team_runner import CompanionTeamAgent
 
 
 def team_state():
@@ -730,6 +730,86 @@ class TeamMCPTests(unittest.IsolatedAsyncioTestCase):
             CompanionTeamBridge(TOKEN, clock=lambda: 0).exchange(
                 {"token": TOKEN, "session_id": "bad-self", "sequence": 1, "state": bad, "results": []}
             )
+
+
+class TaskServiceDirectBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_task_service_runs_direct_bridge_client_without_local_tools_or_mcp_detour(self):
+        from mcp import Client
+        from executor.team_runner import DirectBridgeClient, TeamRunner
+        from mcp_server import task_service
+
+        self.assertFalse(hasattr(task_service, "LocalTools"))
+        self.assertFalse(hasattr(task_service, "internal_call"))
+
+        raw = team_state()
+        for entry in raw["members"].values():
+            entry["control"]["enabled"] = False
+        raw["control"]["enabled"] = False
+        bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
+        payload = {"token": TOKEN, "session_id": "direct-bridge", "sequence": 1, "state": raw}
+        bridge.exchange(payload)
+
+        svc = task_service.TaskService(bridge, companion=True, poll=0.05)
+        host = svc.make_host()
+        self.assertIsInstance(host, TeamRunner)
+        self.assertIsInstance(host.client, DirectBridgeClient)
+        self.assertIs(host.client.bridge, bridge)
+
+        async with Client(create_server(bridge, poll=0.02), read_timeout_seconds=3) as client:
+            for _ in range(100):
+                status = await client.call_tool("get_task_board", {"buddy_id": "buddy1"})
+                if not status.is_error:
+                    break
+                await asyncio.sleep(0.01)
+            accepted = await client.call_tool(
+                "submit_task_board",
+                {"board": {"assignments": {"buddy1": {"tasks": [{"type": "collect", "prefab": "cutgrass", "count": 1}]}}}},
+            )
+            self.assertFalse(accepted.is_error, str(accepted.content))
+            for sequence in range(2, 102):
+                result = bridge.exchange({**payload, "sequence": sequence})
+                if result["commands"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("TaskService DirectBridgeClient should emit native action without LocalTools")
+            self.assertEqual(result["commands"][0]["buddy_id"], "buddy1")
+            self.assertEqual(result["commands"][0]["args"]["target_guid"], 99)
+
+            obs = await client.call_tool("buddy_observe", {"buddy_id": "buddy1"})
+            obs_id = obs.structured_content["observation_id"]
+            manual = await client.call_tool(
+                "buddy_action",
+                {"buddy_id": "buddy1", "op": "collect", "observation_id": obs_id, "args": {"target_guid": 99}},
+            )
+            self.assertTrue(manual.is_error)
+            self.assertIn("Scheduler owns this actor", str(manual.content))
+
+    async def test_external_board_surfaces_thermal_emergency_freezing_through_planning_state(self):
+        from mcp_server.task_service import TaskService
+
+        raw = team_state()
+        b1 = raw["members"]["buddy1"]
+        b1["companion"]["capabilities"] = [*b1["companion"]["capabilities"], "thermal"]
+        b1["companion"]["buddy"].update(temperature=4.0, freezing=True, overheating=False, moisture=0.0)
+        b1["companion"].setdefault("world", {}).update(season="winter", world_temperature=2.0)
+
+        bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
+        bridge.exchange({"token": TOKEN, "session_id": "thermal-external", "sequence": 1, "state": raw})
+
+        svc = TaskService(bridge, companion=True, poll=0.05)
+        svc.host = svc.make_host()
+        try:
+            await svc.host.cycle()
+            svc.submit(
+                {"tasks": [{"id": "grass", "title": "Gather", "target": {"type": "inventory", "prefab": "cutgrass", "count": 1}}]},
+                buddy_id="buddy1",
+            )
+            await svc.host.cycle()
+            plan_state = svc.planning_state()
+            self.assertEqual(plan_state["members"]["buddy1"]["review_reason"], "thermal_emergency_freezing")
+        finally:
+            await svc.close_host()
 
 
 if __name__=="__main__":unittest.main()

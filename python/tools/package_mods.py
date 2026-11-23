@@ -36,7 +36,7 @@ RUNNER_DOC_FILES = (
     "docs/WORKSHOP.md",
     "docs/AGENT_MEMORY_AND_BACKENDS.md",
 )
-RUNNER_PY_PACKAGES = ("common", "transport", "mcp_server", "mcp_agent")
+RUNNER_PY_PACKAGES = ("common", "transport", "executor", "mcp_server", "mcp_agent")
 
 
 def blank_config_lua(port: int) -> str:
@@ -270,6 +270,8 @@ def verify_workshop_dir(stage_dir: Path, mod_id: str) -> None:
         "runner/data/DSTKnowledge.txt",
         "runner/data/worldgen_resources.json",
         "runner/python/requirements-mcp.txt",
+        "runner/python/executor/team_runner.py",
+        "runner/python/executor/companion_tasks.py",
         "runner/python/mcp_server/companion_server.py",
         "runner/python/mcp_agent/companion_agent.py",
     ):

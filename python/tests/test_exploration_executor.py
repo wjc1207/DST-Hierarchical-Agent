@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from common import timing_log as timing
-from mcp_agent.navigation_intents import ExplorationExecutor, sources_for
+from executor.navigation_intents import ExplorationExecutor, sources_for
 from common.task_board import validate_board
 from fixtures import observed, route, native_navigation_dispatch
 from fixtures import grass
@@ -47,7 +47,7 @@ class ExplorationExecutorTests(unittest.TestCase):
         self.assertEqual(self.navigator.strategy, "source_room")
 
     def test_new_exact_grass_position_preempts_retained_room_prior(self):
-        from mcp_agent.navigation_intents import dispatch_for_navigation
+        from executor.navigation_intents import dispatch_for_navigation
         actual = observed(); plan = board({"type":"inventory", "prefab":"cutgrass", "count":2})
         actual["navigation"]["graph"]["routes"] = [{**route("B:BGGrass"), "hops":1}]
         dispatch = {"travel": {"kind":"explore", "mode":"graph", "node_id":"B:BGGrass"}}
@@ -58,7 +58,7 @@ class ExplorationExecutorTests(unittest.TestCase):
         self.assertEqual(self.navigator.strategy, "remembered_source_position")
 
     def test_budget_recovery_tries_another_room_and_preserves_negative_evidence(self):
-        from mcp_agent.navigation_intents import dispatch_for_navigation
+        from executor.navigation_intents import dispatch_for_navigation
         actual = observed(); plan = board({"type":"inventory", "prefab":"cutgrass", "count":2})
         actual["navigation"]["graph"]["routes"] = [{**route("B:BGGrass"), "hops":1}, {**route("C:BGGrass"), "hops":2}]
         dispatch = {n: {"kind":"explore", "mode":"graph", "node_id":n} for n in ("B:BGGrass", "C:BGGrass")}
@@ -71,7 +71,7 @@ class ExplorationExecutorTests(unittest.TestCase):
 
     def test_second_entrance_failure_temporarily_defers_destination_then_recovers(self):
         now = [100.]
-        with patch("mcp_agent.navigation_intents.time.monotonic", side_effect=lambda:now[0]):
+        with patch("executor.navigation_intents.time.monotonic", side_effect=lambda:now[0]):
             actual = observed(); plan = board({"type":"visit_region", "node_id":"B"})
             self.choose(actual, plan)
             self.navigator.on_event({"reason":"region_confirmation_timeout"}, actual)

@@ -15,9 +15,9 @@ from common.placement import validate as validate_placement, resolve as placemen
 from common.refueling import (validate_target as validate_refuel, maintenance_state as fire_maintenance_state,
                               target_error as refuel_error, has_fuel)
 from common.thermal import seasonal_gear_equip, thermal_comfort_status, refuel_pause
-from mcp_agent import camp_execution
-from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
-from mcp_agent.companion_search import ResourceSearch
+from executor import camp_execution
+from executor.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
+from executor.companion_search import ResourceSearch
 from common.companion_transfer import (COUNTED_TARGETS, STORAGE_TARGETS, TRANSFER_TARGETS,
                                        container_guid_for, validate_target as validate_transfer)
 

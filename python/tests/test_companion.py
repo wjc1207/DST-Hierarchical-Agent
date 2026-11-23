@@ -12,8 +12,8 @@ from mcp_server.companion_bridge import CompanionBridge
 from mcp_server.companion_server import create_server
 from transport.http_bridge import BridgeError, serve_bridge
 from mcp_agent.companion_planner import validate_plan, next_action, request_plan, collection_prefab
-from mcp_agent.companion_agent import CompanionAgent
-from mcp_agent.companion_tasks import CompanionTasks
+from executor.team_runner import CompanionAgent
+from executor.companion_tasks import CompanionTasks
 
 TOKEN = "companion-offline-test-" * 3
 
@@ -317,7 +317,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             contexts.append(context)
             return plan()
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(5):
@@ -349,7 +349,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 return validate_plan({"goal":"Collect one grass","tasks":[{"id":"grass","title":"Grass",
                     "target":{"type":"inventory","prefab":"cutgrass","count":1}}]})
             return validate_plan({"kind":"agent_reply","outcome":"completed","reply":"完成。","evidence":"背包已有一根草。"})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor",ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor",ImmediateWorker):
             agent=CompanionAgent(peer,planner,execute=True)
         try:
             for _ in range(9):await agent.cycle()
@@ -367,7 +367,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             contexts.append(context)
             return validate_plan({"done": False, "reply": "我正在回来。", "tasks": [{"id": "back", "type": "return_owner"}]})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         now = time.monotonic()
         try:
@@ -388,7 +388,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         peer = FakePeer();calls = []
         def planner(*_):
             calls.append(1);return validate_plan({"kind": "agent_reply", "outcome": "reply", "reply": "你好。"})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(8): await agent.cycle()
@@ -401,7 +401,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(*_):
             calls.append(1)
             return plan() if len(calls) == 1 else validate_plan({"kind": "agent_reply", "outcome": "reply", "reply": "好呀。"})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             await agent.cycle();await agent.cycle()
@@ -421,7 +421,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             contexts.append(context)
             return validate_plan(raw)
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(12): await agent.cycle()
@@ -445,7 +445,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
              "target": {"type": "inventory", "prefab": "cutgrass", "count": 3}},
             {"id": "back", "title": "Return", "priority": 2, "target": {"type": "return_owner"},
              "at": {"day": 1, "phase": "night"}}]}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, lambda *_: validate_plan(raw), execute=True)
         try:
             await agent.cycle();await agent.cycle()
@@ -475,7 +475,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         forecasts = []
         def planner(context, *_):
             return validate_plan(raw, context)
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", AdvisoryWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", AdvisoryWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             await agent.cycle();await agent.cycle()
@@ -493,7 +493,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if len(contexts) == 1: return plan()
             return validate_plan({"goal": "只要两根草", "reply": "改为两根。", "cancel_task_ids": ["back"], "tasks": [
                 {"id": "grass", "title": "Gather two", "target": {"type": "inventory", "prefab": "cutgrass", "count": 2}}]})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             await agent.cycle();await agent.cycle()
@@ -510,7 +510,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         peer = FakePeer();contexts = []
         def planner(context, history, *_):
             contexts.append((context, history));return plan()
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             await agent.cycle();await agent.cycle()
@@ -526,7 +526,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         peer = FakePeer();peer.state["companion"]["nearby"] = []
         calls = []
         def planner(*_): calls.append(1);return plan()
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(8): await agent.cycle()
@@ -552,7 +552,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             contexts.append(context)
             return validate_plan(raw)
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             await agent.cycle(); await agent.cycle()
@@ -591,7 +591,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "grass", "title": "Gather grass",
                  "target": {"type": "inventory", "prefab": "cutgrass", "count": 2}},
             ]})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             await agent.cycle(); await agent.cycle(); await agent.cycle(); await agent.cycle()
@@ -610,7 +610,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if len(contexts) == 1:
                 board = plan();board["tasks"][0]["target"]["prefab"] = "grass";return board
             return validate_plan({"done": True, "reply": "完成。", "evidence": "背包三根草，已到主人旁。"})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         records = []
         agent.events = SimpleNamespace(write=records.append)
@@ -630,7 +630,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if len(contexts) == 1: return plan()
             self.assertEqual(context["observation"]["buddy"]["inventory"]["cutgrass"], 3)
             return validate_plan({"done": True, "reply": "三根草已收集，我回来了。", "evidence": "背包有三根草，离主人两单位。"})
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(15): await agent.cycle()
@@ -654,7 +654,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         class PendingWorker(ImmediateWorker):
             def submit(self, *_): return Future()
         peer = FakePeer()
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", PendingWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", PendingWorker):
             agent = CompanionAgent(peer, None, execute=True)
         try:
             await agent.cycle();old, cancel = agent.future, agent.cancel

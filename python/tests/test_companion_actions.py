@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_companion import state, TOKEN, FakePeer, ImmediateWorker
-from mcp_agent.companion_agent import CompanionAgent
-from mcp_agent.companion_tasks import CompanionTasks, validate_board
+from executor.team_runner import CompanionAgent
+from executor.companion_tasks import CompanionTasks, validate_board
 from mcp_agent.companion_planner import validate_plan, request_plan, CompanionPlanner
 from mcp_agent import planning_core
 from mcp_server.companion_bridge import CompanionBridge
@@ -163,7 +163,7 @@ class NativePeer(FakePeer):
 class NativeAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_planning_worker_queries_the_real_mcp_without_blocking_observation(self):
         from mcp import Client
-        from mcp_agent.companion_agent import ActorClient
+        from executor.team_runner import ActorClient
         from test_companion_team import single_member_state
         from mcp_server.companion_bridge import CompanionTeamBridge
 
@@ -220,7 +220,7 @@ class NativeAgentTests(unittest.IsolatedAsyncioTestCase):
                              {"type": "structure", "recipe_id": "researchlab", "prefab": "researchlab", "x": 0, "z": 0},
                              {"type": "return_owner"})
             return {"kind": "agent_reply", "outcome": "completed", "reply": "完成。", "evidence": "背包有木头，科学机器在附近，已归队。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(24): await agent.cycle()

@@ -7,8 +7,8 @@ import unittest
 from common.camp_work import target_error as camp_target_error
 from common.companion_transfer import query_storage, validate_target as validate_transfer
 from common.task_board import board_view, validate_board
-from mcp_agent.companion_tasks import CompanionTasks, validate_board as validate_companion_board
-from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals
+from executor.companion_tasks import CompanionTasks, validate_board as validate_companion_board
+from executor.priority_board import PriorityBoardExecutor, validate_goals
 from mcp_server.companion_bridge import CompanionBridge
 from transport.http_bridge import BridgeError
 
@@ -561,7 +561,7 @@ class Phase2CampWorkUnificationTests(unittest.TestCase):
         self.assertEqual((op2, args2), ("work", {"target_guid": 801, "work": "CHOP"}))
 
     def test_camp_execution_batch_transfer_credits_verified_count(self):
-        from mcp_agent import camp_execution
+        from executor import camp_execution
 
         rec = {}
         camp_execution.on_completed(
@@ -711,7 +711,7 @@ class Phase2CampWorkUnificationTests(unittest.TestCase):
 
     def test_companion_thermal_comfort_winter_summer_and_rain_and_coldfire_pause(self):
         from common.thermal import refuel_pause
-        from mcp_agent.companion_tasks import actor_state
+        from executor.companion_tasks import actor_state
 
         # Winter: equips winterhat -> visits firepit -> refuels with log -> waits until warm
         tasks = CompanionTasks(clock=lambda: 10.0)
@@ -883,7 +883,7 @@ class Phase2CampWorkUnificationTests(unittest.TestCase):
         self.assertEqual(tasks.view(obs)["status"], "completed")
 
     def test_companion_spring_rain_drying_and_seasonal_alert_reflex(self):
-        from mcp_agent.companion_agent import seasonal_alert_reason
+        from executor.team_runner import seasonal_alert_reason
 
         tasks = CompanionTasks(clock=lambda: 10.0)
         obs = companion_obs(

@@ -1,41 +1,28 @@
-"""Own task boards and run the existing execution loops inside the MCP process."""
+"""Own task boards and run the deterministic Task Executor inside the MCP process."""
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
 import json
-import sys
-from types import SimpleNamespace
 from typing import Any
 import uuid
 
 from common import timing_log
 from common.paths import PROJECT_ROOT
-from mcp_agent.companion_planner import expand_assignment, validate_plan as validate_companion
-from mcp_agent.companion_tasks import capabilities, CompanionTasks
-from mcp_agent.priority_board import idle_review_reason, task_signature
+from executor.board_contract import expand_assignment, validate_plan as validate_companion
+from executor.compact_tasks import TASK_OPTIONS
+from executor.companion_tasks import capabilities, CompanionTasks
+from executor.priority_board import idle_review_reason, task_signature
+from executor.team_runner import CycleDiagnostics, DirectBridgeClient, TeamRunner
 from transport.http_bridge import BridgeError
 
-
-internal_call = ContextVar("internal_game_tool", default=False)
-
-
-class LocalTools:
-    """Invoke the same registered tool handlers without a second MCP connection."""
-
-    def __init__(self, server):
-        self.server = server
-
-    async def call_tool(self, name, arguments):
-        from mcp.server.mcpserver.exceptions import ToolError
-        token = internal_call.set(True)
-        try:
-            return await self.server.call_tool(name, arguments)
-        except ToolError as exc:
-            return SimpleNamespace(is_error=True, content=[SimpleNamespace(text=str(exc))])
-        finally:
-            internal_call.reset(token)
+URGENT_ADVISORY_REASONS = {
+    "return_at_risk",
+    "return_deadline_missed",
+    "thermal_emergency_freezing",
+    "thermal_emergency_overheating",
+    "thermal_emergency_wet",
+}
 
 
 class TaskService:
@@ -65,13 +52,14 @@ class TaskService:
             self.worker = None
 
     def make_host(self):
-        client = LocalTools(self.server)
-        from mcp_agent.companion_agent import CompanionTeamAgent
-        return CompanionTeamAgent(client, None, execute=True, log_path=PROJECT_ROOT / "logs/companion_agent.jsonl")
+        return TeamRunner(
+            DirectBridgeClient(self.bridge),
+            None,
+            execute=True,
+            log_path=PROJECT_ROOT / "logs/companion_agent.jsonl",
+        )
 
     async def run(self):
-        from mcp_agent.companion_agent import CycleDiagnostics
-
         self.host = self.make_host()
         diagnostics = CycleDiagnostics(self.host)
         cycle = 0
@@ -153,7 +141,7 @@ class TaskService:
         actor.plan = board
 
     def check_manual_action(self, buddy_id=None):
-        if internal_call.get() or self.host is None:
+        if self.host is None:
             return
         actor, packet = self.actor(buddy_id)
         board = self.current(actor, packet)
@@ -191,7 +179,7 @@ class TaskService:
                 reason = idle_review_reason(board)
                 if board:
                     advisory = actor.external_review_reason
-                    if advisory in {"return_at_risk", "return_deadline_missed"} and reason != "all_tasks_completed":
+                    if advisory in URGENT_ADVISORY_REASONS and reason != "all_tasks_completed":
                         reason = advisory
                     elif not reason and not active:
                         reason = advisory
@@ -317,7 +305,6 @@ class TaskService:
                     raise BridgeError("Task is required by " + ", ".join(dependents))
                 rows = [task for task in previous["tasks"] if task["id"] != task_id]
             else:
-                from mcp_agent.compact_tasks import TASK_OPTIONS
                 if {"id", "target"}.intersection(changes):
                     raise BridgeError("Keep the task ID and pass target fields alongside other fields")
                 row = {key: value for key, value in old.items() if key in TASK_OPTIONS}

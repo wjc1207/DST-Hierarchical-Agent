@@ -1,4 +1,4 @@
-"""Package layout and strict bidirectional archive isolation checks; no model API calls."""
+"""Package layout, 3-layer unidirectional DAG, and bidirectional archive isolation checks."""
 import ast
 import asyncio
 from pathlib import Path
@@ -36,6 +36,15 @@ class LayoutTests(unittest.TestCase):
             PYTHON_ROOT / "mcp_agent" / "map_view.py",
             PYTHON_ROOT / "mcp_agent" / "map_icons.py",
             PYTHON_ROOT / "mcp_agent" / "model_state.py",
+            PYTHON_ROOT / "mcp_agent" / "camp_execution.py",
+            PYTHON_ROOT / "mcp_agent" / "compact_tasks.py",
+            PYTHON_ROOT / "mcp_agent" / "companion_search.py",
+            PYTHON_ROOT / "mcp_agent" / "companion_tasks.py",
+            PYTHON_ROOT / "mcp_agent" / "maintenance.py",
+            PYTHON_ROOT / "mcp_agent" / "navigation_intents.py",
+            PYTHON_ROOT / "mcp_agent" / "priority_board.py",
+            PYTHON_ROOT / "mcp_agent" / "region_resources.py",
+            PYTHON_ROOT / "mcp_agent" / "residence.py",
         ):
             self.assertFalse(obsolete.exists(), f"Obsolete path should not exist in active tree: {obsolete}")
 
@@ -51,6 +60,37 @@ class LayoutTests(unittest.TestCase):
             PROJECT_ROOT / "archive" / "python" / "run_tests.py",
         ):
             self.assertTrue(archived.exists(), f"Missing archived client artifact: {archived}")
+
+    def test_unidirectional_three_layer_dependency_dag(self):
+        runtime_layers = {"common", "transport", "executor", "mcp_server", "mcp_agent"}
+        allowed_internal = {
+            "common": {"common"},
+            "transport": {"transport"},
+            "executor": {"common", "transport", "executor"},
+            "mcp_server": {"common", "transport", "executor", "mcp_server"},
+            "mcp_agent": {"common", "transport", "executor", "mcp_agent"},
+        }
+        for pkg in sorted(runtime_layers):
+            for path in sorted((PYTHON_ROOT / pkg).rglob("*.py")):
+                if "__pycache__" in path.parts:
+                    continue
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        targets = [alias.name for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom):
+                        targets = [node.module or ""]
+                    else:
+                        continue
+                    for target in targets:
+                        top = target.split(".")[0]
+                        if top == "mcp" and pkg in {"common", "transport", "executor"}:
+                            self.fail(f"Layer {pkg} ({path}) must not depend on MCP SDK ({target!r})")
+                        if top in runtime_layers:
+                            self.assertIn(
+                                top, allowed_internal[pkg],
+                                f"Forbidden cross-layer import in {path}: {pkg} -> {target}",
+                            )
 
     def test_active_and_archive_python_trees_have_zero_cross_imports(self):
         forbidden_from_active = {
@@ -78,9 +118,8 @@ class LayoutTests(unittest.TestCase):
 
         archive_py = PROJECT_ROOT / "archive" / "python"
         forbidden_from_archive = {
-            "tools.headless_sandbox", "transport", "transport.http_bridge", "transport.metrics",
+            "tools.headless_sandbox", "transport", "executor",
             "mcp_agent.companion_agent", "mcp_agent.companion_planner",
-            "mcp_agent.companion_tasks", "mcp_agent.companion_search",
             "mcp_server.companion_server", "mcp_server.companion_bridge",
         }
         for path in sorted(archive_py.rglob("*.py")):
@@ -100,7 +139,7 @@ class LayoutTests(unittest.TestCase):
                 for target in targets:
                     top = target.split(".")[0]
                     self.assertFalse(
-                        target in forbidden_from_archive or top == "transport",
+                        target in forbidden_from_archive or top in {"transport", "executor"},
                         f"Archive file {path} imports active module {target!r}",
                     )
 

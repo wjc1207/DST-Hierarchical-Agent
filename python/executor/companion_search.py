@@ -5,8 +5,8 @@ import time
 from collections import OrderedDict
 
 from common.task_timing import number
-from mcp_agent.navigation_intents import WORK_SOURCES, sources_for
-from mcp_agent.region_resources import room_resources
+from executor.navigation_intents import WORK_SOURCES, sources_for
+from executor.region_resources import room_resources
 
 
 CELL = 4

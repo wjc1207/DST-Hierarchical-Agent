@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 from test_companion import ImmediateWorker
 from test_companion_storage import TransferPeer,observation
-from mcp_agent.companion_agent import CompanionAgent,CycleDiagnostics
+from executor.team_runner import CompanionAgent,CycleDiagnostics
 from mcp_agent.companion_planner import validate_plan
-from mcp_agent.companion_tasks import CompanionTasks,validate_board
+from executor.companion_tasks import CompanionTasks,validate_board
 
 
 def board():
@@ -77,7 +77,7 @@ class ReviewAgentTests(unittest.IsolatedAsyncioTestCase):
             contexts.append(context)
             if len(contexts)<=2:return board()
             return {"kind":"agent_reply","outcome":"completed","reply":"我已存好三根草。","evidence":"存箱回执累计三根草。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor",ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor",ImmediateWorker):
             agent=CompanionAgent(peer,planner,execute=True)
         try:
             for _ in range(24):await agent.cycle()

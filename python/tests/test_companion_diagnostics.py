@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from test_companion import FakePeer, ImmediateWorker, state
 from test_shared_planning import Response
-from mcp_agent.companion_agent import CompanionAgent
+from executor.team_runner import CompanionAgent
 from mcp_agent.companion_planner import CompanionPlanner, CompanionPlanningError, request_plan
 
 SECRET="sk-secret-must-never-enter-diagnostics"
@@ -53,7 +53,7 @@ class AgentDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             {"id": "back", "title": "Return", "target": {"type": "return_owner"},
              "at": {"day": 1, "phase": "night"}}]}
         error = urllib.error.HTTPError("https://offline.invalid", 402, "Payment Required", {}, None)
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker), \
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker), \
              patch("mcp_agent.planning_core.urllib.request.urlopen", side_effect=[Response(raw), error]) as request:
             agent = CompanionAgent(peer, planner, execute=True)
             try:
@@ -75,7 +75,7 @@ class AgentDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         peer=FakePeer();planner=CompanionPlanner("https://offline.invalid",SECRET,"fake")
         with tempfile.TemporaryDirectory() as folder:
             logfile=Path(folder)/"companion.jsonl"
-            with patch("mcp_agent.companion_agent.ThreadPoolExecutor",ImmediateWorker), \
+            with patch("executor.team_runner.ThreadPoolExecutor",ImmediateWorker), \
                  patch("mcp_agent.planning_core.urllib.request.urlopen",side_effect=[Response(invalid_response()),Response(invalid_response())]):
                 agent=CompanionAgent(peer,planner,execute=True,log_path=logfile)
                 try:

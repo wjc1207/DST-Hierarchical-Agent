@@ -5,8 +5,8 @@ from unittest.mock import patch
 from test_companion import state, TOKEN, ImmediateWorker
 from test_companion_storage import observation, board, TransferPeer
 from test_companion_actions import recipe
-from mcp_agent.companion_tasks import CompanionTasks, validate_board
-from mcp_agent.companion_agent import CompanionAgent
+from executor.companion_tasks import CompanionTasks, validate_board
+from executor.team_runner import CompanionAgent
 from mcp_server.companion_bridge import CompanionBridge
 
 
@@ -101,7 +101,7 @@ class AutoEquipAgentTests(unittest.IsolatedAsyncioTestCase):
             return validate_board({"goal": "Make and give an axe", "tasks": [
                 {"id": "make", "title": "Make axe", "target": {"type": "inventory", "prefab": "axe", "count": 1, "recipe_id": "axe"}},
                 {"id": "give", "title": "Give axe", "target": {"type": "give_owner", "prefab": "axe", "count": 1}, "depends_on": ["make"]}]}, 1)
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(14): await agent.cycle()

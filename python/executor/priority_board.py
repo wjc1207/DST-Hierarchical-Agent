@@ -13,16 +13,16 @@ from common.thermal import refuel_pause, heat_risk
 from common.places import PLACE_TARGETS
 from common.camp_work import CAMP_TARGETS
 from common.companion_transfer import COUNTED_TARGETS as COMPANION_TRANSFERS
-from mcp_agent import camp_execution
+from executor import camp_execution
 from common.coordinates import move_action, validate_point
 from common.game_rules import WORK_PRODUCTS, SAFETY_INTERRUPTS, SAFE_FOOD_PREFABS
 from common.task_board import validate_board, board_view, focus_scope, MAX_TASKS
 from common.task_timing import TIME_FIELDS, TERMINAL_TASKS, number
 from common.exploration_metrics import observed_cells, survey_cells, ROOM_SEARCH_CELLS
 from common.residence import allowed as residence_allowed
-from mcp_agent.residence import update_residences
-from mcp_agent.maintenance import is_maintenance, update_maintenance
-from mcp_agent.navigation_intents import dispatch_for_navigation, FOOD_SEARCH_PRODUCT
+from executor.residence import update_residences
+from executor.maintenance import is_maintenance, update_maintenance
+from executor.navigation_intents import dispatch_for_navigation, FOOD_SEARCH_PRODUCT
 
 SEARCH_RETRY_SECONDS = 15
 TRANSFER_TARGETS = {"deposit", "withdraw"} | COMPANION_TRANSFERS

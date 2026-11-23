@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 from test_companion import state, TOKEN, FakePeer, ImmediateWorker
 from test_companion_actions import recipe
-from mcp_agent.companion_tasks import CompanionTasks, validate_board
+from executor.companion_tasks import CompanionTasks, validate_board
 from mcp_agent.companion_planner import validate_plan, request_plan
-from mcp_agent.companion_agent import CompanionAgent
+from executor.team_runner import CompanionAgent
 from mcp_server.companion_bridge import CompanionBridge
 
 
@@ -135,7 +135,7 @@ class BuildingAgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context,*_):
             contexts.append(context)
             return board() if len(contexts)==1 else {"kind":"agent_reply","outcome":"completed","reply":"回到科学机器旁做好绳子了。","evidence":"抵达已观察科学机器，真实库存一根绳子。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor",ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor",ImmediateWorker):
             agent=CompanionAgent(peer,planner,execute=True)
         try:
             for _ in range(12):await agent.cycle()

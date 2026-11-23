@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 from common.task_board import validate_board, board_view
 from mcp_agent import companion_planner, planning_core
-from mcp_agent.companion_tasks import CompanionTasks, actor_state, validate_board as companion_board
-from mcp_agent.priority_board import PriorityBoardExecutor, idle_review_reason
+from executor.companion_tasks import CompanionTasks, actor_state, validate_board as companion_board
+from executor.priority_board import PriorityBoardExecutor, idle_review_reason
 
 
 def observation():

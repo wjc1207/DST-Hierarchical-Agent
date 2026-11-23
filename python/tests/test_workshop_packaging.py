@@ -162,6 +162,8 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                     "dst_agent_runner/python/common/pairing.py",
                     "dst_agent_runner/python/transport/http_bridge.py",
                     "dst_agent_runner/python/transport/metrics.py",
+                    "dst_agent_runner/python/executor/team_runner.py",
+                    "dst_agent_runner/python/executor/companion_tasks.py",
                     "dst_agent_runner/python/mcp_server/companion_server.py",
                     "dst_agent_runner/python/mcp_agent/companion_agent.py",
                 ):
@@ -202,6 +204,8 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                 self.assertTrue((install_dir / "run_buddy.bat").is_file())
                 self.assertFalse((install_dir / "run_player.bat").exists())
                 self.assertTrue((install_dir / "data" / "DSTKnowledge.txt").is_file())
+                self.assertTrue((install_dir / "python" / "executor" / "team_runner.py").is_file())
+                self.assertTrue((install_dir / "python" / "executor" / "companion_tasks.py").is_file())
                 self.assertTrue((install_dir / "python" / "mcp_agent" / "companion_agent.py").is_file())
                 self.assertEqual(
                     (install_dir / ".workshop_runner_version").read_text(encoding="utf-8").strip(),

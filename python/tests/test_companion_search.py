@@ -4,9 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_companion import FakePeer, ImmediateWorker, state, TOKEN
-from mcp_agent.companion_tasks import CompanionTasks, validate_board
-from mcp_agent.companion_search import ResourceSearch
-from mcp_agent.companion_agent import CompanionAgent
+from executor.companion_tasks import CompanionTasks, validate_board
+from executor.companion_search import ResourceSearch
+from executor.team_runner import CompanionAgent
 from mcp_server.companion_bridge import CompanionBridge
 from transport.http_bridge import BridgeError
 
@@ -258,7 +258,7 @@ class SearchAgentTests(unittest.IsolatedAsyncioTestCase):
                 result = board(task(), {"id": "back", "title": "Return", "depends_on": ["grass"], "target": {"type": "return_owner"}})
                 return result
             return {"kind": "agent_reply", "outcome": "completed", "reply": "找到了草，已收集并回来。", "evidence": "背包三根草，离主人两单位。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(20): await agent.cycle()
@@ -272,7 +272,7 @@ class SearchAgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_message_pauses_search_accounting_without_discarding_actor_memory(self):
         peer = SearchPeer()
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, lambda *_: board(), execute=True)
         try:
             await agent.cycle();await agent.cycle()

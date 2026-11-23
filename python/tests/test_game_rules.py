@@ -82,7 +82,7 @@ class RuleTests(unittest.TestCase):
             "archive", "game_bridge", "daily_planner", "player_bridge", "player_planner",
             "player_agent", "player_server", "player_probe", "map_view", "map_icons", "model_state",
         }
-        for package in ("common", "transport", "mcp_agent", "mcp_server"):
+        for package in ("common", "transport", "executor", "mcp_agent", "mcp_server"):
             for path in (PYTHON_ROOT / package).glob("*.py"):
                 for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                     names = (

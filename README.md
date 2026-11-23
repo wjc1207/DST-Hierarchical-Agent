@@ -2,7 +2,7 @@
 
 [English](README.EN.md) · [系统架构](docs/ARCHITECTURE.md) · [技术说明](docs/TECHNICAL.md) · [创意工坊指南](docs/WORKSHOP.md)
 
-本仓库主线提供一套统一的《饥荒联机版》服务端智能体模组 **`DST Buddy Agent`**（[mods/dst_buddy_agent](mods/dst_buddy_agent)）与 `python/` 下的共用规划和任务执行框架。
+本仓库主线提供一套统一的《饥荒联机版》服务端智能体模组 **`DST Buddy Agent`**（[mods/dst_buddy_agent](mods/dst_buddy_agent)）与 `python/` 下的三层分层框架（`mcp_agent` 规划端 → `mcp_server` + `executor` 任务拆分与执行器 → Lua 原生原子动作）。
 
 | 模组 | 形态与定位 | 安装说明 |
 | --- | --- | --- |

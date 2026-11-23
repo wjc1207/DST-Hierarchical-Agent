@@ -3,9 +3,9 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals, task_signature
-from mcp_agent.navigation_intents import ExplorationExecutor, dispatch_for_navigation
-from mcp_agent.region_resources import expected_sources, room_resources
+from executor.priority_board import PriorityBoardExecutor, validate_goals, merge_goals, task_signature
+from executor.navigation_intents import ExplorationExecutor, dispatch_for_navigation
+from executor.region_resources import expected_sources, room_resources
 from tools.extract_worldgen_resources import extract
 
 

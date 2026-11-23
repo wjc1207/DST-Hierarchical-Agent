@@ -1,6 +1,6 @@
 """Synthetic observations for the MCP-only regression suite."""
 from common import game_rules as rules
-from mcp_agent.navigation_intents import dispatch_for_navigation
+from executor.navigation_intents import dispatch_for_navigation
 
 def grass(guid: int, distance: float, pickable: bool) -> dict:
     return {

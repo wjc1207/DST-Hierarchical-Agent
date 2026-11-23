@@ -3,7 +3,7 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from mcp_agent.navigation_intents import ExplorationExecutor, usable_sources_for
+from executor.navigation_intents import ExplorationExecutor, usable_sources_for
 from fixtures import observed, route, native_navigation_dispatch
 from test_exploration_executor import board
 from fixtures import grass
@@ -12,7 +12,7 @@ from fixtures import grass
 class SourceEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch("builtins.print"))
-        self.clock = self.enterContext(patch("mcp_agent.navigation_intents.time.monotonic", return_value=100))
+        self.clock = self.enterContext(patch("executor.navigation_intents.time.monotonic", return_value=100))
         self.navigator = ExplorationExecutor()
         self.plan = board({"type": "inventory", "prefab": "flint", "count": 2})
 

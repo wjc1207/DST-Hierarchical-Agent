@@ -6,9 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_companion import state, TOKEN, FakePeer, ImmediateWorker
-from mcp_agent.companion_tasks import CompanionTasks, validate_board
+from executor.companion_tasks import CompanionTasks, validate_board
 from mcp_agent.companion_planner import request_plan, validate_plan
-from mcp_agent.companion_agent import CompanionAgent
+from executor.team_runner import CompanionAgent
 from mcp_server.companion_bridge import CompanionBridge
 from transport.http_bridge import BridgeError
 
@@ -244,7 +244,7 @@ class StorageAgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             contexts.append(context)
             return board("deposit") if len(contexts) == 1 else {"kind": "agent_reply", "outcome": "completed", "reply": "已存好三根草。", "evidence": "累计回执三根。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(3):
@@ -262,7 +262,7 @@ class StorageAgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_actual_transfer_progress_clears_old_action_failure_streak(self):
         peer = TransferPeer()
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, lambda *_: board(), execute=True)
         try:
             await agent.cycle();await agent.cycle()
@@ -282,7 +282,7 @@ class StorageAgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             contexts.append(context)
             return board() if len(contexts) == 1 else {"kind": "agent_reply", "outcome": "completed", "reply": "三根草已交给你。", "evidence": "交付回执累计三根草。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(15): await agent.cycle()
@@ -298,7 +298,7 @@ class StorageAgentTests(unittest.IsolatedAsyncioTestCase):
         def planner(context, *_):
             calls.append(context)
             return board("receive_item") if len(calls) == 1 else {"kind": "agent_reply", "outcome": "completed", "reply": "收到草了。", "evidence": "背包三根草。"}
-        with patch("mcp_agent.companion_agent.ThreadPoolExecutor", ImmediateWorker):
+        with patch("executor.team_runner.ThreadPoolExecutor", ImmediateWorker):
             agent = CompanionAgent(peer, planner, execute=True)
         try:
             for _ in range(8): await agent.cycle()
