@@ -12,7 +12,10 @@ local function world_time(G)
     local state=world.state
     local world_id=(world.meta and world.meta.session_identifier)
         or (G.TheNet and G.TheNet.GetSessionIdentifier and G.TheNet:GetSessionIdentifier()) or nil
-    local time={world_id=world_id,day=(state.cycles or 0)+1,phase=state.phase,time=state.time}
+    local time={world_id=world_id,day=(state.cycles or 0)+1,phase=state.phase,time=state.time,
+        season=state.season,remaining_days_in_season=state.remainingdaysinseason,
+        world_temperature=type(state.temperature)=="number" and round(state.temperature) or nil,
+        israining=state.israining==true,issnowing=state.issnowing==true}
     local clock=world.net and world.net.components and world.net.components.clock
     local segment=G.TUNING and G.TUNING.SEG_TIME
     if not (clock and clock.OnSave and type(segment)=="number" and segment>0) then return time end
@@ -334,11 +337,15 @@ function M.new(G,reply,validate_text,encoded_size,trace,options)
         end
         for _,row in ipairs(rest) do if #selected>=48 then break end;selected[#selected+1]=row end
         while #selected>48 do table.remove(selected) end
+        local temp=c.temperature and c.temperature.GetCurrent and round(c.temperature:GetCurrent()) or nil
         state.buddy={guid=a.GUID,prefab=a.prefab,position={x=round(x),z=round(z)},inventory=counts,items=items,
             owner_distance=round(E.distance(a,player)),health=c.health.currenthealth,health_max=c.health.maxhealth,dead=E.dead(a),
             hunger=c.hunger and c.hunger.current,hunger_max=c.hunger and c.hunger.max,
-            sanity=c.sanity and c.sanity.current,
-            temperature=c.temperature and c.temperature.GetCurrent and round(c.temperature:GetCurrent()) or nil}
+            sanity=c.sanity and c.sanity.current,sanity_max=c.sanity and c.sanity.max,
+            moisture=c.moisture and c.moisture.GetMoisture and round(c.moisture:GetMoisture()) or nil,
+            moisture_max=c.moisture and c.moisture.GetMaxMoisture and round(c.moisture:GetMaxMoisture()) or nil,
+            freezing=temp~=nil and temp<=5 or false,overheating=temp~=nil and temp>=65 or false,
+            temperature=temp}
         if state.buddy.dead then
             state.buddy.health=0
             state.buddy.hunger=nil
@@ -351,6 +358,12 @@ function M.new(G,reply,validate_text,encoded_size,trace,options)
         if state.foods then
             state.capabilities[#state.capabilities+1]="eat"
             if c.hunger and c.hunger.max and c.hunger.max>0 then state.capabilities[#state.capabilities+1]="hunger" end
+        end
+        state.healers=native.healers(a)
+        if c.health and c.health.maxhealth and c.health.maxhealth>0 then state.capabilities[#state.capabilities+1]="heal" end
+        if c.temperature then
+            state.capabilities[#state.capabilities+1]="thermal"
+            state.thermal=native.thermal(a)
         end
         state.nearby=selected;state.resources_complete=#nearby<=48
         state.escape=r.escape and {status=r.escape.status,threat_prefab=r.escape.threat_prefab} or nil

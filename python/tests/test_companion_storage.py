@@ -10,7 +10,7 @@ from mcp_agent.companion_tasks import CompanionTasks, validate_board
 from mcp_agent.companion_planner import request_plan, validate_plan
 from mcp_agent.companion_agent import CompanionAgent
 from mcp_server.companion_bridge import CompanionBridge
-from mcp_server.game_bridge import BridgeError
+from transport.http_bridge import BridgeError
 
 
 def observation():

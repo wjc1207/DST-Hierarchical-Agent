@@ -1,10 +1,11 @@
 """Observed game-time windows for persistent hunger/fire goals, independent of safety pauses."""
 from common.task_timing import game_time, number, TERMINAL_TASKS
 from common.refueling import maintenance_state as fire_maintenance_state
+from common.thermal import thermal_comfort_status
 
 
 def is_maintenance(task):
-    return task["target"]["type"] in {"hunger_ratio", "refuel"} and "duration" in task
+    return task["target"]["type"] in {"hunger_ratio", "health_ratio", "thermal_comfort", "refuel"} and "duration" in task
 
 
 def update_maintenance(view, state, records):
@@ -12,17 +13,33 @@ def update_maintenance(view, state, records):
     now = game_time(state)
     vitals = state.get("player", {}).get("vitals", {})
     hunger, maximum = vitals.get("hunger"), vitals.get("hunger_max")
+    health, health_max = vitals.get("health"), vitals.get("health_max")
     for task in view["tasks"]:
         if not is_maintenance(task) or task.get("timing_error"):
             continue
         record = records[task["id"]]
-        fire = fire_maintenance_state(task["target"],state) if task["target"]["type"] == "refuel" else None
-        known = fire["available"] if fire else number(hunger) and number(maximum) and maximum > 0
-        satisfied = fire["satisfied"] if fire else known and hunger / maximum >= task["target"]["at_least"]
-        desired = "maintaining" if (not fire["needs_fuel"] if fire else satisfied) else "in_progress"
+        kind = task["target"]["type"]
+        fire = fire_maintenance_state(task["target"], state) if kind == "refuel" else None
         if fire:
+            known = fire["available"]
+            satisfied = fire["satisfied"]
+            desired = "maintaining" if not fire["needs_fuel"] else "in_progress"
             expiry_reason = "maintenance ended below fuel ratio" if fire["observed"] else "maintenance ended without current fire telemetry"
+        elif kind == "health_ratio":
+            known = number(health) and number(health_max) and health_max > 0
+            satisfied = known and health / health_max >= task["target"]["at_least"]
+            desired = "maintaining" if satisfied else "in_progress"
+            expiry_reason = "maintenance ended below health target" if known else "maintenance ended without health telemetry"
+        elif kind == "thermal_comfort":
+            ts = thermal_comfort_status(task["target"], state.get("_companion") or {})
+            known = ts["known"]
+            satisfied = ts["satisfied"]
+            desired = "maintaining" if satisfied else "in_progress"
+            expiry_reason = "maintenance ended outside safe temperature range" if known else "maintenance ended without temperature telemetry"
         else:
+            known = number(hunger) and number(maximum) and maximum > 0
+            satisfied = known and hunger / maximum >= task["target"]["at_least"]
+            desired = "maintaining" if satisfied else "in_progress"
             expiry_reason = "maintenance ended below hunger target" if known else "maintenance ended without hunger telemetry"
         timer = record.get("maintenance")
         if timer and timer.get("status") in TERMINAL_TASKS:

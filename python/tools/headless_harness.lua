@@ -132,9 +132,103 @@ local function get_bound_buddy(id)
     return nil
 end
 
+local function rebuild_session()
+    local mods = HEADLESS._mods
+    local owner = HEADLESS.owner
+    if HEADLESS.tick_task then
+        HEADLESS.tick_task:Cancel()
+        HEADLESS.tick_task = nil
+    end
+    HEADLESS._session_gen = (HEADLESS._session_gen or 0) + 1
+    local gen = HEADLESS._session_gen
+    HEADLESS._http_callbacks = {}
+    HEADLESS._http_req_id = HEADLESS._http_req_id or 0
+
+    local client
+    local function reply_fn(player, packet)
+        local encoded = (json.encode_compliant or json.encode)(packet)
+        TheWorld:DoTaskInTime(0, function()
+            if gen ~= HEADLESS._session_gen or not client then return end
+            local ok, decoded = pcall(json.decode, encoded)
+            if ok and decoded then client:receive(decoded) end
+        end)
+    end
+    local function trace_fn(event, details)
+        local row = {event = event}
+        for k, v in pairs(details or {}) do row[k] = v end
+        emit("TRACE", row)
+    end
+
+    local world_env = mods.World.new(_G, reply_fn, mods.Client.validate_text, function(v)
+        return #((json.encode_compliant or json.encode)(v))
+    end, trace_fn)
+
+    -- Guard private map marker binding for synthetic headless owner without a real client socket.
+    local orig_map_bind = world_env.map_bind
+    world_env.map_bind = function(player, a)
+        local ok, res, reason = pcall(orig_map_bind, player, a)
+        if not ok then return false, "headless_no_client_map" end
+        return res, reason
+    end
+
+    local server = mods.Server.new_team(world_env)
+    local clock = rawget(_G, "walltime") or function() return GetTime() end
+    local transport_mode = HEADLESS._transport_mode or "http"
+    client = mods.Client.new_team({
+        nonce = "headless:" .. tostring(owner.GUID) .. ":" .. tostring(gen) .. ":" .. string.format("%.0f", clock() * 1000),
+        now = clock,
+        sim_now = GetTime,
+        paused = function() return false end,
+        http_enabled = true,
+        notice = function(text) emit("NOTICE", {text = tostring(text)}) end,
+        send = function(q)
+            local encoded = (json.encode_compliant or json.encode)(q)
+            TheWorld:DoTaskInTime(0, function()
+                if gen ~= HEADLESS._session_gen then return end
+                local ok, decoded = pcall(json.decode, encoded)
+                if ok and decoded then
+                    local handled, err = pcall(function() server:request(owner, decoded) end)
+                    if not handled then emit("ERROR", {stage = "server_request", detail = tostring(err)}) end
+                end
+            end)
+        end,
+        http = function(payload, callback)
+            payload.token = HEADLESS.config.token
+            if transport_mode == "console" then
+                HEADLESS._http_req_id = HEADLESS._http_req_id + 1
+                local req_id = HEADLESS._http_req_id
+                HEADLESS._http_callbacks[req_id] = callback
+                emit_chunked("HTTP_REQ", {req_id = req_id, session_gen = gen, payload = payload})
+                return
+            end
+            local body = (json.encode_compliant or json.encode)(payload)
+            TheSim:QueryServer(HEADLESS.config.url, function(raw, ok, code)
+                if not ok or code ~= 200 then
+                    callback(nil)
+                    return
+                end
+                local decoded_ok, result = pcall(json.decode, raw)
+                callback(decoded_ok and result or nil)
+            end, "POST", body)
+        end,
+    })
+    client.player = owner
+    HEADLESS.world_env = world_env
+    HEADLESS.server = server
+    HEADLESS.client = client
+
+    HEADLESS.tick_task = TheWorld:DoPeriodicTask(0.1, function()
+        if gen ~= HEADLESS._session_gen then return end
+        local ok1, err1 = pcall(function() server:tick() end)
+        if not ok1 then emit("ERROR", {stage = "server_tick", detail = tostring(err1)}) end
+        local ok2, err2 = pcall(function() client:tick(false) end)
+        if not ok2 then emit("ERROR", {stage = "client_tick", detail = tostring(err2)}) end
+    end)
+end
+
 function HEADLESS.init(cfg)
     if HEADLESS.initialized then
-        emit("READY", {x = HEADLESS.ax, z = HEADLESS.az, owner_guid = HEADLESS.owner.GUID})
+        emit("READY", {x = HEADLESS.ax, z = HEADLESS.az, owner_guid = HEADLESS.owner.GUID, session_gen = HEADLESS._session_gen})
         return
     end
     package.path = package.path .. ";" .. cfg.repo_buddy_scripts .. "/?.lua"
@@ -154,6 +248,8 @@ function HEADLESS.init(cfg)
 
     HEADLESS.Pairing = Pairing
     HEADLESS.config = {enabled = true, url = cfg.url, token = cfg.token}
+    HEADLESS._mods = {Server = Server, World = World, Client = Client}
+    HEADLESS._transport_mode = cfg.transport or "http"
 
     local ax, az = find_arena_center()
     HEADLESS.ax, HEADLESS.az = ax, az
@@ -169,81 +265,6 @@ function HEADLESS.init(cfg)
     end
     HEADLESS.owner = owner
 
-    local client
-    local function reply_fn(player, packet)
-        local encoded = (json.encode_compliant or json.encode)(packet)
-        TheWorld:DoTaskInTime(0, function()
-            if not client then return end
-            local ok, decoded = pcall(json.decode, encoded)
-            if ok and decoded then client:receive(decoded) end
-        end)
-    end
-    local function trace_fn(event, details)
-        local row = {event = event}
-        for k, v in pairs(details or {}) do row[k] = v end
-        emit("TRACE", row)
-    end
-
-    local world_env = World.new(_G, reply_fn, Client.validate_text, function(v)
-        return #((json.encode_compliant or json.encode)(v))
-    end, trace_fn)
-
-    -- Guard private map marker binding for synthetic headless owner without a real client socket.
-    local orig_map_bind = world_env.map_bind
-    world_env.map_bind = function(player, a)
-        local ok, res, reason = pcall(orig_map_bind, player, a)
-        if not ok then return false, "headless_no_client_map" end
-        return res, reason
-    end
-
-    local server = Server.new_team(world_env)
-    HEADLESS.world_env = world_env
-    HEADLESS.server = server
-
-    local clock = rawget(_G, "walltime") or function() return GetTime() end
-    HEADLESS._http_callbacks = {}
-    HEADLESS._http_req_id = 0
-    local transport_mode = cfg.transport or "http"
-    client = Client.new_team({
-        nonce = "headless:" .. tostring(owner.GUID) .. ":" .. string.format("%.0f", clock() * 1000),
-        now = clock,
-        sim_now = GetTime,
-        paused = function() return false end,
-        http_enabled = true,
-        notice = function(text) emit("NOTICE", {text = tostring(text)}) end,
-        send = function(q)
-            local encoded = (json.encode_compliant or json.encode)(q)
-            TheWorld:DoTaskInTime(0, function()
-                local ok, decoded = pcall(json.decode, encoded)
-                if ok and decoded then
-                    local handled, err = pcall(function() server:request(owner, decoded) end)
-                    if not handled then emit("ERROR", {stage = "server_request", detail = tostring(err)}) end
-                end
-            end)
-        end,
-        http = function(payload, callback)
-            payload.token = HEADLESS.config.token
-            if transport_mode == "console" then
-                HEADLESS._http_req_id = HEADLESS._http_req_id + 1
-                local req_id = HEADLESS._http_req_id
-                HEADLESS._http_callbacks[req_id] = callback
-                emit_chunked("HTTP_REQ", {req_id = req_id, payload = payload})
-                return
-            end
-            local body = (json.encode_compliant or json.encode)(payload)
-            TheSim:QueryServer(HEADLESS.config.url, function(raw, ok, code)
-                if not ok or code ~= 200 then
-                    callback(nil)
-                    return
-                end
-                local decoded_ok, result = pcall(json.decode, raw)
-                callback(decoded_ok and result or nil)
-            end, "POST", body)
-        end,
-    })
-    client.player = owner
-    HEADLESS.client = client
-
     function HEADLESS.http_reply(req_id, raw_json)
         local cb = HEADLESS._http_callbacks[req_id]
         HEADLESS._http_callbacks[req_id] = nil
@@ -257,12 +278,7 @@ function HEADLESS.init(cfg)
         TheSim:SetTimeScale(cfg.time_scale)
     end
 
-    HEADLESS.tick_task = TheWorld:DoPeriodicTask(0.1, function()
-        local ok1, err1 = pcall(function() server:tick() end)
-        if not ok1 then emit("ERROR", {stage = "server_tick", detail = tostring(err1)}) end
-        local ok2, err2 = pcall(function() client:tick(false) end)
-        if not ok2 then emit("ERROR", {stage = "client_tick", detail = tostring(err2)}) end
-    end)
+    rebuild_session()
 
     HEADLESS.initialized = true
     emit("READY", {
@@ -271,7 +287,101 @@ function HEADLESS.init(cfg)
         owner_guid = owner.GUID,
         time_scale = cfg.time_scale or 1,
         world_id = TheWorld.meta and TheWorld.meta.session_identifier or nil,
+        session_gen = HEADLESS._session_gen,
     })
+end
+
+function HEADLESS.reset_scenario(tag)
+    local owner = HEADLESS.owner
+    local ax, az = HEADLESS.ax, HEADLESS.az
+
+    -- 1. Remove all spawned companion entities regardless of distance.
+    local companions = {}
+    local seen = {}
+    for _, id in ipairs({"buddy1", "buddy2"}) do
+        local b = get_bound_buddy(id)
+        if b and not seen[b] then
+            seen[b] = true
+            companions[#companions + 1] = b
+        end
+    end
+    for _, ent in pairs(Ents or {}) do
+        if ent and ent ~= owner and ent:IsValid() and not seen[ent]
+            and (ent._jev_companion_created_for == owner.userid or ent._jev_companion_owner == owner.userid) then
+            seen[ent] = true
+            companions[#companions + 1] = ent
+        end
+    end
+    for _, comp in ipairs(companions) do
+        if comp:IsValid() then
+            clear_inventory(comp)
+            comp:Remove()
+        end
+    end
+
+    -- 2. Clear all non-owner/non-portal/non-player entities within 36u of arena center.
+    for _, ent in ipairs(TheSim:FindEntities(ax, 0, az, 36, nil, {"INLIMBO"})) do
+        if ent and ent:IsValid() and ent ~= owner and ent.prefab ~= "multiplayer_portal"
+            and not ent:HasTag("player") and not ent:HasTag("CLASSIFIED") then
+            ent:Remove()
+        end
+    end
+
+    -- 3. Fully reset owner state, position, mod state, and builder state.
+    clear_inventory(owner)
+    owner.Transform:SetPosition(ax, 0, az)
+    if owner.components and owner.components.health then
+        owner.components.health:SetInvincible(true)
+        owner.components.health:SetPercent(1)
+    end
+    if owner.components and owner.components.hunger then
+        owner.components.hunger:SetPercent(1)
+        owner.components.hunger:Pause()
+    end
+    if owner.components and owner.components.sanity then
+        owner.components.sanity:SetPercent(1)
+    end
+    if owner.components and owner.components.temperature then
+        owner.components.temperature:SetTemperature(25)
+    end
+    if owner.components and owner.components.moisture and owner.components.moisture.SetPercent then
+        owner.components.moisture:SetPercent(0)
+    end
+    if owner.components and owner.components.burnable and owner.components.burnable:IsBurning() then
+        owner.components.burnable:Extinguish()
+    end
+    if owner.components and owner.components.combat then
+        owner.components.combat:SetTarget(nil)
+    end
+    owner:ClearBufferedAction()
+    if owner.components and owner.components.locomotor then
+        owner.components.locomotor:Clear()
+        owner.components.locomotor:Stop()
+    end
+    owner._jev_companion_places = nil
+    owner._jev_companion_recipes = nil
+    owner._jev_companion_last_build = nil
+    owner._jev_companion_owner = nil
+    owner._jev_companion_slot = nil
+    owner._jev_companion_id = nil
+    owner._jev_companion_name = nil
+    if owner.components and owner.components.builder then
+        owner.components.builder.recipes = {}
+        owner.components.builder.buffered_builds = {}
+    end
+
+    -- 4. Reset world weather/season.
+    pcall(function()
+        if TheWorld then
+            TheWorld:PushEvent("ms_setseason", "autumn")
+            TheWorld:PushEvent("ms_forceprecipitation", false)
+        end
+    end)
+
+    -- 5. Rebuild clean server + client + world_env + tick session.
+    rebuild_session()
+
+    emit("SCENARIO_RESET", {tag = tag or "reset", session_gen = HEADLESS._session_gen})
 end
 
 function HEADLESS.setup_arena(spec_json)
@@ -297,10 +407,18 @@ function HEADLESS.setup_arena(spec_json)
     HEADLESS.owner.Transform:SetPosition(ax, 0, az)
     if spec.reset_owner then
         local o = HEADLESS.owner
-        if o.components and o.components.health then o.components.health:SetPercent(1) end
+        if o.components and o.components.health then
+            o.components.health:SetInvincible(spec.owner_invincible ~= false)
+            local max_hp = o.components.health.maxhealth or 150
+            o.components.health:SetPercent(spec.owner_health and (spec.owner_health / max_hp) or 1)
+        end
         if o.components and o.components.hunger then o.components.hunger:SetPercent(1) end
         if o.components and o.components.sanity then o.components.sanity:SetPercent(1) end
-        if o.components and o.components.temperature then o.components.temperature:SetTemperature(25) end
+        if o.components and o.components.temperature then o.components.temperature:SetTemperature(spec.owner_temperature or 25) end
+        if spec.owner_moisture ~= nil and o.components and o.components.moisture and o.components.moisture.SetPercent then
+            local m_max = o.components.moisture.GetMaxMoisture and o.components.moisture:GetMaxMoisture() or 100
+            o.components.moisture:SetPercent(spec.owner_moisture / m_max)
+        end
         o:ClearBufferedAction()
         if o.components and o.components.locomotor then
             o.components.locomotor:Clear()
@@ -313,10 +431,17 @@ function HEADLESS.setup_arena(spec_json)
         if b then
             clear_inventory(b)
             b.Transform:SetPosition(ax + 2, 0, az)
-            if b.components and b.components.health then b.components.health:SetPercent(1) end
+            if b.components and b.components.health then
+                local max_hp = b.components.health.maxhealth or 150
+                b.components.health:SetPercent(spec.buddy_health and (spec.buddy_health / max_hp) or 1)
+            end
             if b.components and b.components.hunger then b.components.hunger:SetPercent(1) end
             if b.components and b.components.sanity then b.components.sanity:SetPercent(1) end
-            if b.components and b.components.temperature then b.components.temperature:SetTemperature(25) end
+            if b.components and b.components.temperature then b.components.temperature:SetTemperature(spec.buddy_temperature or 25) end
+            if spec.buddy_moisture ~= nil and b.components and b.components.moisture and b.components.moisture.SetPercent then
+                local m_max = b.components.moisture.GetMaxMoisture and b.components.moisture:GetMaxMoisture() or 100
+                b.components.moisture:SetPercent(spec.buddy_moisture / m_max)
+            end
             b:ClearBufferedAction()
             if b.components and b.components.locomotor then
                 b.components.locomotor:Clear()
@@ -367,6 +492,17 @@ function HEADLESS.setup_arena(spec_json)
         give_items(HEADLESS.owner, it.prefab, it.count or 1)
     end
 
+    if spec.season then
+        pcall(function()
+            if TheWorld then TheWorld:PushEvent("ms_setseason", spec.season) end
+        end)
+    end
+    if spec.rain ~= nil then
+        pcall(function()
+            if TheWorld then TheWorld:PushEvent("ms_forceprecipitation", spec.rain == true) end
+        end)
+    end
+
     emit("ARENA_READY", {tag = spec.tag or "default", spawned = spawned})
 end
 
@@ -388,10 +524,31 @@ function HEADLESS.set_simulation(scan_radius, action_delay_ms)
     end
 end
 
+function HEADLESS.set_owner_invincible(on)
+    if HEADLESS.owner and HEADLESS.owner.components and HEADLESS.owner.components.health then
+        HEADLESS.owner.components.health:SetInvincible(on ~= false)
+    end
+end
+
 function HEADLESS.give_buddy(prefab, count, buddy_id)
     local b = get_bound_buddy(buddy_id or "buddy1")
     local ok = b ~= nil and give_items(b, prefab, count or 1) or false
     emit("GIVE_BUDDY", {ok = ok, prefab = prefab, count = count or 1})
+end
+
+local function actor_stones(ent)
+    local out = {}
+    local inv = ent and ent:IsValid() and ent.components and ent.components.inventory
+    if not inv then return out end
+    for _, item in ipairs(inv:FindItems(function(i) return i:IsValid() and i.prefab == "heatrock" end)) do
+        local t = item.components and item.components.temperature and item.components.temperature.GetCurrent and item.components.temperature:GetCurrent() or nil
+        out[#out + 1] = {
+            guid = item.GUID,
+            temperature = type(t) == "number" and round2(t) or nil,
+            range = item.currentTempRange or item.currenttempRange,
+        }
+    end
+    return out
 end
 
 function HEADLESS.inspect(tag)
@@ -406,6 +563,9 @@ function HEADLESS.inspect(tag)
             z = round2(bz),
             health = b.components.health and round2(b.components.health.currenthealth) or nil,
             hunger = b.components.hunger and round2(b.components.hunger.current) or nil,
+            temperature = b.components.temperature and b.components.temperature.GetCurrent and round2(b.components.temperature:GetCurrent()) or nil,
+            moisture = b.components.moisture and b.components.moisture.GetMoisture and round2(b.components.moisture:GetMoisture()) or nil,
+            thermal_stones = actor_stones(b),
             inventory = inventory_counts(b),
         }
     end
@@ -415,8 +575,9 @@ function HEADLESS.inspect(tag)
     for _, ent in ipairs(TheSim:FindEntities(ax, 0, az, 22, nil, {"INLIMBO", "FX", "DECOR"})) do
         if ent and ent:IsValid() then
             local ex, _, ez = ent.Transform:GetWorldPosition()
-            if ent.prefab == "firepit" or ent.prefab == "campfire" or ent.prefab == "cookpot"
-                or ent.prefab == "treasurechest" or ent.prefab == "icebox" or ent.prefab == "researchlab" then
+            if ent.prefab == "firepit" or ent.prefab == "campfire" or ent.prefab == "coldfire" or ent.prefab == "coldfirepit"
+                or ent.prefab == "cookpot" or ent.prefab == "treasurechest" or ent.prefab == "icebox"
+                or ent.prefab == "researchlab" or ent.prefab == "researchlab2" then
                 local row = {
                     guid = ent.GUID,
                     prefab = ent.prefab,
@@ -444,11 +605,16 @@ function HEADLESS.inspect(tag)
     emit("INSPECT", {
         tag = tag or "inspect",
         sim_time = round2(GetTime()),
+        season = TheWorld and TheWorld.state and TheWorld.state.season or nil,
+        israining = TheWorld and TheWorld.state and TheWorld.state.israining == true or false,
         owner_inventory = inventory_counts(HEADLESS.owner),
         owner = {
             guid = HEADLESS.owner.GUID,
             health = HEADLESS.owner.components.health and round2(HEADLESS.owner.components.health.currenthealth) or nil,
             hunger = HEADLESS.owner.components.hunger and round2(HEADLESS.owner.components.hunger.current) or nil,
+            temperature = HEADLESS.owner.components.temperature and HEADLESS.owner.components.temperature.GetCurrent and round2(HEADLESS.owner.components.temperature:GetCurrent()) or nil,
+            moisture = HEADLESS.owner.components.moisture and HEADLESS.owner.components.moisture.GetMoisture and round2(HEADLESS.owner.components.moisture:GetMoisture()) or nil,
+            thermal_stones = actor_stones(HEADLESS.owner),
             inventory = inventory_counts(HEADLESS.owner),
         },
         buddy = buddy_info,

@@ -76,16 +76,29 @@ class RuleTests(unittest.TestCase):
             self.assertFalse((PROJECT_ROOT/name).exists(),name)
 
     def test_runtime_import_graph_has_no_retired_or_windows_input_modules(self):
-        forbidden={"controller","jev_agent","telemetry","board_executor","decision_prefetch","action_buffer","ctypes","win32api","pyautogui","pynput"}
-        for package in ("common","mcp_agent","mcp_server"):
-            for path in (PYTHON_ROOT/package).glob("*.py"):
+        forbidden = {
+            "controller", "jev_agent", "telemetry", "board_executor", "decision_prefetch", "action_buffer",
+            "ctypes", "win32api", "pyautogui", "pynput",
+            "archive", "game_bridge", "daily_planner", "player_bridge", "player_planner",
+            "player_agent", "player_server", "player_probe", "map_view", "map_icons", "model_state",
+        }
+        for package in ("common", "transport", "mcp_agent", "mcp_server"):
+            for path in (PYTHON_ROOT / package).glob("*.py"):
                 for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                    names=([n.name for n in node.names] if isinstance(node,ast.Import) else
-                           [node.module or ""] if isinstance(node,ast.ImportFrom) else [])
-                    self.assertFalse({n.split('.')[0] for n in names}&forbidden,str(path))
-        result=subprocess.run([sys.executable,"-c","import sys; import mcp_agent.mcp_agent; assert not ({'controller','jev_agent','telemetry','decision_prefetch','action_buffer'} & set(sys.modules))"],
-                              cwd=PYTHON_ROOT,capture_output=True,text=True,timeout=10)
-        self.assertEqual(result.returncode,0,result.stderr)
+                    names = (
+                        [n.name for n in node.names] if isinstance(node, ast.Import) else
+                        [node.module or ""] if isinstance(node, ast.ImportFrom) else []
+                    )
+                    parts = {part for name in names for part in name.split(".") if part}
+                    self.assertFalse(parts & forbidden, f"{path}: {parts & forbidden}")
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import sys; import mcp_agent.companion_agent; assert not ({'controller','jev_agent','telemetry','decision_prefetch','action_buffer'} & set(sys.modules))",
+            ],
+            cwd=PYTHON_ROOT, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 

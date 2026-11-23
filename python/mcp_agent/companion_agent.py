@@ -23,14 +23,37 @@ from common.paths import PROJECT_ROOT, PYTHON_ROOT
 from common.config import load_dotenv, resolve_env_path
 from common.task_board import format_board
 from common.task_timing import number
+from common.thermal import seasonal_gear_equip
 from mcp_agent.companion_planner import collection_prefab, validate_team_plan
 from mcp_agent.companion_tasks import RETURN_ALERTS, CompanionTasks, capabilities
 from mcp_agent.planning_core import recent_exchanges, validate_reply, DEFAULT_API_URL, DEFAULT_MODEL
 from mcp_agent.priority_board import idle_review_reason, idle_review_marker
-from mcp_server.game_bridge import check_bridge_port
-from mcp_server.transport_metrics import TransportRecorder
+from transport.http_bridge import check_bridge_port
+from transport.metrics import TransportRecorder
 
 AUTONOMY_REVIEW_SECONDS = 30
+
+
+def seasonal_alert_reason(observed, board=None):
+    """Detect acute freezing, overheating, or unequipped wet-rain hazard not already covered by thermal_comfort."""
+    if "thermal" not in capabilities(observed or {}):
+        return None
+    for task in ((board or {}).get("tasks") or []):
+        if ((task.get("target") or {}).get("type") == "thermal_comfort"
+                and task.get("status") not in {"done", "failed", "expired"}):
+            return None
+    buddy = (observed or {}).get("buddy") or {}
+    world = (observed or {}).get("world") or {}
+    temp = buddy.get("temperature")
+    moisture = buddy.get("moisture")
+    if buddy.get("freezing") or (number(temp) and temp <= 8.0):
+        return "thermal_emergency_freezing"
+    if buddy.get("overheating") or (number(temp) and temp >= 62.0):
+        return "thermal_emergency_overheating"
+    if (world.get("israining") and number(moisture) and moisture >= 35.0
+            and seasonal_gear_equip(observed, "rain") is not None):
+        return "thermal_emergency_wet"
+    return None
 
 
 class CycleDiagnostics:
@@ -89,6 +112,7 @@ class CompanionAgent:
         self.observation_marker = None
         self.prerequisite_replans = 0
         self.storage_wait_marker = None
+        self.thermal_alert_sent = None
         if hasattr(planner, "set_error_handler"):
             planner.set_error_handler(lambda stage, detail: self.trace("planning_detail", stage=stage, detail=detail))
         if hasattr(planner, "set_query_handler"):
@@ -224,6 +248,7 @@ class CompanionAgent:
             self.idle_marker = None
             self.prerequisite_replans = 0
             self.storage_wait_marker = None
+            self.thermal_alert_sent = None
         self.observed = observed
         self.tasks.view(observed)
         products = {}
@@ -295,7 +320,8 @@ class CompanionAgent:
                 if action["status"] == "completed" and (action.get("reason") in {
                         "one_item_transferred", "one_item_dropped", "inventory_increased", "equipped", "unequipped",
                         "work_progressed", "work_finished", "new_structure_observed", "arrived", "building_arrived",
-                        "target_killed", "combat_progressed", "pot_loaded", "pot_started", "tree_ignited"}
+                        "target_killed", "combat_progressed", "pot_loaded", "pot_started", "tree_ignited",
+                        "food_eaten", "healed", "fuel_added"}
                         or str(action.get("reason") or "").startswith("meal_harvested:")):
                     self.failures = 0  # Only real progress breaks a consecutive failure streak.
             # The result may arrive after the observation read at the start of this cycle.
@@ -409,8 +435,23 @@ class CompanionAgent:
         if ((self.future and not background_planning) or time.monotonic() < self.retry_at) and not (
                 self.plan and self.tasks.due_returns(self.board())):
             return
+        if self.thermal_alert_sent:
+            buddy_snap = observed.get("buddy") or {}
+            snap_temp = buddy_snap.get("temperature")
+            if (seasonal_alert_reason(observed, None) is None
+                    and not buddy_snap.get("freezing") and not buddy_snap.get("overheating")
+                    and (not number(snap_temp) or 12 <= snap_temp <= 58)):
+                self.thermal_alert_sent = None
         if self.plan:
             if self.future is None and not self.planning_unavailable and not self.external_board:
+                seasonal_alert = seasonal_alert_reason(observed, self.board())
+                if seasonal_alert and seasonal_alert != self.thermal_alert_sent:
+                    self.thermal_alert_sent = seasonal_alert
+                    self.previous, self.plan = self.board(), None
+                    self.reason = seasonal_alert
+                    self.trace("seasonal_alert", reason=seasonal_alert)
+                    self.request_plan(control, observed, seasonal_alert)
+                    return
                 alert = self.tasks.next_return_alert(self.board())
                 if alert:
                     task_id, reason, timing = alert

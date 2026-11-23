@@ -13,7 +13,7 @@ from common.camp_work import SAFE_MEALS, query_meals
 from common.companion_transfer import COUNTED_TARGETS, guid, query_storage
 from common.places import query_places
 from common.refueling import FUEL_PREFABS
-from mcp_server.game_bridge import BridgeError
+from transport.http_bridge import BridgeError
 
 TERMINAL = {"completed", "failed", "interrupted"}
 OPS = {"summon", "bind", "follow", "stay", "stop", "move", "collect", "recipes", "equip", "unequip", "work", "craft",
@@ -46,7 +46,10 @@ class CompanionBridge:
         return self.session, companion.get("token"), control.get("revision")
 
     def exchange(self, payload, measurements=None):
+        lock_started = time.perf_counter() if isinstance(measurements, dict) else None
         with self.lock:
+            if lock_started is not None:
+                measurements["lock_wait_ms"] = (time.perf_counter() - lock_started) * 1000
             if not isinstance(payload.get("token"), str) or not hmac.compare_digest(payload["token"], self.token):
                 raise PermissionError("Unauthorized")
             session, sequence, state = payload.get("session_id"), payload.get("sequence"), payload.get("state")
@@ -422,7 +425,10 @@ class CompanionTeamBridge:
             raise BridgeError("Companion team disconnected/stale")
 
     def exchange(self, payload, measurements=None):
+        lock_started = time.perf_counter() if isinstance(measurements, dict) else None
         with self.lock:
+            if lock_started is not None:
+                measurements["lock_wait_ms"] = (time.perf_counter() - lock_started) * 1000
             if not isinstance(payload.get("token"), str) or not hmac.compare_digest(payload["token"], self.token):
                 raise PermissionError("Unauthorized")
             session, sequence = payload.get("session_id"), payload.get("sequence")
@@ -502,8 +508,11 @@ class CompanionTeamBridge:
             self.session = session
             self.sequence = sequence
             self.received = self.clock()
+            copy_started = time.perf_counter() if isinstance(measurements, dict) else None
             self.state = {"team": True, "paused": paused, "control": copy.deepcopy(control), "roster": copy.deepcopy(roster),
                           "members": {key: copy.deepcopy(value.state) for key, value in staged.items()}}
+            if copy_started is not None:
+                measurements["state_copy_ms"] = (time.perf_counter() - copy_started) * 1000
             return {"server_id": self.server_id, "session_id": session, "sequence": sequence, "commands": commands, "feedback": feedback}
 
     def observe(self):

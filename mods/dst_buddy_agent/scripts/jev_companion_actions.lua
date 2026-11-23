@@ -4,8 +4,8 @@ local Storage=require("jev_companion_storage")
 local TREES={evergreen={"log","pinecone"},evergreen_sparse={"log","pinecone"},deciduoustree={"log","acorn"},twiggytree={"log","twigs","twiggy_nut"}}
 local ROCKS={rock1={"rocks","flint","nitre"},rock2={"rocks","flint","goldnugget"},rock_flintless={"rocks"},rock_flintless_med={"rocks"},rock_flintless_low={"rocks"},rock_ice={"ice"}}
 local WORK_ACTIONS={"CHOP","MINE"}
-local FIRE_PREFABS={campfire=true,firepit=true}
-local FUEL_PREFABS={log=true,charcoal=true,pinecone=true,acorn=true,twiggy_nut=true,twigs=true,cutgrass=true}
+local FIRE_PREFABS={campfire=true,firepit=true,coldfire=true,coldfirepit=true}
+local FUEL_PREFABS={log=true,charcoal=true,pinecone=true,acorn=true,twiggy_nut=true,twigs=true,cutgrass=true,nitre=true}
 local SAFE_MEALS={
     meatballs=true,ratatouille=true,perogies=true,baconeggs=true,bonestew=true,
     honeyham=true,honeynuggets=true,taffy=true,trailmix=true,dragonpie=true,
@@ -59,7 +59,7 @@ local MEAL_CATALOG={
     {product="dragonpie",ingredients={"dragonfruit","twigs","twigs","twigs"},cook_seconds=40},
     {product="dragonpie",ingredients={"dragonfruit","berries","berries","berries"},cook_seconds=40},
 }
-local DEFAULT_RECIPES={"axe","pickaxe","torch","spear","armorwood","footballhat","campfire","firepit","researchlab","rope","boards","cutstone","treasurechest","cookpot"}
+local DEFAULT_RECIPES={"pickaxe","torch","spear","armorwood","footballhat","healingsalve","bandage","rope","boards","cutstone","treasurechest","cookpot","researchlab","researchlab2","campfire","firepit","coldfire","coldfirepit","earmuffshat","winterhat","beefalohat","strawhat","grass_umbrella","umbrella","rainhat","heatrock","axe"}
 local NON_COMBAT_ALLY={chester=true,hutch=true,glommer=true,abigail=true,bernie_active=true,bernie_big=true}
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<100000 end
 -- Entity IDs are not coordinates; real DST worlds routinely use IDs >100000.
@@ -102,6 +102,55 @@ function M.new(G,E)
                     and edible:GetHealth(a)*multiplier*eater.healthabsorption or 0}
         end
         return foods
+    end
+    function A.healers(a)
+        local healers={}
+        for _,item in ipairs(a.components.inventory:FindItems(function(i)
+            return i:IsValid() and i.components and i.components.healer~=nil
+        end)) do
+            healers[#healers+1]={guid=item.GUID,prefab=item.prefab,
+                count=item.components.stackable and item.components.stackable:StackSize() or 1,
+                health_delta=item.components.healer.health or 0}
+        end
+        return healers
+    end
+    function A.thermal(a)
+        local stones={}
+        for _,item in ipairs(a.components.inventory:FindItems(function(i)
+            return i:IsValid() and i.prefab=="heatrock"
+        end)) do
+            local c=item.components or {}
+            local t=c.temperature and c.temperature.GetCurrent and c.temperature:GetCurrent() or nil
+            t=type(t)=="number" and math.floor(t*100+0.5)/100 or nil
+            local rng=item.currentTempRange or item.currenttempRange
+            local dur=c.fueled and c.fueled.GetPercent and c.fueled:GetPercent() or nil
+            dur=type(dur)=="number" and math.floor(dur*100+0.5)/100 or nil
+            stones[#stones+1]={guid=item.GUID,prefab="heatrock",temperature=t,range=rng,durability=dur}
+        end
+        local winter_ins,summer_ins,wp=0,0,0
+        local inv=a.components.inventory
+        for _,slot in pairs(G.EQUIPSLOTS or {}) do
+            local eq=inv and inv:GetEquippedItem(slot)
+            if eq and eq:IsValid() then
+                local c=eq.components or {}
+                if c.insulator and c.insulator.GetInsulation then
+                    local ins,ins_t=c.insulator:GetInsulation()
+                    if type(ins)=="number" and ins>0 then
+                        if (G.SEASONS and ins_t==G.SEASONS.SUMMER) or tostring(ins_t):lower()=="summer" then
+                            summer_ins=summer_ins+ins
+                        else
+                            winter_ins=winter_ins+ins
+                        end
+                    end
+                end
+                if c.waterproofer and c.waterproofer.GetEffectiveness then
+                    local eff=c.waterproofer:GetEffectiveness()
+                    if type(eff)=="number" and eff>0 then wp=wp+eff end
+                end
+            end
+        end
+        return {stones=stones,winter_insulation=winter_ins,summer_insulation=summer_ins,
+            waterproof=math.min(1,math.floor(wp*100+0.5)/100)}
     end
     local function healthy(item)
         local c=item.components
@@ -298,6 +347,25 @@ function M.new(G,E)
         end)
         return push(a,q,action)
     end
+    local function heal(a,q,r)
+        local args=q.args
+        if args.container_guid~=nil then return false,"invalid_heal_target" end
+        local receipt,reason=Storage.item_receipt(r,args,"heal")
+        if not receipt then return false,reason end
+        q.receipt=receipt
+        if receipt.count>=args.total_count then q.heal_complete=true;return true end
+        local item=a.components.inventory:FindItems(function(i)
+            return i:IsValid() and i.prefab==args.prefab and i.components and i.components.healer~=nil
+        end)[1]
+        if not item then return false,"healer_not_carried" end
+        local action=G.BufferedAction(a,a,G.ACTIONS.HEAL,item)
+        action.validfn=function() return carried(a,item.GUID)==item and not E.dead(a) end
+        action:AddSuccessAction(function()
+            receipt.count=receipt.count+1
+            q.heal_complete=true
+        end)
+        return push(a,q,action)
+    end
     local function refuel(a,q,r)
         local args=q.args
         if type(args.building_id)~="string" or not FUEL_PREFABS[args.fuel_prefab] then return false,"invalid_refuel_args" end
@@ -310,12 +378,18 @@ function M.new(G,E)
         if not receipt then return false,rreason end
         q.receipt=receipt
         if receipt.count>=args.total_count then q.refuel_complete=true;return true end
-        local item=a.components.inventory:FindItems(function(i)
+        local found=a.components.inventory:FindItems(function(i)
             return i:IsValid() and i.prefab==args.fuel_prefab and i.components.fuel~=nil
-        end)[1]
-        if not item then return false,"fuel_not_carried" end
+        end)
+        if #found==0 then return false,"fuel_not_carried" end
+        local item
+        for _,cand in ipairs(found) do
+            if not target.components.fueled or target.components.fueled:CanAcceptFuelItem(cand) then item=cand;break end
+        end
+        if not item then return false,"fuel_incompatible" end
         local fuel_action=(item.GetIsWet and item:GetIsWet() and G.ACTIONS.ADDWETFUEL) or G.ACTIONS.ADDFUEL
         local action=G.BufferedAction(a,target,fuel_action,item)
+        action.distance=3.5
         action.validfn=function() return target:IsValid() and carried(a,item.GUID)==item end
         action:AddSuccessAction(function()
             receipt.count=receipt.count+1
@@ -332,6 +406,7 @@ function M.new(G,E)
                 local section=fueled and fueled.GetCurrentSection and fueled:GetCurrentSection() or nil
                 local lit=(fueled and fueled.IsEmpty and not fueled:IsEmpty()) or e:HasTag("fire") or false
                 targets[#targets+1]={building_id="building:"..tostring(e.GUID),guid=e.GUID,prefab=e.prefab,
+                    is_cold=(e.prefab=="coldfire" or e.prefab=="coldfirepit"),
                     lit=lit,fuel_percent=percent,fire_section=section,fire_data_source="server_fueled"}
             end
         end
@@ -411,6 +486,8 @@ function M.new(G,E)
         q.deferred=nil
         if op=="eat" then
             return eat(a,q,r)
+        elseif op=="heal" then
+            return heal(a,q,r)
         elseif op=="refuel" then
             return refuel(a,q,r)
         elseif op=="set_home" then
@@ -535,6 +612,8 @@ function M.new(G,E)
         end
         if q.op=="eat" and q.eat_complete then
             return "completed","food_eaten",{task_key=q.args.task_key,count=q.receipt.count}
+        elseif q.op=="heal" and q.heal_complete then
+            return "completed","healed",{task_key=q.args.task_key,count=q.receipt.count}
         elseif q.op=="refuel" and q.refuel_complete then
             return "completed","fuel_added",{task_key=q.args.task_key,count=q.receipt.count,building_id=q.args.building_id}
         elseif q.op=="set_home" and q.home_id then
@@ -656,6 +735,7 @@ function M.new(G,E)
         local works,structures,equipment,recipes={},{},{},{}
         local products={}
         if a.components.builder and G.GetValidRecipe then
+            if a.components.builder.EvaluateTechTrees then a.components.builder:EvaluateTechTrees() end
             watch(a,"axe");local bytes=0
             for index=#a._jev_companion_recipes,1,-1 do
                 local id=a._jev_companion_recipes[index]
@@ -702,9 +782,18 @@ function M.new(G,E)
             if equipped then can_unequip,unequip_reason=Storage.can_stow(a,item) end
             local dmg=item.components.weapon and type(item.components.weapon.damage)=="number" and item.components.weapon.damage or 0
             local arm=item.components.armor and type(item.components.armor.absorb_percent)=="number" and item.components.armor.absorb_percent or 0
+            local ins,ins_t
+            if item.components.insulator and item.components.insulator.GetInsulation then
+                ins,ins_t=item.components.insulator:GetInsulation()
+            end
+            ins=type(ins)=="number" and ins or 0
+            local ins_type=ins>0 and ((G.SEASONS and ins_t==G.SEASONS.SUMMER or tostring(ins_t):lower()=="summer") and "summer" or "winter") or nil
+            local wp=item.components.waterproofer and item.components.waterproofer.GetEffectiveness and item.components.waterproofer:GetEffectiveness() or 0
+            wp=type(wp)=="number" and wp or 0
             equipment[#equipment+1]={guid=item.GUID,prefab=item.prefab,slot=item.components.equippable.equipslot,
                 equipped=equipped,can_unequip=can_unequip,unequip_reason=unequip_reason,usable=healthy(item),
-                tools=tools,damage=dmg>0 and dmg or nil,armor=arm>0 and arm or nil}
+                tools=tools,damage=dmg>0 and dmg or nil,armor=arm>0 and arm or nil,
+                insulation=ins>0 and ins or nil,insulation_type=ins_type,waterproof=wp>0 and wp or nil}
             end
         end
         return {work_targets=works,structures=structures,equipment=equipment,recipes=recipes}

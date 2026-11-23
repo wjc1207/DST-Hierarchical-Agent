@@ -163,7 +163,7 @@ function M.new(env)
             save_result(command.id,"interrupted","client_intent_changed",command.revision);return
         end
         if not ({summon=true,bind=true,move=true,collect=true,follow=true,stay=true,stop=true,
-            recipes=true,equip=true,unequip=true,eat=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,
+            recipes=true,equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,
             refuel=true,set_home=true,cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true})[command.op] then
             save_result(command.id,"failed","unsupported_action",command.revision);return
         end
@@ -238,7 +238,7 @@ end
 local TEAM_ACTIVITY={
     collect="采集",search="探索",equip="装备工具",unequip="收起工具",work="工作",CHOP="砍树",MINE="挖矿",
     craft="制作",place="建造",visit_building="前往建筑",move="移动",give_owner="交付物品",
-    eat="进食",drop_item="放下物品",deposit="存放物品",withdraw="取出物品",
+    eat="进食",heal="治疗",drop_item="放下物品",deposit="存放物品",withdraw="取出物品",
     refuel="添燃料",set_home="设置家",cook_load="放食材",start_meal="开始烹饪",harvest_meal="收获料理",ignite_tree="点火烧炭",attack="战斗",
 }
 

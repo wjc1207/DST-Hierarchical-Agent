@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from mcp_agent import companion_planner, daily_planner
+from mcp_agent import companion_planner
 from mcp_agent.agent_memory import AgentMemoryStore, capabilities_fingerprint
 from mcp_agent.context_harness import ContextHarness, flush_memories_from_payload
 
@@ -152,40 +152,6 @@ class ContextHarnessTests(unittest.TestCase):
 
 
 class PlannerMemoryIntegrationTests(unittest.TestCase):
-    def test_player_planner_registers_memory_tools_and_preserves_append_only_history(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = AgentMemoryStore(root=Path(tmp), world_id="world_p")
-            store.memory_write("global", "torch_first", "Make torch before dark", "Craft a torch early.", "lesson")
-            captured = {}
-
-            def fake_request(api_url, api_key, body, validate, *, functions=None, on_usage=None, **kwargs):
-                captured["body"] = body
-                captured["functions"] = functions
-                # Simulate model actively writing a new world memory during planning
-                functions["memory_write"](
-                    scope="world", name="base_loc", description="Camp near portal", content="Camp is east of portal.", kind="convention"
-                )
-                if on_usage:
-                    on_usage({"prompt_tokens": 1234})
-                return {"kind": "agent_reply", "outcome": "reply", "reply": "好的。"}
-
-            usage_seen = []
-            ctx = {"interaction": {"mode": "instruction", "enabled": True, "instruction": "hi", "messages": []}}
-            history = [(f"u{i}", f"a{i}") for i in range(5)]  # > old 3-turn limit
-            with patch("mcp_agent.daily_planner.request_json_plan", fake_request):
-                daily_planner.request_plan(
-                    "https://offline.invalid", "fake", "fake", 1, ctx, history,
-                    memory_store=store, on_usage=usage_seen.append, preserve_history=True,
-                )
-
-            self.assertIn("torch_first", captured["body"]["messages"][0]["content"])
-            # All 5 prior turns preserved (system + 5*2 + current user = 12)
-            self.assertEqual(len(captured["body"]["messages"]), 12)
-            tool_names = {t["function"]["name"] for t in captured["body"]["tools"]}
-            self.assertTrue({"memory_search", "memory_read", "memory_write", "memory_delete"} <= tool_names)
-            self.assertEqual(usage_seen, [{"prompt_tokens": 1234}])
-            self.assertEqual(store.memory_read("world/base_loc.md")["name"], "base_loc")
-
     def test_companion_planner_registers_memory_tools_without_buddy_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = AgentMemoryStore(root=Path(tmp), world_id="world_c")

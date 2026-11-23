@@ -3,8 +3,8 @@ import re
 from common.task_timing import number
 from common.thermal import refuel_pause
 
-FIRE_PREFABS = {"campfire", "firepit"}
-FUEL_PREFABS = {"log", "charcoal", "pinecone", "acorn", "twiggy_nut", "twigs", "cutgrass"}
+FIRE_PREFABS = {"campfire", "firepit", "coldfire", "coldfirepit"}
+FUEL_PREFABS = {"log", "charcoal", "pinecone", "acorn", "twiggy_nut", "twigs", "cutgrass", "nitre"}
 
 
 def validate_target(target):
@@ -33,7 +33,7 @@ def target_error(target, places):
     if not building or building.get("status") == "missing":
         return "refuel building missing or unknown"
     if building.get("prefab") not in FIRE_PREFABS:
-        return "refuel supports campfire and firepit only"
+        return "refuel supports campfire, firepit, coldfire and coldfirepit only"
     return ""
 
 

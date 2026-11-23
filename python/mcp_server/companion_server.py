@@ -16,7 +16,7 @@ from common.pairing import ensure_bridge_token, format_pair_command
 from common.paths import PROJECT_ROOT
 from mcp_server.task_service import TaskService
 from mcp_server.companion_bridge import CompanionTeamBridge
-from mcp_server.game_bridge import serve_bridge
+from transport.http_bridge import BridgePortUnavailable, check_bridge_port, serve_bridge
 
 
 def create_server(bridge, *, poll=.2, timing_path=None):
@@ -31,7 +31,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
         "unequip requires a currently equipped item GUID and stows it without dropping overflow; can_unequip reports capacity/restrictions. "
         "When search is advertised, perception offers local terrain, hazards and validated short search points. "
         "Search accepts only offered points; resource_found is not inventory completion. "
-        "Companion observations list carried foods and their per-serving hunger, sanity and health deltas. Use eat for named food. Use buddy_storage for nearby observed chest contents. give_owner, drop_item, deposit and withdraw move one unit per action; "
+        "Companion observations list carried foods, healers[] and thermal (heatrock stones[] + winter/summer insulation + waterproof). Use eat/heal for named items. Use buddy_storage for nearby observed chest contents. give_owner, drop_item, deposit and withdraw move one unit per action; refuel supports campfire, firepit, coldfire and coldfirepit (including nitre) with seasonal thermal/moisture telemetry; "
         "task_key and total_count preserve a cumulative receipt across retries. Never take items from owner inventory. "
         "Use buddy_places for buildings actually seen by the actor. visit_building={building_id} returns over long distances; "
         "unconfirmed means outside local observation, not missing. Ordinary move still has a 20-unit limit. "
@@ -125,6 +125,12 @@ def main():
 
     if not 1 <= args.port <= 65535:
         parser.error("Invalid port")
+    if not args.configure_only and not args.print_pair_command:
+        try:
+            check_bridge_port(args.port)
+        except BridgePortUnavailable as exc:
+            print(f"mcp_startup_error {exc}", file=sys.stderr)
+            return 2
     token, created = ensure_bridge_token(args.config)
     pair_cmd = format_pair_command(token, args.port, prefix="/buddy", default_port=8766)
     bridge = CompanionTeamBridge(token)
@@ -142,7 +148,11 @@ def main():
             print(pair_cmd, file=sys.stderr)
         return 0
     service = None if args.bridge_only else create_server(bridge, poll=args.poll)
-    listener = serve_bridge(bridge, args.port, metrics_path=args.config.parent / "companion_transport.jsonl")
+    try:
+        listener = serve_bridge(bridge, args.port, metrics_path=args.config.parent / "companion_transport.jsonl")
+    except BridgePortUnavailable as exc:
+        print(f"mcp_startup_error {exc}", file=sys.stderr)
+        return 2
     print(f"Companion bridge: 127.0.0.1:{listener.server_port}; no model API calls.", file=sys.stderr)
     if created:
         print("First-time Workshop pairing (paste in DST chat, local only, keep private):", file=sys.stderr)

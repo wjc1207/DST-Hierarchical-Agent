@@ -104,7 +104,7 @@ class ExternalBackendTests(unittest.TestCase):
             self.assertIn("采两根草", cmds[0][1])
 
             # Test dsh-http backend
-            dsh_http = ExternalAgentBackend("dsh-http", role="player", dsh_url="http://127.0.0.1:57787/mcp/dsh/api", memory_root=Path(tmp))
+            dsh_http = ExternalAgentBackend("dsh-http", role="companion", dsh_url="http://127.0.0.1:57787/mcp/dsh/api", memory_root=Path(tmp))
             seen_req = []
 
             class FakeResp:
@@ -115,19 +115,18 @@ class ExternalBackendTests(unittest.TestCase):
                 def read(self):
                     return json.dumps({
                         "session_id": "dsh-http-7",
-                        "plan": {"kind": "agent_reply", "outcome": "reply", "reply": "收到。"},
+                        "plan": json.loads(plan_json),
                     }).encode("utf-8")
 
             def fake_urlopen(req, timeout=120):
                 seen_req.append(json.loads(req.data.decode("utf-8")))
                 return FakeResp()
 
-            player_ctx = {"interaction": {"mode": "instruction", "enabled": True, "instruction": "hi", "messages": []}}
             with patch("urllib.request.urlopen", fake_urlopen):
-                reply = dsh_http.plan_player(1, player_ctx, [], threading.Event(), world_id="world_3")
-            self.assertEqual(reply["outcome"], "reply")
+                reply = dsh_http.plan_companion(ctx, [], threading.Event(), world_id="world_3")
+            self.assertEqual(reply["kind"], "team_plan")
             self.assertEqual(seen_req[0]["world_id"], "world_3")
-            self.assertEqual(dsh_http.sessions.get("world_3", "dsh-http", "player"), "dsh-http-7")
+            self.assertEqual(dsh_http.sessions.get("world_3", "dsh-http", "companion"), "dsh-http-7")
 
 
 if __name__ == "__main__":

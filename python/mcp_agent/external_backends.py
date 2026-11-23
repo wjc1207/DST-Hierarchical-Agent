@@ -18,13 +18,6 @@ from mcp_agent.companion_planner import (
     companion_profile,
     validate_team_plan,
 )
-from mcp_agent.daily_planner import (
-    PLAYER_TASK_FORMAT,
-    planning_reference,
-    snapshot_message,
-    validate_player_board,
-)
-from mcp_agent.planning_core import PLANNING_RULES, TASK_START_RULES
 
 BACKENDS = ("deepseek", "claude", "codex", "dsh", "dsh-http")
 DEFAULT_TIMEOUT_SECONDS = 120
@@ -225,18 +218,6 @@ class ExternalAgentBackend:
         )
         return header + "\nCurrent game planning event JSON:\n" + json.dumps(context, ensure_ascii=False)
 
-    def _build_player_prompt(self, context: dict, session_id: str | None) -> str:
-        header = (
-            "You are the Don't Starve Together player planner. Return ONLY a single valid JSON object.\n"
-            + PLANNING_RULES
-            + PLAYER_TASK_FORMAT
-            + TASK_START_RULES
-        )
-        if not session_id:
-            ref = planning_reference(knowledge=context.get("dst_knowledge"))
-            header += "\nStatic reference:\n" + json.dumps(ref, ensure_ascii=False, separators=(",", ":"))
-        return header + "\n\nCurrent game planning event JSON:\n" + snapshot_message(context)
-
     def _invoke_claude(self, prompt: str, session_id: str | None, cancel) -> tuple[str, str | None]:
         cmd = _resolve_command("claude", self.command)
         cmd.extend(["-p", "--output-format", "json"])
@@ -395,9 +376,3 @@ class ExternalAgentBackend:
             if self.error_handler:
                 self.error_handler("external_backend", str(exc)[:500])
             raise CompanionPlanningError(type(exc).__name__, str(exc)[:500]) from None
-
-    def plan_player(self, day: int, context: dict, _history, cancel, *, world_id: str | None = None) -> dict:
-        session_id = self.sessions.get(world_id, self.backend, self.role)
-        prompt = self._build_player_prompt(context, session_id)
-        raw, _ = self.invoke(prompt, context, world_id=world_id, cancel=cancel)
-        return validate_player_board(raw, day, context, map_seen=False)

@@ -1,9 +1,9 @@
 -- One authoritative actor/executor per actual RPC sender.
 local M={}
 local OPS={summon=true,bind=true,state=true,intent=true,follow=true,stay=true,stop=true,move=true,collect=true,release=true,say=true,
-    recipes=true,equip=true,unequip=true,eat=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,refuel=true,set_home=true,
+    recipes=true,equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,refuel=true,set_home=true,
     cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true}
-local NATIVE={equip=true,unequip=true,eat=true,work=true,craft=true,place=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,refuel=true,set_home=true,
+local NATIVE={equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,refuel=true,set_home=true,
     cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true}
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<1e7 end
 local function valid_guid(v) return type(v)=="number" and v==v and v>=1 and v<=9007199254740991 and v%1==0 end

@@ -48,10 +48,9 @@ function Sync-RunnerFiles([string]$FromDir, [string]$ToDir) {
         }
     }
 
-    # Write convenient per-mode batch entrypoints inside the persistent install directory.
+    # Write convenient batch entrypoint inside the persistent install directory.
     foreach ($pair in @(
-        @{ File = "run_buddy.bat"; Mode = "buddy" },
-        @{ File = "run_player.bat"; Mode = "player" }
+        @{ File = "run_buddy.bat"; Mode = "buddy" }
     )) {
         $bat = @(
             "@echo off",

@@ -1,8 +1,6 @@
-package.path="./mods/dst_buddy_agent/scripts/?.lua;./mods/dst_player_agent/scripts/?.lua;"..package.path
+package.path="./mods/dst_buddy_agent/scripts/?.lua;"..package.path
 
 local UI=require("jev_companion_ui")
-local PlayerUI=require("jev_autonomy_ui")
-local Autonomy=require("jev_autonomy")
 local pixels,units_to_pixels,mouse_y,held=1080,0,600,false
 local saved,writes={},0
 
@@ -122,71 +120,4 @@ toggle.onclick()
 assert(panel.shown and dock.y==-35 and -panel.y+151*panel.scale<=342)
 
 print("ok 1 - HUD starts without GetWorldScale, drags at the measured scale and restores the saved position")
-pixels=1080
-dock:OnUpdate(.25)
-PlayerUI.install(G,function(name,attach)
-    if name=="widgets/controls" then attach(controls) end
-end)
-local root=controls.topright_root
-local player_dock,player_panel=root.children[4],root.children[5]
-local player_toggle,player_grip=player_dock.children[1],player_dock.children[2]
-assert(player_toggle.text=="角色操控" and player_grip.text==nil and player_dock.y==-380)
-player_toggle.onclick()
-assert(player_panel.shown and not panel.shown)
-toggle.onclick()
-assert(panel.shown and not player_panel.shown)
-player_toggle.onclick()
-
-local function button(text)
-    for _,child in ipairs(player_panel.children) do
-        if child.text==text and child.onclick then
-            assert(child.enabled and not child.selected and child.shown,text)
-            child.onclick()
-            return
-        end
-    end
-    error("missing button "..text)
-end
-
-local state=Autonomy.get(G.ThePlayer)
-assert(not state.enabled and not state.listening)
-button("聊天监听：关")
-assert(state.listening and not state.enabled)
-button("编辑目标")
-assert(dialog)
-dialog.text="build camp"
-dialog.buttons[1].cb()
-assert(not dialog and state.goal=="build camp" and not state.enabled)
-button("开始自主")
-assert(state.enabled)
-button("指令")
-assert(state.mode=="instruction" and not state.enabled and state.goal=="build camp")
-Autonomy.submit_message(G.ThePlayer,"collect logs")
-player_dock:OnUpdate(.25)
-button("暂停并接管")
-assert(not state.enabled and state.paused)
-button("继续")
-assert(state.enabled and not state.paused and state.instruction=="collect logs")
-assert(Autonomy.apply_feedback(G.ThePlayer,{id="done",text="done",revision=state.revision,finish=true},function() end))
-player_dock:OnUpdate(.25)
-for _,child in ipairs(player_panel.children) do
-    if child.text=="等待指令" and child.onclick then assert(not child.enabled) end
-end
-player_toggle.onclick()
-held=true
-player_grip:OnMouseButton(1,true)
-mouse_y=mouse_y-45
-player_dock:OnUpdate(.01)
-held=false
-player_dock:OnUpdate(.01)
-assert(saved.jev_player_hud_position=="410" and saved.jev_companion_hud_position=="420")
-print("ok 2 - both panels share the layout with independent positions, and player controls stop and resume safely")
-
-local function file(path)
-    local f=assert(io.open(path,"rb"))
-    local contents=f:read("*a")
-    f:close()
-    return contents
-end
-assert(file("mods/dst_buddy_agent/scripts/jev_hud_dock.lua")==file("mods/dst_player_agent/scripts/jev_hud_dock.lua"))
-print("1..2")
+print("1..1")

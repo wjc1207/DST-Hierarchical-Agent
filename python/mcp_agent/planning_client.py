@@ -6,8 +6,6 @@ import time
 
 from mcp_agent.agent_memory import AgentMemoryStore, capabilities_fingerprint
 from mcp_agent.context_harness import ContextHarness, llm_compact_summary
-from mcp_agent.daily_planner import SUPPORTED_CAPABILITIES, planning_context, planning_slot, request_plan, snapshot_message
-from mcp_server.game_bridge import SUPPORTED as PLAYER_SUPPORTED_ACTIONS
 
 
 def _extract_world_id(snapshot: dict) -> str | None:
@@ -21,13 +19,12 @@ def _extract_world_id(snapshot: dict) -> str | None:
 
 
 class PlanningClient:
-    def __init__(self, client, *, player_model=None, companion_model=None, external_backend=None, memory_root=None):
+    def __init__(self, client, *, companion_model=None, external_backend=None, memory_root=None):
         self.client = client
-        self.player_model = player_model
         self.companion_model = companion_model
         self.external_backend = external_backend
         self.memory = AgentMemoryStore(root=memory_root)
-        self.context = ContextHarness(role="companion" if self.is_companion else "player", root=memory_root)
+        self.context = ContextHarness(role="companion", root=memory_root)
         self.handled = {}
         self.pending = None
         self.cancel = None
@@ -67,7 +64,7 @@ class PlanningClient:
 
     @property
     def is_companion(self) -> bool:
-        return bool(self.companion_model) or (self.external_backend is not None and self.external_backend.role == "companion")
+        return True
 
     async def rpc(self, name, **args):
         result = await self.client.call_tool(name, args)
@@ -83,10 +80,6 @@ class PlanningClient:
             summarizer = lambda prev, older: llm_compact_summary(
                 self.companion_model.api_url, self.companion_model.key, self.companion_model.model,
                 prev, older, memory_store=self.memory)
-        elif self.player_model:
-            api_url, api_key, model = self.player_model
-            summarizer = lambda prev, older: llm_compact_summary(
-                api_url, api_key, model, prev, older, memory_store=self.memory)
         if self.context.compact(summarizer=summarizer):
             print(f"context_compacted role={self.context.role} count={self.context.compaction_count} turns_kept={len(self.context.turns)}")
 
@@ -95,45 +88,29 @@ class PlanningClient:
             self._compact_if_needed()
         history = self.context.messages_for_prompt()
         members = snapshot["members"]
-        if self.is_companion:
-            context = {
-                "interaction": snapshot["interaction"],
-                "long_term_goal": snapshot["interaction"].get("goal"),
-                "members": {identity: {**row, "replan_reason": (
-                    "player_dialogue" if identity in requested and self.new_intent(identity, row)
-                    else row["review_reason"])} for identity, row in members.items()},
-                "request_ids": requested,
-            }
-            if self.external_backend is not None:
-                result = self.external_backend.plan_companion(context, history, cancel, world_id=self.context.world_id)
-            else:
-                result = self.companion_model(context, history, cancel)
-            plans = {row["buddy_id"]: row["plan"] for row in result["assignments"]}
-            return json.dumps(context, ensure_ascii=False), result["_assistant_message"], plans
-        actor = members["player"]
-        state = actor["observation"]
-        context = planning_context(state, state.get("bridge", {}).get("events", []))
-        context.update(current_task_board=actor["current_task_board"], replan_reason=(
-            "player_message" if self.new_intent("player", actor) else actor["review_reason"] or "quarter_review"))
+        context = {
+            "interaction": snapshot["interaction"],
+            "long_term_goal": snapshot["interaction"].get("goal"),
+            "members": {identity: {**row, "replan_reason": (
+                "player_dialogue" if identity in requested and self.new_intent(identity, row)
+                else row["review_reason"])} for identity, row in members.items()},
+            "request_ids": requested,
+        }
         if self.external_backend is not None:
-            result = self.external_backend.plan_player(state["world"]["day"], context, history, cancel, world_id=self.context.world_id)
+            result = self.external_backend.plan_companion(context, history, cancel, world_id=self.context.world_id)
         else:
-            api_url, api_key, model = self.player_model
-            result = request_plan(api_url, api_key, model, state["world"]["day"], context, history,
-                                  cancel_event=cancel, memory_store=self.memory,
-                                  on_usage=self.context.note_usage, preserve_history=True)
-        return snapshot_message(context), json.dumps(result, ensure_ascii=False), {"player": result}
+            result = self.companion_model(context, history, cancel)
+        plans = {row["buddy_id"]: row["plan"] for row in result["assignments"]}
+        return json.dumps(context, ensure_ascii=False), result["_assistant_message"], plans
 
     def new_intent(self, identity, row):
         return self.handled.get(identity, (None,))[0] != row["intent_version"]
 
     def marker(self, row):
-        control = row["interaction"]
         board = row["current_task_board"] or {}
         tasks = tuple(sorted((t["id"], t["status"], t.get("blocked_reason", "")) for t in board.get("tasks", [])))
-        slot = planning_slot(row["observation"]) if not self.is_companion and control.get("mode") == "autonomous" else None
         reason = row["review_reason"]
-        return (row["intent_version"], slot, reason, tasks if reason else ())
+        return (row["intent_version"], None, reason, tasks if reason else ())
 
     async def cycle(self):
         snapshot = await self.rpc("get_planning_state")
@@ -144,18 +121,12 @@ class PlanningClient:
             self.memory.bind_world(world_id)
             self.context.bind_world(world_id)
         members = snapshot["members"]
-        if self.is_companion:
-            caps = sorted({
-                c for row in members.values()
-                for c in (row.get("supported_capabilities") or (row.get("observation") or {}).get("capabilities") or [])
-            })
-            if caps:
-                self.memory.set_capabilities_hash(capabilities_fingerprint(caps))
-        else:
-            self.memory.set_capabilities_hash(capabilities_fingerprint([
-                *SUPPORTED_CAPABILITIES.get("target_types", []),
-                *PLAYER_SUPPORTED_ACTIONS,
-            ]))
+        caps = sorted({
+            c for row in members.values()
+            for c in (row.get("supported_capabilities") or (row.get("observation") or {}).get("capabilities") or [])
+        })
+        if caps:
+            self.memory.set_capabilities_hash(capabilities_fingerprint(caps))
         if self.pending:
             if any(members.get(i, {}).get("version") != v or not members[i]["interaction"].get("enabled")
                    for i, v in self.versions.items()):
@@ -172,17 +143,16 @@ class PlanningClient:
                 boards = {i: p for i, p in plans.items() if p.get("kind") == "task_board"}
                 replies = {i: p for i, p in plans.items() if i not in boards}
                 if boards:
-                    board = {"assignments": boards} if self.is_companion else boards["player"]
-                    result = await self.rpc("submit_task_board", board=board, versions={i: self.versions[i] for i in boards})
+                    result = await self.rpc("submit_task_board", board={"assignments": boards}, versions={i: self.versions[i] for i in boards})
                     for identity, plan in boards.items():
                         if plan.get("reply"):
                             await self.rpc("send_planning_reply", text=plan["reply"], version=result["versions"][identity],
-                                           **({"buddy_id": identity} if self.is_companion else {}))
+                                           buddy_id=identity)
                 for identity, reply in replies.items():
                     if reply["outcome"] == "blocked" and members[identity]["interaction"].get("mode") == "autonomous":
                         self.blocked_until[identity] = time.monotonic() + 30
                     await self.rpc("send_planning_reply", text=reply["reply"], version=self.versions[identity],
-                                   outcome=reply["outcome"], **({"buddy_id": identity} if self.is_companion else {}))
+                                   outcome=reply["outcome"], buddy_id=identity)
                     if reply["outcome"] == "completed":
                         self.finished[identity] = members[identity]["intent_version"]
                 self.context.append(user_message, assistant_message)
@@ -206,7 +176,7 @@ class PlanningClient:
                     for identity in self.versions:
                         row = members[identity]
                         await self.rpc("send_planning_reply", text="DeepSeek API 余额不足（HTTP 402）。请检查余额后再发送消息。",
-                                       version=row["version"], **({"buddy_id": identity} if self.is_companion else {}))
+                                       version=row["version"], buddy_id=identity)
                         self.finished[identity] = row["intent_version"]
                 self.retry_at = time.monotonic() + 5
                 raise
@@ -236,11 +206,11 @@ class PlanningClient:
             self.pending.cancel()
 
 
-async def run_planning_loop(client, *, poll, max_cycles=0, player_model=None, companion_model=None,
+async def run_planning_loop(client, *, poll, max_cycles=0, companion_model=None,
                             external_backend=None, idle_tool=None, on_error=None, on_recovered=None):
-    """Shared MCP orchestration loop for both player and companion CLIs."""
-    has_planner = bool(player_model or companion_model or external_backend)
-    planning = PlanningClient(client, player_model=player_model, companion_model=companion_model,
+    """Unified MCP orchestration loop for companion/self planning CLIs."""
+    has_planner = bool(companion_model or external_backend)
+    planning = PlanningClient(client, companion_model=companion_model,
                               external_backend=external_backend) if has_planner else None
     cycle = 0
     try:

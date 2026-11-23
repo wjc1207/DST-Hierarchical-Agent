@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from mcp_server.companion_bridge import CompanionBridge
 from mcp_server.companion_server import create_server
-from mcp_server.game_bridge import BridgeError, serve_bridge
+from transport.http_bridge import BridgeError, serve_bridge
 from mcp_agent.companion_planner import validate_plan, next_action, request_plan, collection_prefab
 from mcp_agent.companion_agent import CompanionAgent
 from mcp_agent.companion_tasks import CompanionTasks

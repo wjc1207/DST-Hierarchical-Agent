@@ -2,7 +2,7 @@
 from copy import deepcopy
 import re
 
-COUNTED_TARGETS = {"give_owner", "drop_item", "deposit", "withdraw", "eat"}
+COUNTED_TARGETS = {"give_owner", "drop_item", "deposit", "withdraw", "eat", "heal"}
 STORAGE_TARGETS = {"inspect_storage", "deposit", "withdraw"}
 TRANSFER_TARGETS = COUNTED_TARGETS | STORAGE_TARGETS | {"receive_item"}
 
@@ -54,7 +54,7 @@ def validate_target(target):
         fields.update({"prefab", "count"})
         if not isinstance(target.get("prefab"), str) or not re.fullmatch(r"[a-z0-9_]{1,60}", target["prefab"]):
             raise ValueError("Transfer requires a canonical item prefab")
-        count = target.get("count", 1 if kind == "eat" else None)
+        count = target.get("count", 1 if kind in {"eat", "heal"} else None)
         if type(count) is not int or not 1 <= count <= 100:
             raise ValueError("Item count must be 1..100")
         clean.update(prefab=target["prefab"], count=count)

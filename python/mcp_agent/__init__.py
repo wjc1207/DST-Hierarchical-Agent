@@ -1,1 +1,1 @@
-"""Models, persistent goals and search-intent scheduling. Lua owns game movement."""
+"""Unified DST Buddy Agent planner and executor package."""

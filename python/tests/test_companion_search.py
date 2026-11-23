@@ -8,7 +8,7 @@ from mcp_agent.companion_tasks import CompanionTasks, validate_board
 from mcp_agent.companion_search import ResourceSearch
 from mcp_agent.companion_agent import CompanionAgent
 from mcp_server.companion_bridge import CompanionBridge
-from mcp_server.game_bridge import BridgeError
+from transport.http_bridge import BridgeError
 
 
 def relocate(observed, x=0, z=0):

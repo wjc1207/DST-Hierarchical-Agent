@@ -1,17 +1,10 @@
-"""Structured planning is validated; only observed facts advance the board."""
-import copy
-import json
-import tempfile
+"""Structured task board schema, view projection, and alias validation tests."""
 import unittest
-from pathlib import Path
-from concurrent.futures import Future
-from unittest.mock import Mock, patch
 
-from mcp_agent import daily_planner
 from common import game_rules as rules
 from common.task_board import (validate_board, board_view, format_board,
-                        INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
-from fixtures import state, grass
+                               INVENTORY_TARGET_PREFABS, INVENTORY_PREFAB_ALIASES)
+from fixtures import state
 
 
 def raw_board():
@@ -24,97 +17,7 @@ def raw_board():
          "depends_on": ["grass"], "action_hints": ["craft_torch"]}]}
 
 
-class BoardExecutor:
-    def __init__(self, **_kwargs): self.calls = []
-    def submit(self, function, *args):
-        self.calls.append((function, args))
-        result = Future()
-        result.set_result((validate_board(raw_board(), args[3]), 0.75, None))
-        return result
-    def shutdown(self, **_kwargs): pass
-
-
-class PendingBoardExecutor:
-    def __init__(self, **_kwargs): self.calls, self.futures = [], []
-    def submit(self, function, *args):
-        self.calls.append((function, args))
-        future = Future()
-        self.futures.append(future)
-        return future
-    def shutdown(self, **_kwargs): pass
-
-
 class BoardTests(unittest.TestCase):
-    def completed_state(self):
-        actual = state([], cutgrass=4)
-        actual["player"]["inventory"]["items"].append({"prefab": "torch", "count": 1})
-        return actual
-
-    def pending_planner(self, *, seeded=True):
-        with patch.object(daily_planner, "ThreadPoolExecutor", PendingBoardExecutor):
-            planner = daily_planner.DailyPlanner("secret", board_log_dir=None)
-        self.addCleanup(planner.close)
-        if seeded:
-            planner.plan = validate_board(raw_board(), 1)
-            planner.plan.update(quarter=1, board_id="original")
-            planner.requested_slot = (1, 0)
-        return planner
-
-    def test_all_tasks_done_replans_once_immediately_without_waiting_for_quarter(self):
-        planner = self.pending_planner()
-        actual = self.completed_state()
-        self.assertIsNone(planner.update(actual))
-        self.assertEqual(len(planner.executor.calls), 1)
-        context = planner.executor.calls[0][1][4]
-        self.assertEqual(context["replan_reason"], "all_tasks_completed")
-        self.assertEqual(context["previous_task_board"]["status"], "completed")
-        self.assertTrue(all(t["status"] == "done" for t in context["previous_task_board"]["tasks"]))
-        self.assertEqual(context["inventory"]["cutgrass"], 4)
-        for _ in range(10):
-            self.assertIsNone(planner.update(actual))
-        self.assertEqual(len(planner.executor.calls), 1)
-        self.assertIsNone(planner.plan)
-
-    def test_partial_blocked_predicted_empty_or_dead_board_does_not_trigger_completion(self):
-        for scenario in ("partial", "predicted", "dead", "empty"):
-            with self.subTest(scenario=scenario):
-                planner = self.pending_planner()
-                actual = self.completed_state()
-                if scenario == "partial": actual["player"]["inventory"]["items"][0]["count"] = 1
-                elif scenario == "predicted": actual["_jev_execution_context"] = {"predicted_success": True}
-                elif scenario == "dead": actual["player"]["vitals"]["dead"] = True
-                else: planner.plan["tasks"] = []
-                planner.update(actual)
-                self.assertEqual(len(planner.executor.calls), 0)
-
-    def test_already_satisfied_replies_are_rate_limited_not_resubmitted_each_cycle(self):
-        planner = self.pending_planner(seeded=False)
-        actual = self.completed_state()
-        with patch.object(daily_planner.time, "monotonic", return_value=100) as clock:
-            planner.update(actual)
-            planner.executor.futures[0].set_result((validate_board(raw_board(), 1), 1, None))
-            self.assertIsNone(planner.update(actual))
-            self.assertEqual(len(planner.executor.calls), 2)
-            clock.return_value = 101
-            planner.executor.futures[1].set_result((validate_board(raw_board(), 1), 1, None))
-            self.assertIsNone(planner.update(actual))
-            for _ in range(5): planner.update(actual)
-            self.assertEqual(len(planner.executor.calls), 2)
-            clock.return_value = 100 + daily_planner.COMPLETION_REPLAN_INTERVAL
-            planner.update(actual)
-            self.assertEqual(len(planner.executor.calls), 3)
-
-    def test_completion_request_failure_does_not_spin_and_new_quarter_can_request_again(self):
-        planner = self.pending_planner()
-        actual = self.completed_state()
-        planner.update(actual)
-        planner.executor.futures[0].set_result((None, 1, RuntimeError("offline")))
-        for _ in range(5): self.assertIsNone(planner.update(actual))
-        self.assertEqual(len(planner.executor.calls), 1)
-        actual["world"]["time"] = 0.26
-        planner.update(actual)
-        self.assertEqual(len(planner.executor.calls), 2)
-
     def test_cli_table_shows_tasks_progress_and_blockers_without_control_sequences(self):
         board = validate_board(raw_board(), 1)
         board["tasks"][0]["title"] = "收集草以备夜晚使用" * 8 + "\x1b[2J"
@@ -128,25 +31,6 @@ class BoardTests(unittest.TestCase):
         self.assertIn("...", rendered)
         row_widths = [len(line) for line in rendered.splitlines() if line.startswith("+")]
         self.assertEqual(len(set(row_widths)), 1)
-
-    def test_cli_progress_is_throttled_but_status_changes_are_immediate(self):
-        with patch.object(daily_planner, "ThreadPoolExecutor", BoardExecutor):
-            planner = daily_planner.DailyPlanner("secret", board_log_dir=None)
-        self.addCleanup(planner.close)
-        board = validate_board(raw_board(), 1)
-        board["board_id"] = "test:1"
-        with patch.object(daily_planner.time, "monotonic", return_value=10) as clock, patch("builtins.print") as output:
-            planner._publish_board(board_view(board, state([], cutgrass=1)))
-            self.assertEqual(output.call_count, 1)
-            clock.return_value = 11
-            planner._publish_board(board_view(board, state([], cutgrass=2)))
-            self.assertEqual(output.call_count, 1)
-            clock.return_value = 13
-            planner._publish_board(board_view(board, state([], cutgrass=2)))
-            self.assertEqual(output.call_count, 2)
-            clock.return_value = 13.1
-            planner._publish_board(board_view(board, state([], cutgrass=4)))
-            self.assertEqual(output.call_count, 3)
 
     def test_status_is_runtime_owned_and_dependencies_are_validated(self):
         raw = raw_board()
@@ -222,7 +106,6 @@ class BoardTests(unittest.TestCase):
         actual["navigation"]["graph"] = {"current_node": "forest"}
         self.assertTrue(all(t["status"] == "done" for t in board_view(board, actual)["tasks"]))
 
-
     def test_expired_board_has_no_ready_tasks(self):
         board = validate_board(raw_board(), 1)
         board["quarter"] = 1
@@ -233,78 +116,13 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(view["ready_task_ids"], [])
         self.assertTrue(all(t["status"] == "expired" for t in view["tasks"]))
 
-    def test_planner_logs_board_and_sends_previous_board_to_next_quarter(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(daily_planner, "ThreadPoolExecutor", BoardExecutor):
-            planner = daily_planner.DailyPlanner("secret", board_log_dir=Path(directory))
-            self.addCleanup(planner.close)
-            current = state([], cutgrass=2)
-            self.assertIsNone(planner.update(current))
-            board = planner.update(current)
-            self.assertEqual(board["kind"], "task_board")
-            self.assertEqual(board["tasks"][0]["progress"]["current"], 2)
-            snapshot = Path(directory, "task_board.json").read_text(encoding="utf8")
-            self.assertNotIn("secret", snapshot)
-            self.assertEqual(json.loads(snapshot)["task_board"]["board_id"], board["board_id"])
-            planner.update(current)
-            self.assertEqual(len(Path(directory, "task_board.jsonl").read_text(encoding="utf8").splitlines()), 1)
-            current["player"]["inventory"]["items"][0]["count"] = 4
-            planner.update(current)
-            current["world"]["time"] = 0.26
-            self.assertIsNone(planner.update(current))
-            context = planner.executor.calls[-1][1][4]
-            self.assertEqual(context["previous_task_board"]["status"], "expired")
-            self.assertEqual(context["previous_task_board"]["tasks"][0]["progress"]["current"], 4)
-            next_board = planner.update(current)
-            self.assertNotEqual(next_board["board_id"], board["board_id"])
-
-
-
-    def test_deepseek_is_prompted_for_interleaved_priority_goals(self):
-        class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_args): return False
-            def read(self):
-                return json.dumps({"choices": [{"finish_reason": "stop", "message": {
-                    "content": json.dumps({"goal":"Gather","tasks":[
-                        {"id":"grass","title":"Grass","target":{"type":"inventory","prefab":"cutgrass","count":4}}]})}}]}).encode()
-        with patch.object(daily_planner.urllib.request, "urlopen", return_value=Response()) as send:
-            board = daily_planner.request_plan("https://example.invalid", "secret", "test", 1, {})
-        self.assertEqual(board["execution_policy"], "priority_goals")
-        prompt = json.loads(send.call_args.args[0].data)["messages"][0]["content"]
-        self.assertIn('"tasks"', prompt)
-        self.assertIn("interleaved order", prompt)
-        self.assertIn("waits when no board task can advance", prompt)
-        self.assertIn("sanity recovery", prompt)
-        self.assertIn("log not logs", prompt)
-
-    def test_unknown_inventory_target_retries_then_normalizes_known_alias(self):
-        class Response:
-            def __init__(self, prefab): self.prefab = prefab
-            def __enter__(self): return self
-            def __exit__(self, *_args): return False
-            def read(self):
-                raw = {"goal":"Get logs","tasks":[{"id":"logs","title":"Logs","target":{"type":"inventory","prefab":self.prefab,"count":4}}]}
-                return json.dumps({"choices": [{"finish_reason": "stop", "message": {
-                    "content": json.dumps(raw)}}]}).encode()
-        with patch.object(daily_planner.urllib.request, "urlopen",
-                          side_effect=[Response("loggs"), Response("logs")]) as send:
-            board = daily_planner.request_plan("https://example.invalid", "secret", "test", 1, {})
-        self.assertEqual(send.call_count, 2)
-        self.assertEqual(board["tasks"][0]["target"]["prefab"], "log")
-
-    def test_planner_receives_canonical_inventory_names_and_aliases(self):
-        planner = self.pending_planner(seeded=False)
-        planner.update(state([]))
-        capabilities = planner.executor.calls[0][1][6]["supported_capabilities"]
-        self.assertEqual(capabilities["inventory_target_prefabs"], sorted(INVENTORY_TARGET_PREFABS))
-        self.assertEqual(capabilities["inventory_prefab_aliases"], INVENTORY_PREFAB_ALIASES)
-        self.assertIn("log", capabilities["inventory_target_prefabs"])
-        self.assertNotIn("logs", capabilities["inventory_target_prefabs"])
-
-
     def test_verified_science_machine_fact_completes_task_even_after_leaving_it(self):
         raw = {"goal": "Research", "tasks": [{"id": "science", "title": "Build science machine",
                "target": {"type": "structure", "prefab": "sciencemachine"}}]}
         board = validate_board(raw, 1)
         self.assertEqual(board_view(board, state([]))["tasks"][0]["status"], "ready")
         self.assertEqual(board_view(board, state([]), verified_structures=["sciencemachine"])["tasks"][0]["status"], "done")
+
+
+if __name__ == "__main__":
+    unittest.main()

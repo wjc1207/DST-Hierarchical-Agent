@@ -13,7 +13,7 @@ from mcp_agent.companion_planner import validate_plan, request_plan, CompanionPl
 from mcp_agent import planning_core
 from mcp_server.companion_bridge import CompanionBridge
 from mcp_server.companion_server import create_server
-from mcp_server.game_bridge import BridgeError
+from transport.http_bridge import BridgeError
 
 
 def recipe(identity="axe", *, placement=False, ready=True, count=1):

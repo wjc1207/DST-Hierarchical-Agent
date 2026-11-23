@@ -1,7 +1,7 @@
-"""Content-free timing tests use loopback fake game messages only."""
+"""Content-free timing tests use loopback fake team messages only."""
+import contextlib
 import json
 import math
-import contextlib
 import socket
 import time
 import unittest
@@ -10,42 +10,75 @@ import urllib.request
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from mcp_server.game_bridge import GameBridge, serve_bridge
-from mcp_server.transport_metrics import TransportRecorder, lua_measurements
-from test_game_bridge import TOKEN, state
+from mcp_server.companion_bridge import CompanionTeamBridge
+from test_companion import TOKEN
+from test_companion_team import team_state
+from transport.http_bridge import serve_bridge
+from transport.metrics import TransportRecorder, lua_measurements
+
+
+class _HeartbeatLoopbackBridge:
+    """Minimal loopback bridge peer for exercising serve_bridge heartbeat filtering."""
+
+    def __init__(self):
+        self.server_id = "hb-server"
+        self.state_version = 1
+
+    def exchange(self, payload, measurements=None):
+        if measurements is not None:
+            measurements["lock_wait_ms"] = 0.0
+        return {
+            "server_id": self.server_id,
+            "session_id": payload["session_id"],
+            "sequence": payload["sequence"],
+            "board_revision": 0,
+        }
 
 
 class TransportTests(unittest.TestCase):
     def test_game_chat_response_uses_utf8_not_unsupported_unicode_escapes(self):
         with self.fake_http_peer() as (bridge, server, _records):
-            snapshot = state()
-            snapshot["autonomy"] = {"enabled": True, "revision": 1, "mode": "instruction",
-                                    "instruction": "做火把", "messages": [{"id": 1, "text": "做火把"}]}
+            snapshot = team_state()
+            snapshot["members"]["buddy1"]["control"].update(
+                mode="instruction",
+                instruction="做火把",
+                messages=[{"id": 1, "text": "做火把"}],
+            )
+            snapshot["control"].update(
+                mode="instruction",
+                instruction="做火把",
+                messages=[{"id": 1, "text": "做火把"}],
+            )
+
             def exchange(sequence):
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{server.server_port}/v1/exchange",
-                    data=json.dumps({"token": TOKEN, "session_id": "utf8-chat", "sequence": sequence,
-                                     "state": snapshot}, ensure_ascii=False).encode("utf-8"),
-                    headers={"Content-Type": "application/json"})
+                    data=json.dumps(
+                        {"token": TOKEN, "session_id": "utf8-chat", "sequence": sequence, "state": snapshot},
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
                 with urllib.request.urlopen(request, timeout=2) as response:
                     body = response.read()
                     self.assertEqual(int(response.headers["Content-Length"]), len(body))
                     self.assertEqual(response.headers.get_content_charset(), "utf-8")
                     return body
+
             exchange(1)
             text = '先采草和树枝，再做火把。你好，"饥荒"！🌲'
-            bridge.send_agent_feedback(text, 1, "utf8-reply")
+            bridge.member_call("reply", "buddy1", text, 1, "utf8-reply")
             raw = exchange(2)
             self.assertIn("先采草和树枝".encode("utf-8"), raw)
             self.assertIn("🌲".encode("utf-8"), raw)
             self.assertNotIn(b"\\u", raw)
-            self.assertEqual(json.loads(raw)["agent_feedback"][0]["text"], text)
+            self.assertEqual(json.loads(raw)["feedback"][0]["text"], text)
 
     @contextlib.contextmanager
     def fake_http_peer(self):
         records = []
-        bridge = GameBridge(TOKEN)
-        with patch("mcp_server.game_bridge.TransportRecorder", return_value=SimpleNamespace(write=records.append)):
+        bridge = CompanionTeamBridge(TOKEN)
+        with patch("transport.http_bridge.TransportRecorder", return_value=SimpleNamespace(write=records.append)):
             server = serve_bridge(bridge, 0)
         try:
             yield bridge, server, records
@@ -66,7 +99,7 @@ class TransportTests(unittest.TestCase):
         self.fail("too many response headers")
 
     def await_records(self, records, count):
-        deadline = time.monotonic()+2
+        deadline = time.monotonic() + 2
         while len(records) < count and time.monotonic() < deadline:
             time.sleep(0.001)
         self.assertEqual(len(records), count)
@@ -76,7 +109,7 @@ class TransportTests(unittest.TestCase):
         # that eagerly sends its body (urllib) cannot catch this regression.
         with self.fake_http_peer() as (bridge, server, records):
             body = json.dumps({"token": TOKEN, "session_id": "offline", "sequence": 1,
-                               "state": state()}).encode()
+                               "state": team_state()}).encode()
             with socket.create_connection(server.server_address, timeout=0.75) as peer:
                 with peer.makefile("rb") as stream:
                     peer.sendall(("POST /v1/exchange HTTP/1.1\r\nHost: localhost\r\n"
@@ -88,8 +121,7 @@ class TransportTests(unittest.TestCase):
                     peer.sendall(body)
                     status, headers = self.response_head(stream)
                     self.assertEqual(status, "HTTP/1.1 200 OK")
-                    self.assertEqual(json.loads(stream.read(int(headers["content-length"])))
-                                     ["sequence"], 1)
+                    self.assertEqual(json.loads(stream.read(int(headers["content-length"])))["sequence"], 1)
                     self.assertEqual(headers["connection"], "close")
                     self.assertEqual(stream.read(1), b"")
             self.await_records(records, 1)
@@ -126,7 +158,7 @@ class TransportTests(unittest.TestCase):
             for sequence, version in enumerate(("HTTP/1.0", "HTTP/1.1"), 1):
                 with self.subTest(version=version):
                     body = json.dumps({"token": TOKEN, "session_id": "offline",
-                                       "sequence": sequence, "state": state()}).encode()
+                                       "sequence": sequence, "state": team_state()}).encode()
                     with socket.create_connection(server.server_address, timeout=2) as peer:
                         with peer.makefile("rb") as stream:
                             peer.sendall((f"POST /v1/exchange {version}\r\nHost: localhost\r\n"
@@ -149,7 +181,7 @@ class TransportTests(unittest.TestCase):
     def test_continue_does_not_bypass_body_authentication(self):
         with self.fake_http_peer() as (bridge, server, records):
             body = json.dumps({"token": "wrong", "session_id": "offline", "sequence": 1,
-                               "state": state()}).encode()
+                               "state": team_state()}).encode()
             with socket.create_connection(server.server_address, timeout=2) as peer:
                 with peer.makefile("rb") as stream:
                     peer.sendall(("POST /v1/exchange HTTP/1.1\r\nHost: localhost\r\n"
@@ -168,21 +200,22 @@ class TransportTests(unittest.TestCase):
             self.assertNotIn("lua", records[0])
 
     def test_exclusive_listener_can_restart_after_a_completed_http_exchange(self):
-        bridge = GameBridge(TOKEN)
+        bridge = CompanionTeamBridge(TOKEN)
         server = serve_bridge(bridge, 0)
         port = server.server_port
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exchange",
-                data=json.dumps({"token": TOKEN, "session_id": "offline", "sequence": 1,
-                                 "state": state()}).encode(),
-                headers={"Content-Type": "application/json"})
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/exchange",
+                data=json.dumps({"token": TOKEN, "session_id": "offline", "sequence": 1, "state": team_state()}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
             with opener.open(request, timeout=3) as response:
                 self.assertEqual(json.load(response)["sequence"], 1)
         finally:
             server.shutdown()
             server.server_close()
-        replacement = serve_bridge(GameBridge(TOKEN), port)
+        replacement = serve_bridge(CompanionTeamBridge(TOKEN), port)
         replacement.shutdown()
         replacement.server_close()
 
@@ -202,12 +235,14 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(records[0]["http"]["continue_sent"])
 
     def test_lua_fields_are_bounded_numeric_and_content_free(self):
-        value = {"clock": "lua_real_seconds", "token": "do-not-log", "prompt": "do-not-log",
+        value = {
+            "clock": "lua_real_seconds", "token": "do-not-log", "prompt": "do-not-log",
             "sampling": {"ticks": 3, "sum_ms": {"navigation_ms": 2, "campfire_siting_ms": 1.5, "token": 123,
                                                  "state_total_ms": math.nan}, "max_ms": []},
             "previous_exchanges": [{"sequence": 1, "encode_ms": 2, "decode_ms": -3,
                                     "token": "do-not-log", "action_id": "a", "accepted": True},
-                                   {"sequence": 99, "encode_ms": 2}]}
+                                   {"sequence": 99, "encode_ms": 2}],
+        }
         result = lua_measurements(value, 2)
         self.assertEqual(result["sampling"]["sum_ms"], {"navigation_ms": 2, "campfire_siting_ms": 1.5})
         self.assertEqual(len(result["previous_exchanges"]), 1)
@@ -228,57 +263,78 @@ class TransportTests(unittest.TestCase):
 
     def test_real_http_phases_correlate_sequence_and_omit_bodies_and_bad_token_data(self):
         records = []
-        bridge = GameBridge(TOKEN)
-        with patch("mcp_server.game_bridge.TransportRecorder", return_value=SimpleNamespace(write=records.append)):
+        bridge = CompanionTeamBridge(TOKEN)
+        with patch("transport.http_bridge.TransportRecorder", return_value=SimpleNamespace(write=records.append)):
             server = serve_bridge(bridge, 0)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        def post(payload):
-            req = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/v1/exchange",
-                data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+
+        def post(srv, payload):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.server_port}/v1/exchange",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
             with opener.open(req, timeout=3) as response:
                 return json.load(response)
-        def await_records(count):
-            deadline = time.monotonic()+2
-            while len(records) < count and time.monotonic() < deadline:
+
+        def await_records(buf, count):
+            deadline = time.monotonic() + 2
+            while len(buf) < count and time.monotonic() < deadline:
                 time.sleep(0.001)
-            self.assertEqual(len(records), count)
+            self.assertEqual(len(buf), count)
+
         try:
-            payload = {"token": TOKEN, "session_id": "offline", "sequence": 2, "state": state(),
-                "measurement": {"clock": "lua_real_seconds", "token": TOKEN,
+            payload = {
+                "token": TOKEN, "session_id": "offline", "sequence": 2, "state": team_state(),
+                "measurement": {
+                    "clock": "lua_real_seconds", "token": TOKEN,
                     "sampling": {"ticks": 1, "sum_ms": {"navigation_ms": 1}},
-                    "previous_exchanges": [{"sequence": 1, "encode_ms": 0.2}]}}
-            result = post(payload)
+                    "previous_exchanges": [{"sequence": 1, "encode_ms": 0.2}],
+                },
+            }
+            result = post(server, payload)
             self.assertEqual(result["sequence"], 2)
-            await_records(1)
+            await_records(records, 1)
             record = records[0]
             self.assertEqual(record["session_id"], "offline")
             self.assertEqual(record["sequence"], 2)
             self.assertTrue(record["response_written"])
             self.assertEqual(record["lua"]["previous_exchanges"][0]["sequence"], 1)
             self.assertNotIn(TOKEN, json.dumps(record))
-            self.assertNotIn("player", json.dumps(record))
-            for key in ("body_read_ms", "json_decode_ms", "lock_wait_ms", "state_copy_ms", "exchange_ms",
-                        "json_encode_ms", "headers_write_ms", "body_write_ms"):
+            self.assertNotIn("members", json.dumps(record))
+            for key in (
+                "body_read_ms", "json_decode_ms", "lock_wait_ms", "state_copy_ms",
+                "exchange_ms", "json_encode_ms", "headers_write_ms", "body_write_ms",
+            ):
                 self.assertGreaterEqual(record["stages_ms"][key], 0)
                 self.assertLessEqual(record["stages_ms"][key], record["server_total_ms"])
             payload["token"] = "wrong"
             with self.assertRaises(urllib.error.HTTPError) as error:
-                post(payload)
+                post(server, payload)
             self.assertEqual(error.exception.code, 403)
-            await_records(2)
+            await_records(records, 2)
             self.assertNotIn("lua", records[1])
             self.assertNotIn("session_id", records[1])
-            post({"token": TOKEN, "session_id": "offline", "sequence": 3, "kind": "heartbeat",
-                  "control": {"board_revision": 0}, "snapshot_reason": "private-header-value"})
-            await_records(3)
-            self.assertEqual(records[2]["message_kind"], "heartbeat")
-            self.assertNotIn("state_copy_ms", records[2]["stages_ms"])
-            self.assertNotIn("snapshot_reason", records[2])
-            self.assertEqual(bridge.get_state()["state_version"], 2)
-            self.assertLess(records[2]["request_bytes"], records[0]["request_bytes"])
         finally:
             server.shutdown()
             server.server_close()
+
+        hb_records = []
+        with patch("transport.http_bridge.TransportRecorder", return_value=SimpleNamespace(write=hb_records.append)):
+            hb_server = serve_bridge(_HeartbeatLoopbackBridge(), 0)
+        try:
+            post(hb_server, {
+                "token": TOKEN, "session_id": "offline", "sequence": 3, "kind": "heartbeat",
+                "control": {"board_revision": 0}, "snapshot_reason": "private-header-value",
+            })
+            await_records(hb_records, 1)
+            self.assertEqual(hb_records[0]["message_kind"], "heartbeat")
+            self.assertNotIn("state_copy_ms", hb_records[0]["stages_ms"])
+            self.assertNotIn("snapshot_reason", hb_records[0])
+            self.assertLess(hb_records[0]["request_bytes"], records[0]["request_bytes"])
+        finally:
+            hb_server.shutdown()
+            hb_server.server_close()
 
 
 if __name__ == "__main__":

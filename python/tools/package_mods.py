@@ -10,12 +10,6 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parents[2]
 MODS = {
-    "dst_player_agent": {
-        "config_name": "jev_bridge_config.lua",
-        "port": 8765,
-        "mode": "player",
-        "run_stem": "2_run_player",
-    },
     "dst_buddy_agent": {
         "config_name": "jev_companion_config.lua",
         "port": 8766,
@@ -42,7 +36,7 @@ RUNNER_DOC_FILES = (
     "docs/WORKSHOP.md",
     "docs/AGENT_MEMORY_AND_BACKENDS.md",
 )
-RUNNER_PY_PACKAGES = ("common", "mcp_server", "mcp_agent")
+RUNNER_PY_PACKAGES = ("common", "transport", "mcp_server", "mcp_agent")
 
 
 def blank_config_lua(port: int) -> str:
@@ -276,9 +270,7 @@ def verify_workshop_dir(stage_dir: Path, mod_id: str) -> None:
         "runner/data/DSTKnowledge.txt",
         "runner/data/worldgen_resources.json",
         "runner/python/requirements-mcp.txt",
-        "runner/python/mcp_server/mcp_server.py",
         "runner/python/mcp_server/companion_server.py",
-        "runner/python/mcp_agent/mcp_agent.py",
         "runner/python/mcp_agent/companion_agent.py",
     ):
         if not (stage_dir / req_runner).is_file():

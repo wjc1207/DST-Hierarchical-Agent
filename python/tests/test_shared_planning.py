@@ -1,4 +1,4 @@
-"""Exercise both actor profiles against the real shared planning/task policies."""
+"""Exercise companion planning and shared task policies."""
 import copy
 import json
 import threading
@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from common.task_board import validate_board, board_view
-from mcp_agent import daily_planner, companion_planner, planning_core
+from mcp_agent import companion_planner, planning_core
 from mcp_agent.companion_tasks import CompanionTasks, actor_state, validate_board as companion_board
 from mcp_agent.priority_board import PriorityBoardExecutor, idle_review_reason
 
@@ -39,7 +39,7 @@ class SharedTaskTests(unittest.TestCase):
     def test_a_satisfied_target_cannot_latch_before_its_dependencies_are_finished(self):
         raw = board(task("grass"), task("twigs", "twigs", depends_on=["grass"]))
         observed = observation();observed["buddy"]["inventory"] = {"twigs": 3}
-        for runtime, clean in ((PriorityBoardExecutor(), daily_planner.validate_goals(raw, 1)),
+        for runtime, clean in ((PriorityBoardExecutor(), validate_board(raw, 1)),
                                (CompanionTasks().goals, companion_board(raw, 1))):
             runtime.adopt(clean)
             first = runtime.view(clean, actor_state(observed))
@@ -57,12 +57,12 @@ class SharedTaskTests(unittest.TestCase):
         raw = board(task("grass"), task("twigs", "twigs", depends_on=["grass"], start_at={"day": 1, "phase": "dusk"}))
         observed = observation()
         partner = CompanionTasks();partner.adopt(companion_board(raw, 1), observed)
-        player = PriorityBoardExecutor()
-        client_board = daily_planner.validate_goals(raw, 1);player.adopt(client_board)
+        shared_runtime = PriorityBoardExecutor()
+        client_board = validate_board(raw, 1);shared_runtime.adopt(client_board)
         for inventory, phase in (({}, "day"), ({"cutgrass": 3}, "day"), ({"cutgrass": 3}, "dusk")):
             observed["buddy"]["inventory"] = inventory;observed["world"]["phase"] = phase
             observed["version"] += 1
-            left, right = player.view(client_board, actor_state(observed)), partner.view(observed)
+            left, right = shared_runtime.view(client_board, actor_state(observed)), partner.view(observed)
             project = lambda view: [(t["id"], t["status"], t["progress"]) for t in view["tasks"]]
             self.assertEqual(project(left), project(right))
 
@@ -128,36 +128,29 @@ class SharedTaskTests(unittest.TestCase):
         normalized = actor_state(observed)
         self.assertNotIn("world_map", normalized)
         self.assertNotIn("hunger_max", normalized["player"]["vitals"])
-        board_view(daily_planner.validate_goals(board(task("grass")), 1), normalized)
+        board_view(validate_board(board(task("grass")), 1), normalized)
         self.assertEqual(observed, original)
 
 
 class SharedPlannerTests(unittest.TestCase):
-    def test_both_profiles_share_contract_token_budget_and_repair_a_truncated_response(self):
+    def test_companion_profile_uses_shared_contract_token_budget_and_repairs_truncated_response(self):
         raw = board(task("grass"))
         context = {"interaction": {"mode": "instruction", "instruction": "收集三根草"}, "observation": observation()}
-        for profile in ("player", "companion"):
-            with self.subTest(profile=profile):
-                with patch.object(planning_core.urllib.request, "urlopen", side_effect=[Response({}, "length"), Response(raw)]) as send:
-                    if profile == "player":
-                        result = daily_planner.request_plan("https://offline.invalid", "fake", "fake", 1, context)
-                    else:
-                        result = companion_planner.request_plan("https://offline.invalid", "fake", "fake", context, [], threading.Event())
-                self.assertEqual(result["kind"], "task_board")
-                self.assertEqual(send.call_count, 2)
-                body = json.loads(send.call_args.args[0].data)
-                self.assertEqual(body["max_tokens"], planning_core.PLAN_MAX_TOKENS)
-                self.assertIn(planning_core.PLANNING_RULES, body["messages"][0]["content"])
-                self.assertIn("finish_reason=length", body["messages"][-1]["content"])
+        with patch.object(planning_core.urllib.request, "urlopen", side_effect=[Response({}, "length"), Response(raw)]) as send:
+            result = companion_planner.request_plan("https://offline.invalid", "fake", "fake", context, [], threading.Event())
+        self.assertEqual(result["kind"], "task_board")
+        self.assertEqual(send.call_count, 2)
+        body = json.loads(send.call_args.args[0].data)
+        self.assertEqual(body["max_tokens"], planning_core.PLAN_MAX_TOKENS)
+        self.assertIn(planning_core.PLANNING_RULES, body["messages"][0]["content"])
+        self.assertIn("finish_reason=length", body["messages"][-1]["content"])
 
-    def test_completion_rejection_is_identical_for_both_profiles(self):
+    def test_completion_rejection_requires_finished_tasks(self):
         context = {"interaction": {"mode": "instruction"}, "observation": observation(),
                    "current_task_board": {"tasks": [{"status": "scheduled"}]}}
         raw = {"kind": "agent_reply", "outcome": "completed", "reply": "完成", "evidence": "完成了"}
-        for validate in (lambda: daily_planner.validate_agent_response(raw, 1, context),
-                         lambda: companion_planner.validate_plan(raw, context)):
-            with self.assertRaisesRegex(ValueError, "unfinished"):
-                validate()
+        with self.assertRaisesRegex(ValueError, "unfinished"):
+            companion_planner.validate_plan(raw, context)
 
     def test_companion_model_cannot_bypass_backend_capabilities_and_can_repair_its_plan(self):
         context = {"interaction": {"mode": "instruction"}, "observation": observation()}
@@ -172,7 +165,10 @@ class SharedPlannerTests(unittest.TestCase):
     def test_chat_reply_keeps_the_common_conversation_contract(self):
         context = {"interaction": {"mode": "instruction"}}
         raw = {"kind": "agent_reply", "outcome": "reply", "reply": "你好。"}
-        self.assertEqual(daily_planner.validate_agent_response(raw, 1, context), companion_planner.validate_plan(raw, context))
+        validated = companion_planner.validate_plan(raw, context)
+        self.assertEqual(validated["kind"], "agent_reply")
+        self.assertEqual(validated["outcome"], "reply")
+        self.assertEqual(validated["reply"], "你好。")
 
 
 if __name__ == "__main__":

@@ -140,13 +140,8 @@ function Ensure-DeepSeekEnv {
 }
 
 function Show-PairCommand([string]$VenvPython, [string]$Target) {
-    if ($Target -eq "buddy") {
-        $script = Join-Path $ProjectRoot "python\mcp_server\companion_server.py"
-        $label = "DST Buddy Agent (AI 伙伴)"
-    } else {
-        $script = Join-Path $ProjectRoot "python\mcp_server\mcp_server.py"
-        $label = "DST Player Agent (AI 角色操控)"
-    }
+    $script = Join-Path $ProjectRoot "python\mcp_server\companion_server.py"
+    $label = "DST Buddy Agent (主角托管 + AI 伙伴)"
     $pairCmd = (& $VenvPython $script --print-pair-command | Select-Object -First 1).Trim()
     if (-not $pairCmd) { throw "获取配对口令失败。" }
     try {
@@ -175,26 +170,28 @@ if ($CheckOnly) {
     exit 0
 }
 
+if ($Mode -eq "player") {
+    Write-Host "提示：纯客户端版 dst_player_agent 已归档至 archive/ 目录。主线 DST Buddy Agent 已支持 /buddy self（@自己）托管主角。" -ForegroundColor Yellow
+    Write-Host "如需运行历史归档客户端，请执行：python .\archive\python\mcp_agent\mcp_agent.py --loop --execute" -ForegroundColor Gray
+    exit 0
+}
+
 if (-not $Mode) {
     Write-Host ""
-    Write-Host "请选择要启动的模式："
-    Write-Host "  [1] DST Buddy Agent  - AI 伙伴模式（推荐，支持最多 2 名 AI 威尔逊）"
-    Write-Host "  [2] DST Player Agent - AI 角色操控模式（纯客户端，AI 操控你的角色）"
-    Write-Host "  [3] 仅生成/复制游戏内配对口令（Buddy 与 Player）"
+    Write-Host "请选择操作："
+    Write-Host "  [1] DST Buddy Agent（主角托管 @自己 + AI 伙伴，推荐）"
+    Write-Host "  [2] 仅生成/复制游戏内配对口令"
     $choice = (Read-Host "请输入编号 [默认 1]").Trim()
     switch ($choice) {
         ""  { $Mode = "buddy" }
         "1" { $Mode = "buddy" }
-        "2" { $Mode = "player" }
-        "3" { $Mode = "pair" }
+        "2" { $Mode = "pair" }
         default { throw "无效选项：$choice" }
     }
 }
 
 if ($Mode -eq "pair") {
-    Show-PairCommand $venvPython "player"
     Show-PairCommand $venvPython "buddy"
-    Write-Host "提示：最后一次复制到剪贴板的是 Buddy 配对口令。" -ForegroundColor Gray
     Read-Host "按回车键退出"
     exit 0
 }
@@ -227,12 +224,8 @@ if ($Backend -eq "deepseek") {
     }
 }
 
-Show-PairCommand $venvPython $Mode
+Show-PairCommand $venvPython "buddy"
 
 Write-Host "正在启动控制器（按 Ctrl+C 随时停止）..." -ForegroundColor Green
-if ($Mode -eq "buddy") {
-    & $venvPython (Join-Path $ProjectRoot "python\mcp_agent\companion_agent.py") --execute --backend $Backend
-} else {
-    & $venvPython (Join-Path $ProjectRoot "python\mcp_agent\mcp_agent.py") --loop --execute --backend $Backend
-}
+& $venvPython (Join-Path $ProjectRoot "python\mcp_agent\companion_agent.py") --execute --backend $Backend
 exit $LASTEXITCODE

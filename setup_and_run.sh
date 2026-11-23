@@ -67,15 +67,9 @@ copy_clipboard() {
 }
 
 show_pair() {
-    local target="$1"
     local script label cmd
-    if [ "$target" = "buddy" ]; then
-        script="$PROJECT_ROOT/python/mcp_server/companion_server.py"
-        label="DST Buddy Agent (AI 伙伴)"
-    else
-        script="$PROJECT_ROOT/python/mcp_server/mcp_server.py"
-        label="DST Player Agent (AI 角色操控)"
-    fi
+    script="$PROJECT_ROOT/python/mcp_server/companion_server.py"
+    label="DST Buddy Agent (主角托管 + AI 伙伴)"
     cmd="$("$VENV_PY" "$script" --print-pair-command)"
     echo ""
     echo "[$label] 游戏内配对口令（仅本机有效，请勿发给他人）："
@@ -117,20 +111,23 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     exit 0
 fi
 
+if [ "$MODE" = "player" ]; then
+    echo "提示：纯客户端版 dst_player_agent 已归档至 archive/。主线 DST Buddy Agent 已支持 /buddy self（@自己）托管主角。"
+    echo "如需运行历史归档客户端，请执行：$VENV_PY $PROJECT_ROOT/archive/python/mcp_agent/mcp_agent.py --loop --execute"
+    exit 0
+fi
+
 if [ -z "$MODE" ]; then
     echo ""
-    echo "请选择要启动的模式："
-    echo "  [1] DST Buddy Agent  - AI 伙伴模式（默认）"
-    echo "  [2] DST Player Agent - AI 角色操控模式"
-    echo "  [3] 仅显示游戏内配对口令"
+    echo "请选择操作："
+    echo "  [1] DST Buddy Agent（主角托管 @自己 + AI 伙伴，默认）"
+    echo "  [2] 仅显示游戏内配对口令"
     read -r -p "请输入编号 [默认 1]: " mode_choice
 
     case "${mode_choice:-1}" in
         1) MODE="buddy" ;;
-        2) MODE="player" ;;
-        3)
-            show_pair player
-            show_pair buddy
+        2)
+            show_pair
             exit 0
             ;;
         *) echo "无效选项：$mode_choice" >&2; exit 1 ;;
@@ -159,10 +156,6 @@ if [ "$BACKEND" = "deepseek" ]; then
     ensure_deepseek_env
 fi
 
-show_pair "$MODE"
+show_pair
 echo "正在启动控制器（按 Ctrl+C 停止）..."
-if [ "$MODE" = "buddy" ]; then
-    exec "$VENV_PY" "$PROJECT_ROOT/python/mcp_agent/companion_agent.py" --execute --backend "$BACKEND"
-else
-    exec "$VENV_PY" "$PROJECT_ROOT/python/mcp_agent/mcp_agent.py" --loop --execute --backend "$BACKEND"
-fi
+exec "$VENV_PY" "$PROJECT_ROOT/python/mcp_agent/companion_agent.py" --execute --backend "$BACKEND"

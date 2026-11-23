@@ -86,7 +86,7 @@ function M.new(G,E)
         if e:HasTag("burnt") or e:HasTag("INLIMBO") then
             known.invalid="unavailable";return nil,"building_unavailable"
         end
-        if e.components.burnable and e.components.burnable:IsBurning() and e.prefab~="campfire" and e.prefab~="firepit" then return nil,"building_burning" end
+        if e.components.burnable and e.components.burnable:IsBurning() and e.prefab~="campfire" and e.prefab~="firepit" and e.prefab~="coldfire" and e.prefab~="coldfirepit" then return nil,"building_burning" end
         return e
     end
     function P.start(a,q)

@@ -67,7 +67,7 @@ class TeamBridgeTests(unittest.TestCase):
         obs=self.bridge.member_call("observe",identity)
         return self.bridge.member_call("action",identity,"collect",obs["observation_id"],{"target_guid":guid})
     def test_pause_heartbeats_hold_dispatch_and_resume_with_fresh_credentials(self):
-        from mcp_server.game_bridge import BridgeError
+        from transport.http_bridge import BridgeError
 
         now = [0]
         self.bridge = CompanionTeamBridge(TOKEN, clock=lambda: now[0])
@@ -93,7 +93,7 @@ class TeamBridgeTests(unittest.TestCase):
         self.assertNotEqual(self.action("buddy2", 100)["id"], queued)
 
     def test_legacy_snapshot_is_rejected_without_resetting_team(self):
-        from mcp_server.game_bridge import BridgeError
+        from transport.http_bridge import BridgeError
 
         legacy = {"token": TOKEN, "session_id": "legacy", "sequence": 1, "state": state()}
         bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
@@ -690,7 +690,7 @@ class TeamMCPTests(unittest.IsolatedAsyncioTestCase):
         finally:stopped.set();await task
 
     def test_self_slot_coexists_with_two_buddies_and_rejects_reserved_name_on_buddies(self):
-        from mcp_server.game_bridge import BridgeError
+        from transport.http_bridge import BridgeError
 
         raw = team_state()
         self_entry = state()

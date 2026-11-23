@@ -10,13 +10,12 @@ from types import SimpleNamespace
 from typing import Any
 import uuid
 
-from common import autonomy, timing_log
+from common import timing_log
 from common.paths import PROJECT_ROOT
-from mcp_agent.compact_tasks import expand_tasks
 from mcp_agent.companion_planner import expand_assignment, validate_plan as validate_companion
-from mcp_agent.companion_tasks import capabilities
-from mcp_agent.priority_board import merge_goals, idle_review_reason, task_signature, PriorityBoardExecutor
-from mcp_server.game_bridge import BridgeError
+from mcp_agent.companion_tasks import capabilities, CompanionTasks
+from mcp_agent.priority_board import idle_review_reason, task_signature
+from transport.http_bridge import BridgeError
 
 
 internal_call = ContextVar("internal_game_tool", default=False)
@@ -40,9 +39,11 @@ class LocalTools:
 
 
 class TaskService:
-    def __init__(self, bridge, *, companion=False, poll=.2, timing_path=None):
+    def __init__(self, bridge, *, companion=True, poll=.2, timing_path=None):
+        if not companion:
+            raise ValueError("Unified TaskService supports companion=True only")
         self.bridge = bridge
-        self.companion = companion
+        self.companion = True
         self.poll = poll
         self.timing_path = timing_path
         self.host = None
@@ -57,7 +58,6 @@ class TaskService:
             yield
         finally:
             from anyio import CancelScope
-
             with CancelScope(shield=True):
                 self.worker.cancel()
                 with suppress(asyncio.CancelledError):
@@ -66,46 +66,28 @@ class TaskService:
 
     def make_host(self):
         client = LocalTools(self.server)
-        if self.companion:
-            from mcp_agent.companion_agent import CompanionTeamAgent
-            return CompanionTeamAgent(client, None, execute=True, log_path=PROJECT_ROOT / "logs/companion_agent.jsonl")
-        from mcp_agent.mcp_agent import MCPAgent
-        host = MCPAgent(client, execute=True, poll=self.poll)
-        host.external_board = True
-        return host
+        from mcp_agent.companion_agent import CompanionTeamAgent
+        return CompanionTeamAgent(client, None, execute=True, log_path=PROJECT_ROOT / "logs/companion_agent.jsonl")
 
     async def run(self):
-        from mcp_agent.mcp_agent import SessionChanged
         from mcp_agent.companion_agent import CycleDiagnostics
 
         self.host = self.make_host()
-        diagnostics = CycleDiagnostics(self.host) if self.companion else None
-        last_error = None
+        diagnostics = CycleDiagnostics(self.host)
         cycle = 0
         try:
             while True:
                 try:
                     cycle += 1
                     path = self.timing_path
-                    if path and (self.host.plan or self.host.active_id):
+                    if path:
                         with timing_log.CycleTrace(cycle, path, emit_console=False):
                             await self.host.cycle()
-                    elif self.companion or self.host.plan or self.host.active_id:
+                    else:
                         await self.host.cycle()
-                    if diagnostics:
-                        diagnostics.recovered()
-                    last_error = None
-                except SessionChanged:
-                    # A new player/session cannot inherit prior task or action ownership.
-                    self.host.execute = False
-                    await self.close_host()
-                    self.host = self.make_host()
+                    diagnostics.recovered()
                 except Exception as exc:
-                    if diagnostics:
-                        diagnostics.error(exc)
-                    elif str(exc) != last_error:
-                        last_error = str(exc)
-                        print(f"task_service_cycle_error: {last_error}", file=sys.stderr)
+                    diagnostics.error(exc)
                 await asyncio.sleep(self.poll)
         finally:
             with suppress(Exception):
@@ -113,18 +95,11 @@ class TaskService:
             self.host = None
 
     async def close_host(self):
-        if self.companion:
-            await self.host.close()
-        else:
-            await self.host.shutdown()
+        await self.host.close()
 
     def actor(self, buddy_id):
         if self.host is None:
             raise BridgeError("Task service is starting")
-        if not self.companion:
-            if buddy_id is not None:
-                raise BridgeError("Player board does not take a buddy_id")
-            return self.host, self.bridge.get_available_actions()
         team = self.bridge.observe()["state"]["members"]
         if buddy_id is None and len(team) == 1:
             buddy_id = next(iter(team))
@@ -135,76 +110,46 @@ class TaskService:
 
     def current(self, actor, packet):
         state = packet["state"]
-        if self.companion:
-            snapshot = state.get("companion") or {}
-            control = state["control"]
-            goal = control.get("goal") if control.get("mode") == "autonomous" else None
-            basis = (packet["session_id"], snapshot.get("token"), control["revision"],
-                     control.get("mode") == "autonomous", goal)
-            return actor.tasks.view(snapshot) if actor.basis == basis and actor.plan else None
-        if (actor.session != packet["session_id"] or actor.player_guid != state["player"].get("guid")
-                or actor.autonomy_revision != autonomy.revision(state) or not actor.plan):
-            return None
-        return actor.goals.view(actor.plan, state)
+        snapshot = state.get("companion") or {}
+        control = state["control"]
+        goal = control.get("goal") if control.get("mode") == "autonomous" else None
+        basis = (packet["session_id"], snapshot.get("token"), control["revision"],
+                 control.get("mode") == "autonomous", goal)
+        return actor.tasks.view(snapshot) if actor.basis == basis and actor.plan else None
 
     def prepare(self, actor, packet, raw, previous, *, replace=False):
-        from mcp_agent.companion_tasks import CompanionTasks
-        from mcp_agent.daily_planner import validate_player_board, planning_context
         state = packet["state"]
         rows = raw.get("tasks")
         if not isinstance(rows, list):
             raise BridgeError("tasks must be a list")
-        if self.companion:
-            observed = state["companion"]
-            if not state.get("ready") or (observed.get("buddy") or {}).get("dead") or not observed.get("bound"):
-                raise BridgeError("Companion is not ready to execute tasks")
-            context = {"observation": observed, "interaction": state["control"], "current_task_board": previous}
-            if any(isinstance(row, dict) and "type" in row for row in rows):
-                raw = expand_assignment(raw, context)
-            clean = validate_companion(raw, context)
-            runtime = deepcopy(actor.tasks) if previous else CompanionTasks()
-            if replace:
-                runtime.plan = clean
-                runtime.goals.adopt(clean)
-                board = clean
-            else:
-                board = runtime.adopt(clean, observed)
-            return board, runtime
-        if state.get("bridge", {}).get("protocol", 0) < 4:
-            raise BridgeError("Task scheduling requires player Mod protocol 4")
-        if not autonomy.enabled(state):
-            raise BridgeError("Enable character control in the game UI")
-        if state["player"].get("vitals", {}).get("dead"):
-            raise BridgeError("Player is dead")
-        context = {**planning_context(state, []), "current_task_board": previous}
-        clean = validate_player_board(raw, state["world"]["day"], context, map_seen=True)
-        return (clean if replace else merge_goals(previous, clean)), None
+        observed = state["companion"]
+        if not state.get("ready") or (observed.get("buddy") or {}).get("dead") or not observed.get("bound"):
+            raise BridgeError("Companion is not ready to execute tasks")
+        context = {"observation": observed, "interaction": state["control"], "current_task_board": previous}
+        if any(isinstance(row, dict) and "type" in row for row in rows):
+            raw = expand_assignment(raw, context)
+        clean = validate_companion(raw, context)
+        runtime = deepcopy(actor.tasks) if previous else CompanionTasks()
+        if replace:
+            runtime.plan = clean
+            runtime.goals.adopt(clean)
+            board = clean
+        else:
+            board = runtime.adopt(clean, observed)
+        return board, runtime
 
     def commit(self, actor, packet, board, runtime):
         state = packet["state"]
-        if self.companion:
-            snapshot, control = state["companion"], state["control"]
-            goal = control.get("goal") if control.get("mode") == "autonomous" else None
-            actor.basis = (packet["session_id"], snapshot.get("token"), control["revision"],
-                           control.get("mode") == "autonomous", goal)
-            actor.dialogue_revision = control.get("dialogue_revision")
-            actor.tasks, actor.observed = runtime, snapshot
-            actor.idle_marker = None
-            actor.finished_basis = None
-            actor.external_review_reason = None
-            actor.waiting_at = actor.waiting_position = None
-        else:
-            actor.session, actor.player_guid = packet["session_id"], state["player"].get("guid")
-            revision = autonomy.revision(state)
-            if revision != actor.autonomy_revision:
-                from mcp_agent.navigation_intents import ExplorationExecutor
-                actor.goals = PriorityBoardExecutor()
-                actor.navigator = ExplorationExecutor()
-            actor.autonomy_revision = revision
-            if board:
-                actor.goals.adopt(board)
-            else:
-                actor.goals.pause_accounting()
+        snapshot, control = state["companion"], state["control"]
+        goal = control.get("goal") if control.get("mode") == "autonomous" else None
+        actor.basis = (packet["session_id"], snapshot.get("token"), control["revision"],
+                       control.get("mode") == "autonomous", goal)
+        actor.dialogue_revision = control.get("dialogue_revision")
+        actor.tasks, actor.observed = runtime, snapshot
+        actor.idle_marker = None
+        actor.finished_basis = None
+        actor.external_review_reason = None
+        actor.waiting_at = actor.waiting_position = None
         actor.plan = board
 
     def check_manual_action(self, buddy_id=None):
@@ -212,59 +157,52 @@ class TaskService:
             return
         actor, packet = self.actor(buddy_id)
         board = self.current(actor, packet)
-        if (board and board.get("status") != "completed") or (actor.active if self.companion else actor.active_id):
+        if (board and board.get("status") != "completed") or actor.active:
             raise BridgeError("Scheduler owns this actor. Wait for its action and complete or delete its tasks before manual control.")
 
     def get(self, buddy_id):
         actor, packet = self.actor(buddy_id)
         board = self.current(actor, packet)
-        active = actor.active if self.companion else actor.active_id
+        active = actor.active
         reason = idle_review_reason(board)
-        if board and not reason and not self.companion:
-            reason = actor.goals.reason
-        return {"task_board": board, "active_action_id": active[0] if self.companion and active else active,
+        return {"task_board": board, "active_action_id": active[0] if active else None,
                 "review_reason": reason or None}
 
     def planning_state(self):
         """Capture game intent, boards and their submission versions together."""
         with self.bridge.lock:
-            team_state = self.bridge.observe()["state"] if self.companion else {}
+            team_state = self.bridge.observe()["state"]
             if team_state.get("paused"):
                 return {"paused": True, "members": {}, "interaction": team_state["control"]}
-            ids = list(team_state["members"]) if self.companion else ["player"]
             members = {}
-            for identity in ids:
-                actor, packet = self.actor(identity if self.companion else None)
+            for identity in team_state["members"]:
+                actor, packet = self.actor(identity)
                 state = packet["state"]
-                control = state["control"] if self.companion else state.get("autonomy") or {}
-                observed = state["companion"] if self.companion else state
+                control = state["control"]
+                observed = state["companion"]
                 board = self.current(actor, packet)
-                dead = bool(self.companion and (observed.get("buddy") or {}).get("dead"))
-                basis = [packet["session_id"], observed.get("token") if self.companion else state["player"].get("guid"),
+                dead = bool((observed.get("buddy") or {}).get("dead"))
+                basis = [packet["session_id"], observed.get("token"),
                          control.get("revision"), control.get("dialogue_revision"), dead]
                 intent_version = hashlib.sha256(json.dumps(basis).encode()).hexdigest()
                 basis.append((board or {}).get("board_id"))
                 version = hashlib.sha256(json.dumps(basis).encode()).hexdigest()
-                active = actor.active if self.companion else actor.goal_actions.get(actor.active_id)
+                active = actor.active
                 reason = idle_review_reason(board)
-                if board and self.companion:
+                if board:
                     advisory = actor.external_review_reason
                     if advisory in {"return_at_risk", "return_deadline_missed"} and reason != "all_tasks_completed":
                         reason = advisory
                     elif not reason and not active:
                         reason = advisory
-                elif board and not reason and not active:
-                    if actor.goals.reason not in {"", "waiting_for_start", "residence_holding", "maintenance_holding",
-                                                    "refuel_settling", "charcoal_burning", "search_budget_cooldown"}:
-                        reason = actor.goals.reason
                 members[identity] = {
                     "interaction": control, "observation": observed, "current_task_board": board,
                     "ready": state.get("ready", True) and not dead, "version": version, "intent_version": intent_version,
-                    "active_task_id": (active[1] if self.companion else active[0]) if active else None,
+                    "active_task_id": active[1] if active else None,
                     "review_reason": "buddy_dead" if dead else reason,
-                    **({"supported_capabilities": capabilities(observed)} if self.companion else {}),
+                    "supported_capabilities": capabilities(observed),
                 }
-            team = self.bridge.observe()["state"]["control"] if self.companion else {}
+            team = self.bridge.observe()["state"]["control"]
             return {"members": members, "interaction": team}
 
     def check_versions(self, versions, identities):
@@ -282,10 +220,10 @@ class TaskService:
     def reply(self, text, version, outcome, buddy_id, message_id):
         with self.bridge.lock:
             actor, packet = self.actor(buddy_id)
-            identity = actor.buddy_id if self.companion else "player"
+            identity = actor.buddy_id
             self.check_versions({identity: version}, [identity])
             state = packet["state"]
-            control = state["control"] if self.companion else state.get("autonomy") or {}
+            control = state["control"]
             board = self.current(actor, packet)
             if outcome == "completed" and control.get("mode") == "autonomous":
                 raise BridgeError("Autonomous mode continues after milestones; send an ordinary reply")
@@ -293,31 +231,26 @@ class TaskService:
                 raise BridgeError("Cannot complete while accepted tasks remain unfinished")
             finish = control.get("mode") == "instruction" and (
                 outcome == "completed" or outcome == "blocked" and (not board or not board.get("execution_task_ids")))
-            if self.companion:
-                return self.bridge.member_call("reply", identity, text, control["revision"], message_id, finish,
-                                               control.get("dialogue_revision"))
-            return self.bridge.send_agent_feedback(text, control["revision"], message_id, finish,
-                                                   control.get("dialogue_revision"))
+            return self.bridge.member_call("reply", identity, text, control["revision"], message_id, finish,
+                                           control.get("dialogue_revision"))
 
     def stop_changed_action(self, actor, packet, board):
-        active = actor.active if self.companion else actor.goal_actions.get(actor.active_id)
+        active = actor.active
         if not active:
             return
-        task_id = active[1] if self.companion else active[0]
+        task_id = active[1]
         if task_id is None:
             return
         old = next((task for task in actor.plan["tasks"] if task["id"] == task_id), None) if actor.plan else None
         new = next((task for task in board["tasks"] if task["id"] == task_id), None) if board else None
         if old and new and all(old.get(key) == new.get(key) for key in ("priority", "focus", "depends_on")) and task_signature(old) == task_signature(new):
             return
-        if self.companion:
-            record = self.bridge.member_call("action", actor.buddy_id, "stop", packet["observation_id"])
-            actor.active = (record["id"], None, "stop")
-            return task_id
-        self.bridge.cancel_action(actor.active_id)
+        record = self.bridge.member_call("action", actor.buddy_id, "stop", packet["observation_id"])
+        actor.active = (record["id"], None, "stop")
+        return task_id
 
     def submit(self, raw, buddy_id=None, observation_id=None, versions=None):
-        if not self.companion or "assignments" not in raw:
+        if "assignments" not in raw:
             assignments = [(buddy_id, raw)]
         else:
             assignments = raw["assignments"]
@@ -326,9 +259,7 @@ class TaskService:
             assignments = list(assignments.items())
         with self.bridge.lock:
             if observation_id is not None:
-                if self.companion:
-                    raise BridgeError("Companion boards use buddy_id or assignments")
-                self.bridge.validate_board_observation(observation_id)
+                raise BridgeError("Companion boards use buddy_id or assignments")
             staged = []
             for identity, plan in assignments:
                 actor, packet = self.actor(identity)
@@ -339,15 +270,14 @@ class TaskService:
                     plan = {**plan, "goal": (previous or {}).get("goal") or "MCP tasks"}
                 board, runtime = self.prepare(actor, packet, plan, previous)
                 staged.append((actor, packet, board, runtime))
-            self.check_versions(versions, [actor.buddy_id if self.companion else "player" for actor, _, _, _ in staged])
+            self.check_versions(versions, [actor.buddy_id for actor, _, _, _ in staged])
             for actor, packet, board, runtime in staged:
                 if self.stop_changed_action(actor, packet, board) and runtime:
                     runtime.pause_search()
             for actor, packet, board, runtime in staged:
                 board["board_id"] = uuid.uuid4().hex
                 self.commit(actor, packet, board, runtime)
-            boards = {(actor.buddy_id if self.companion else "player"): board
-                      for actor, _, board, _ in staged}
+            boards = {actor.buddy_id: board for actor, _, board, _ in staged}
             state = self.planning_state()["members"]
             return {"accepted": True, "boards": boards,
                     "versions": {identity: state[identity]["version"] for identity in boards}}
@@ -360,14 +290,10 @@ class TaskService:
             if task.get("id") in {row["id"] for row in rows}:
                 raise BridgeError("Task ID already exists; use update_task")
             context = {"observation": packet["state"].get("companion"), "current_task_board": previous}
-            if self.companion:
-                task = expand_assignment({"tasks": [task]}, context)["tasks"][0]
-            else:
-                task = expand_tasks([task], rows)[0]
+            task = expand_assignment({"tasks": [task]}, context)["tasks"][0]
             required = set(task["depends_on"]) if isinstance(task.get("depends_on"), list) and all(
                 isinstance(item, str) for item in task["depends_on"]) else set()
             prerequisites = [row for row in rows if row["id"] in required]
-            # Include the transitive prerequisite closure for the existing validator.
             while True:
                 required |= {item for row in prerequisites for item in row["depends_on"]}
                 closure = [row for row in rows if row["id"] in required]
@@ -397,9 +323,8 @@ class TaskService:
                 row = {key: value for key, value in old.items() if key in TASK_OPTIONS}
                 target = old["target"] if changes.get("type", old["target"]["type"]) == old["target"]["type"] else {}
                 row = {**row, **target, **changes, "id": task_id}
-                expanded = (expand_assignment({"tasks": [row]}, {"observation": packet["state"]["companion"],
-                            "current_task_board": previous})["tasks"] if self.companion
-                            else expand_tasks([row], previous["tasks"]))
+                expanded = expand_assignment({"tasks": [row]}, {"observation": packet["state"]["companion"],
+                            "current_task_board": previous})["tasks"]
                 rows = [expanded[0] if task["id"] == task_id else task for task in previous["tasks"]]
             if rows:
                 raw = {"goal": previous["goal"], "tasks": rows}
@@ -409,10 +334,7 @@ class TaskService:
                     raw["camp_site"] = previous["camp_site"]
                 board, runtime = self.prepare(actor, packet, raw, previous, replace=True)
             else:
-                board, runtime = None, None
-                if self.companion:
-                    from mcp_agent.companion_tasks import CompanionTasks
-                    runtime = CompanionTasks()
+                board, runtime = None, CompanionTasks()
             if self.stop_changed_action(actor, packet, board) and runtime:
                 runtime.pause_search()
             if board:
@@ -434,11 +356,6 @@ class TaskService:
                                     auto_execute: bool = True, buddy_id: str | None = None,
                                     versions: dict[str, str] | None = None) -> dict[str, Any]:
             """Merge a batch into the live Python board. Omitted tasks remain. Team batches use assignments keyed by buddy_id."""
-            if internal_call.get() and not self.companion:
-                # Existing internal Lua synchronization only releases a previous lease.
-                if auto_execute:
-                    raise ToolError("Automatic task boards run in Python")
-                return invoke(self.bridge.submit_task_board, board, observation_id, False)
             if not auto_execute:
                 raise ToolError("This tool starts Python task execution. Use delete_task to remove a task.")
             return invoke(self.submit, board, buddy_id, observation_id, versions)

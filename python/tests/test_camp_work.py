@@ -2,7 +2,6 @@ import copy
 import unittest
 
 from common.camp_work import query_meals, query_storage
-from mcp_agent import daily_planner
 from mcp_agent.priority_board import PriorityBoardExecutor, merge_goals, progress_signatures_match, task_signature
 from mcp_agent.navigation_intents import ExplorationExecutor
 from test_priority_board import board, state, task
@@ -180,9 +179,3 @@ class CampWorkTests(unittest.TestCase):
         self.state["camp_work"]["trees"][0]["status"] = "burnt"
         chop = {"chop": {"kind": "chop_nearest_tree", "charcoal_work": True, "guid": 55, "planner_only": True}}
         self.assertEqual(self.act(charcoal(True), {**ignition, **chop})[1], "chop")
-
-    def test_query_data_is_separate_from_persistent_planner_history(self):
-        ctx = daily_planner.planning_context(self.state, [])
-        self.assertEqual(query_meals(ctx["_camp_work"], "meatballs")["meals"], [MEAL])
-        self.assertNotIn('"_camp_work"', daily_planner.snapshot_message(ctx))
-        self.assertIn('"camp_work_summary"', daily_planner.snapshot_message(ctx))

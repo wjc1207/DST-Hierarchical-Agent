@@ -10,7 +10,7 @@ from common.task_board import board_view, validate_board
 from mcp_agent.companion_tasks import CompanionTasks, validate_board as validate_companion_board
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals
 from mcp_server.companion_bridge import CompanionBridge
-from mcp_server.game_bridge import BridgeError
+from transport.http_bridge import BridgeError
 
 TOKEN = "u" * 40
 
@@ -560,58 +560,15 @@ class Phase2CampWorkUnificationTests(unittest.TestCase):
         _, op2, args2 = tasks.next_action(obs2)
         self.assertEqual((op2, args2), ("work", {"target_guid": 801, "work": "CHOP"}))
 
-    def test_player_flat_equip_unequip_eat_drop_and_batch_storage_transfer(self):
-        from mcp_agent.daily_planner import validate_player_board
+    def test_camp_execution_batch_transfer_credits_verified_count(self):
         from mcp_agent import camp_execution
-        from mcp_server.game_bridge import GameBridge, BridgeError as PlayerBridgeError
 
-        ctx = {
-            "world": {"day": 2, "phase": "day", "time": 0.2},
-            "autonomy": {"enabled": True, "revision": 1, "mode": "instruction"},
-            "places": {"buildings": []},
-        }
-        plan = validate_player_board({
-            "goal": "Manage axe and items",
-            "tasks": [
-                {"id": "eq", "type": "equip", "prefab": "axe"},
-                {"id": "uneq", "type": "unequip", "prefab": "axe", "depends_on": ["eq"]},
-                {"id": "eat1", "type": "eat", "prefab": "berries", "count": 1},
-                {"id": "drop1", "type": "drop_item", "prefab": "cutgrass", "count": 2},
-            ],
-        }, 2, ctx, map_seen=False)
-        self.assertEqual([t["target"]["type"] for t in plan["tasks"]], ["equip", "unequip", "eat", "drop_item"])
-
-        # Batch transfer completion credits exact verified count
         rec = {}
         camp_execution.on_completed(
             {"type": "deposit", "building_id": "building:60", "prefab": "berries", "count": 10},
             rec, {"kind": "store_item"}, "items_transferred:10", {},
         )
         self.assertEqual(rec["camp_count"], 10)
-
-        # GameBridge validates transfer_count on store_item/take_item
-        bridge = GameBridge(TOKEN)
-        snap = {
-            "player": {"guid": 1, "position": {"x": 0, "z": 0}, "vitals": {}, "inventory": {"items": [], "equipped": []}},
-            "world": {"day": 1, "phase": "day", "time": 0.2},
-            "autonomy": {"enabled": True, "revision": 1},
-            "bridge": {"available_actions": {
-                "store_item:60:inventory:1": {"kind": "store_item", "building_id": "building:60", "product": "berries", "available": 10},
-                "equip_item:axe": {"kind": "equip_item", "prefab": "axe", "guid": 101},
-                "unequip_item:axe": {"kind": "unequip_item", "prefab": "axe", "guid": 101, "slot": "hands"},
-                "eat_item:berries": {"kind": "eat_item", "prefab": "berries", "guid": 102},
-                "drop_item:cutgrass": {"kind": "drop_item", "prefab": "cutgrass", "guid": 103},
-                "wait": {"kind": "wait"},
-            }},
-        }
-        bridge.exchange({"token": TOKEN, "session_id": "s1", "sequence": 1, "state": snap})
-        avail = bridge.get_available_actions()
-        obs_id = avail["observation_id"]
-        self.assertTrue({"equip_item:axe", "unequip_item:axe", "eat_item:berries", "drop_item:cutgrass"} <= set(avail["actions"]))
-        with self.assertRaises(PlayerBridgeError):
-            bridge.start_action("wait", obs_id, transfer_count=5)
-        rec_action = bridge.start_action("store_item:60:inventory:1", obs_id, transfer_count=10)
-        self.assertEqual(rec_action["action"]["transfer_count"], 10)
 
     def test_companion_combat_auto_equips_armor_weapon_and_kills_or_retreats(self):
         tasks = CompanionTasks(clock=lambda: 10.0)
@@ -707,6 +664,265 @@ class Phase2CampWorkUnificationTests(unittest.TestCase):
             self.assertEqual(rec_m["op"], "start_meal")
             bridge.actions[rec_m["id"]]["status"] = "completed"
             bridge.active = None
+
+    def test_companion_health_ratio_heals_then_falls_back_to_food_and_requires_missing(self):
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["heal"]),
+            healers=[{"guid": 501, "prefab": "healingsalve", "count": 1, "health_delta": 20}],
+            foods=[
+                {"guid": 502, "prefab": "perogies", "count": 1, "hunger_delta": 37.5, "sanity_delta": 5, "health_delta": 40},
+                {"guid": 503, "prefab": "monstermeat", "count": 1, "hunger_delta": 18.75, "sanity_delta": -20, "health_delta": -20},
+            ],
+        )
+        obs["buddy"].update(health=50, health_max=150)
+        tasks.adopt({
+            "day": 1, "goal": "Recover health",
+            "tasks": [{"id": "heal1", "title": "Heal to 60%", "priority": 1, "target": {"type": "health_ratio", "at_least": 0.6}}],
+        }, obs)
+
+        # 1. Uses carried healer first
+        _, op1, args1 = tasks.next_action(obs)
+        self.assertEqual(op1, "heal")
+        self.assertEqual(args1["prefab"], "healingsalve")
+        self.assertEqual(args1["total_count"], 1)
+        tasks.on_result("heal1", {"op": "heal", "status": "completed", "reason": "healed",
+                                  "data": {"task_key": args1["task_key"], "count": 1}}, obs)
+
+        # 2. Healer spent; falls back to safe healing food
+        obs["healers"] = []
+        obs["buddy"]["health"] = 70
+        _, op2, args2 = tasks.next_action(obs)
+        self.assertEqual(op2, "eat")
+        self.assertEqual(args2["prefab"], "perogies")
+        self.assertEqual(args2["total_count"], 1)
+        tasks.on_result("heal1", {"op": "eat", "status": "completed", "reason": "food_eaten",
+                                  "data": {"task_key": args2["task_key"], "count": 1}}, obs)
+
+        # 3. Still below target with no healers or healing food -> needs_replan
+        obs["foods"] = []
+        obs["buddy"]["health"] = 75
+        _, op3, args3 = tasks.next_action(obs)
+        self.assertEqual((op3, args3), ("needs_replan", {"reason": "healing_item_missing"}))
+
+        # 4. At >=60% health completes target
+        obs["buddy"]["health"] = 95
+        self.assertEqual(tasks.view(obs)["status"], "completed")
+
+    def test_companion_thermal_comfort_winter_summer_and_rain_and_coldfire_pause(self):
+        from common.thermal import refuel_pause
+        from mcp_agent.companion_tasks import actor_state
+
+        # Winter: equips winterhat -> visits firepit -> refuels with log -> waits until warm
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal", "refuel", "visit_building"]),
+            equipment=[
+                {"guid": 601, "prefab": "winterhat", "slot": "head", "equipped": False, "usable": True,
+                 "tools": [], "insulation": 120, "insulation_type": "winter"},
+            ],
+            refueling={"available": True, "ratio_available": True,
+                       "targets": [{"building_id": "building:80", "guid": 80, "prefab": "firepit",
+                                    "is_cold": False, "lit": False, "fuel_percent": 0.0}]},
+        )
+        obs["buddy"].update(temperature=4.0, inventory={"log": 2, "winterhat": 1})
+        obs["places"]["buildings"].append({"id": "building:80", "guid": 80, "prefab": "firepit",
+                                           "status": "observed", "arrived": False, "distance": 6.0})
+        tasks.adopt({
+            "day": 1, "goal": "Stay warm",
+            "tasks": [{"id": "therm", "title": "Thermal comfort", "priority": 1,
+                       "target": {"type": "thermal_comfort", "min_temp": 18, "max_temp": 55}}],
+        }, obs)
+        _, op, args = tasks.next_action(obs)
+        self.assertEqual((op, args), ("equip", {"item_guid": 601}))
+        obs["equipment"][0]["equipped"] = True
+
+        _, op, args = tasks.next_action(obs)
+        self.assertEqual((op, args), ("visit_building", {"building_id": "building:80"}))
+        obs["places"]["buildings"][-1]["arrived"] = True
+
+        _, op, args = tasks.next_action(obs)
+        self.assertEqual(op, "refuel")
+        self.assertEqual((args["building_id"], args["fuel_prefab"]), ("building:80", "log"))
+        obs["refueling"]["targets"][0].update(lit=True, fuel_percent=0.5)
+
+        _, op, _ = tasks.next_action(obs)
+        self.assertEqual(op, "waiting")
+
+        # Summer: overheating equips strawhat + umbrella -> visits coldfirepit -> refuels nitre (not paused by heat!)
+        hot_obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal", "refuel", "visit_building"]),
+            equipment=[
+                {"guid": 602, "prefab": "strawhat", "slot": "head", "equipped": False, "usable": True,
+                 "tools": [], "insulation": 60, "insulation_type": "summer", "waterproof": 0.2},
+                {"guid": 603, "prefab": "umbrella", "slot": "hands", "equipped": False, "usable": True,
+                 "tools": [], "insulation": 120, "insulation_type": "summer", "waterproof": 0.9},
+            ],
+            refueling={"available": True, "ratio_available": True,
+                       "targets": [{"building_id": "building:81", "guid": 81, "prefab": "coldfirepit",
+                                    "is_cold": True, "lit": True, "fuel_percent": 0.1}]},
+        )
+        hot_obs["buddy"].update(temperature=68.0, overheating=True, inventory={"nitre": 2})
+        hot_obs["places"]["buildings"].append({"id": "building:81", "guid": 81, "prefab": "coldfirepit",
+                                               "status": "observed", "arrived": True, "distance": 2.0})
+        self.assertEqual(refuel_pause({"type": "refuel", "building_id": "building:81", "fuel_prefab": "nitre", "count": 1},
+                                      actor_state(hot_obs)), "")
+        t_hot = CompanionTasks(clock=lambda: 10.0)
+        t_hot.adopt({
+            "day": 1, "goal": "Cool down",
+            "tasks": [{"id": "cool", "title": "Cool down", "priority": 1,
+                       "target": {"type": "thermal_comfort", "min_temp": 15, "max_temp": 50}}],
+        }, hot_obs)
+        self.assertEqual(t_hot.next_action(hot_obs)[1:], ("equip", {"item_guid": 602}))
+        hot_obs["equipment"][0]["equipped"] = True
+        self.assertEqual(t_hot.next_action(hot_obs)[1:], ("equip", {"item_guid": 603}))
+        hot_obs["equipment"][1]["equipped"] = True
+        _, op_cold, args_cold = t_hot.next_action(hot_obs)
+        self.assertEqual(op_cold, "refuel")
+        self.assertEqual((args_cold["building_id"], args_cold["fuel_prefab"]), ("building:81", "nitre"))
+        hot_obs["buddy"].update(temperature=25.0, overheating=False)
+        self.assertEqual(t_hot.view(hot_obs)["status"], "completed")
+
+        # Rain maintenance: equips umbrella when wet
+        rain_tasks = CompanionTasks(clock=lambda: 10.0)
+        rain_obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal"]),
+            equipment=[{"guid": 604, "prefab": "umbrella", "slot": "hands", "equipped": False, "usable": True,
+                        "tools": [], "waterproof": 0.9}],
+        )
+        rain_obs["buddy"].update(temperature=25.0, moisture=35.0)
+        rain_obs["world"]["israining"] = True
+        rain_tasks.adopt({
+            "day": 1, "goal": "Keep dry",
+            "tasks": [{"id": "dry", "title": "Stay dry", "priority": 1, "duration": 0.2,
+                       "target": {"type": "thermal_comfort", "min_temp": 15, "max_temp": 55}}],
+        }, rain_obs)
+        self.assertEqual(rain_tasks.next_action(rain_obs)[1:], ("equip", {"item_guid": 604}))
+
+    def test_companion_thermal_comfort_winter_crafts_gear_heatrock_places_fire_and_roasts(self):
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal", "refuel", "visit_building"]),
+            recipes={
+                "winterhat": {"recipe_id": "winterhat", "product": "winterhat", "placement": False, "supported": True, "ready": True},
+                "heatrock": {"recipe_id": "heatrock", "product": "heatrock", "placement": False, "supported": True, "ready": True},
+                "firepit": {"recipe_id": "firepit", "product": "firepit", "placement": True, "supported": True, "ready": True},
+            },
+            places={"available": True, "scope": "companion_observed_buildings", "identity": "server_guid", "buildings": []},
+            thermal={"stones": [], "winter_insulation": 0, "summer_insulation": 0, "waterproof": 0},
+        )
+        obs["world"]["season"] = "winter"
+        obs["buddy"].update(temperature=4.0, position={"x": 2.0, "z": 3.0}, inventory={"log": 3})
+        tasks.adopt({
+            "day": 1, "goal": "Prepare winter gear and roast thermal stone",
+            "tasks": [{"id": "w1", "title": "Winter survival", "priority": 1,
+                       "target": {"type": "thermal_comfort", "min_temp": 18, "max_temp": 55, "charge_heatrock": "warm"}}],
+        }, obs)
+
+        # 1. Craft winterhat -> equip -> craft heatrock -> place firepit -> refuel -> roast stone >= 45C
+        self.assertEqual(tasks.next_action(obs)[1:], ("craft", {"recipe_id": "winterhat"}))
+        obs["equipment"] = [{"guid": 701, "prefab": "winterhat", "slot": "head", "equipped": False,
+                             "usable": True, "tools": [], "insulation": 120, "insulation_type": "winter"}]
+        self.assertEqual(tasks.next_action(obs)[1:], ("equip", {"item_guid": 701}))
+        obs["equipment"][0]["equipped"] = True
+
+        self.assertEqual(tasks.next_action(obs)[1:], ("craft", {"recipe_id": "heatrock"}))
+        obs["thermal"]["stones"] = [{"guid": 702, "prefab": "heatrock", "temperature": 20.0, "range": 3, "durability": 1.0}]
+
+        self.assertEqual(tasks.next_action(obs)[1:], ("place", {"recipe_id": "firepit", "x": 2.0, "z": 3.0, "radius": 6}))
+        obs["places"]["buildings"].append({"id": "building:90", "guid": 90, "prefab": "firepit",
+                                           "status": "observed", "arrived": True, "distance": 1.5})
+        obs["refueling"] = {"available": True, "ratio_available": True,
+                            "targets": [{"building_id": "building:90", "guid": 90, "prefab": "firepit",
+                                         "is_cold": False, "lit": True, "fuel_percent": 0.30}]}
+        obs["buddy"]["temperature"] = 25.0  # Body temp ok, but heatrock still 20C < 45C and fire fuel 0.30 < 0.45!
+        _, op_ref, args_ref = tasks.next_action(obs)
+        self.assertEqual(op_ref, "refuel")
+        self.assertEqual((args_ref["building_id"], args_ref["fuel_prefab"]), ("building:90", "log"))
+        obs["refueling"]["targets"][0]["fuel_percent"] = 0.65
+        self.assertEqual(tasks.next_action(obs)[1:], ("waiting", {}))
+
+        obs["thermal"]["stones"][0]["temperature"] = 48.0
+        self.assertEqual(tasks.view(obs)["status"], "completed")
+
+    def test_companion_thermal_comfort_summer_ignores_firepit_places_coldfire_and_chills_heatrock(self):
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal", "refuel", "visit_building"]),
+            recipes={
+                "strawhat": {"recipe_id": "strawhat", "product": "strawhat", "placement": False, "supported": True, "ready": True},
+                "coldfire": {"recipe_id": "coldfire", "product": "coldfire", "placement": True, "supported": True, "ready": True},
+            },
+            thermal={"stones": [{"guid": 710, "prefab": "heatrock", "temperature": 38.0, "range": 4, "durability": 1.0}],
+                     "winter_insulation": 0, "summer_insulation": 0, "waterproof": 0},
+        )
+        # Note companion_obs() already has building:40 firepit in places; Summer must ignore it and place coldfire.
+        obs["world"]["season"] = "summer"
+        obs["buddy"].update(temperature=66.0, overheating=True, position={"x": -2.0, "z": 1.0}, inventory={"nitre": 2})
+        tasks.adopt({
+            "day": 1, "goal": "Cool down in summer",
+            "tasks": [{"id": "s1", "title": "Summer survival", "priority": 1,
+                       "target": {"type": "thermal_comfort", "min_temp": 12, "max_temp": 45, "charge_heatrock": "cool"}}],
+        }, obs)
+
+        self.assertEqual(tasks.next_action(obs)[1:], ("craft", {"recipe_id": "strawhat"}))
+        obs["equipment"] = [{"guid": 711, "prefab": "strawhat", "slot": "head", "equipped": True,
+                             "usable": True, "tools": [], "insulation": 60, "insulation_type": "summer"}]
+        self.assertEqual(tasks.next_action(obs)[1:], ("place", {"recipe_id": "coldfire", "x": -2.0, "z": 1.0, "radius": 6}))
+
+        obs["places"]["buildings"].append({"id": "building:91", "guid": 91, "prefab": "coldfire",
+                                           "status": "observed", "arrived": True, "distance": 1.5})
+        obs["refueling"] = {"available": True, "ratio_available": True,
+                            "targets": [{"building_id": "building:91", "guid": 91, "prefab": "coldfire",
+                                         "is_cold": True, "lit": True, "fuel_percent": 0.30}]}
+        obs["buddy"].update(temperature=35.0, overheating=False)  # Body temp cooled, heatrock still 38C > 20C
+        _, op_ref, args_ref = tasks.next_action(obs)
+        self.assertEqual(op_ref, "refuel")
+        self.assertEqual((args_ref["building_id"], args_ref["fuel_prefab"]), ("building:91", "nitre"))
+        obs["thermal"]["stones"][0]["temperature"] = 18.0
+        self.assertEqual(tasks.view(obs)["status"], "completed")
+
+    def test_companion_spring_rain_drying_and_seasonal_alert_reflex(self):
+        from mcp_agent.companion_agent import seasonal_alert_reason
+
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal", "visit_building", "refuel"]),
+            recipes={"grass_umbrella": {"recipe_id": "grass_umbrella", "product": "grass_umbrella",
+                                        "placement": False, "supported": True, "ready": True}},
+        )
+        obs["world"].update(season="spring", israining=True)
+        obs["buddy"].update(temperature=25.0, moisture=55.0)
+        tasks.adopt({
+            "day": 1, "goal": "Dry off in spring rain",
+            "tasks": [{"id": "r1", "title": "Stay dry", "priority": 1,
+                       "target": {"type": "thermal_comfort", "min_temp": 12, "max_temp": 55, "max_moisture": 40}}],
+        }, obs)
+
+        self.assertEqual(tasks.next_action(obs)[1:], ("craft", {"recipe_id": "grass_umbrella"}))
+        obs["equipment"] = [{"guid": 720, "prefab": "grass_umbrella", "slot": "hands", "equipped": True,
+                             "usable": True, "tools": [], "waterproof": 0.5}]
+        # Still wet (55 > 40): travels to firepit (building:40) to dry off
+        self.assertEqual(tasks.next_action(obs)[1:], ("visit_building", {"building_id": "building:40"}))
+        obs["buddy"]["moisture"] = 35.0
+        self.assertEqual(tasks.view(obs)["status"], "completed")
+
+        # Autonomous seasonal alert reflex triggers on freezing/overheating/wet and suppresses if thermal_comfort active
+        alert_obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["thermal"]),
+            equipment=[{"guid": 721, "prefab": "umbrella", "slot": "hands", "equipped": False, "usable": True,
+                        "tools": [], "waterproof": 0.9}],
+        )
+        alert_obs["buddy"].update(temperature=6.0, freezing=True)
+        self.assertEqual(seasonal_alert_reason(alert_obs, {"tasks": []}), "thermal_emergency_freezing")
+        self.assertIsNone(seasonal_alert_reason(alert_obs, {"tasks": [
+            {"id": "t", "status": "in_progress", "target": {"type": "thermal_comfort"}}
+        ]}))
+        alert_obs["buddy"].update(temperature=64.0, freezing=False, overheating=True)
+        self.assertEqual(seasonal_alert_reason(alert_obs, {"tasks": []}), "thermal_emergency_overheating")
+        alert_obs["buddy"].update(temperature=24.0, overheating=False, moisture=45.0)
+        alert_obs["world"]["israining"] = True
+        self.assertEqual(seasonal_alert_reason(alert_obs, {"tasks": []}), "thermal_emergency_wet")
 
 
 if __name__ == "__main__":

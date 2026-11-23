@@ -46,19 +46,17 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                 f"/buddy pair {token1} 9002",
             )
 
-    def test_cli_print_pair_command_for_all_four_entrypoints(self):
+    def test_cli_print_pair_command_for_unified_entrypoints(self):
         cases = [
-            ("mcp_server/mcp_server.py", "/agent", 8765, 9101),
-            ("mcp_server/companion_server.py", "/buddy", 8766, 9102),
-            ("mcp_agent/mcp_agent.py", "/agent", 8765, 9103),
-            ("mcp_agent/companion_agent.py", "/buddy", 8766, 9104),
+            (PYTHON_ROOT / "mcp_server/companion_server.py", "/buddy", 8766, 9102),
+            (PYTHON_ROOT / "mcp_agent/companion_agent.py", "/buddy", 8766, 9104),
         ]
         with tempfile.TemporaryDirectory(dir=PYTHON_ROOT / "tests") as folder:
             for idx, (script, prefix, default_port, custom_port) in enumerate(cases):
                 cfg = Path(folder) / f"cfg_{idx}.json"
-                with self.subTest(script=script, mode="default_port"):
+                with self.subTest(script=str(script), mode="default_port"):
                     res = subprocess.run(
-                        [sys.executable, str(PYTHON_ROOT / script),
+                        [sys.executable, str(script),
                          "--config", str(cfg), "--port", str(default_port), "--print-pair-command"],
                         cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=10,
                     )
@@ -67,29 +65,20 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                     token = json.loads(cfg.read_text(encoding="utf-8"))["token"]
                     self.assertEqual(line, f"{prefix} pair {token}")
                     self.assertNotIn("Traceback", res.stderr)
-                with self.subTest(script=script, mode="custom_port"):
+                with self.subTest(script=str(script), mode="custom_port"):
                     res2 = subprocess.run(
-                        [sys.executable, str(PYTHON_ROOT / script),
+                        [sys.executable, str(script),
                          "--config", str(cfg), "--port", str(custom_port), "--print-pair-command"],
                         cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=10,
                     )
                     self.assertEqual(res2.returncode, 0, res2.stderr)
                     self.assertEqual(res2.stdout.strip(), f"{prefix} pair {token} {custom_port}")
 
-    def test_lua_pairing_and_setup_modules_match_and_intercept_locally(self):
-        player_lua = (PROJECT_ROOT / "mods/dst_player_agent/scripts/jev_bridge_pairing.lua").read_text(encoding="utf-8")
+    def test_lua_pairing_and_setup_modules_intercept_locally(self):
         buddy_lua = (PROJECT_ROOT / "mods/dst_buddy_agent/scripts/jev_bridge_pairing.lua").read_text(encoding="utf-8")
-        self.assertEqual(player_lua, buddy_lua)
-        self.assertIn("SetPersistentString", player_lua)
-        self.assertIn("GetPersistentString", player_lua)
-        self.assertIn('if cmd == "setup" then', player_lua)
-
-        player_ui = (PROJECT_ROOT / "mods/dst_player_agent/scripts/jev_autonomy_ui.lua").read_text(encoding="utf-8")
-        self.assertIn('Pairing.parse(text,"/agent",8765,true)', player_ui)
-        self.assertIn('elseif p_action=="setup" then', player_ui)
-        self.assertIn("1_install_agent.bat", player_ui)
-        self.assertIn("2_run_player.bat", player_ui)
-        self.assertLess(player_ui.index("Pairing.parse"), player_ui.index("return run(self,...)"))
+        self.assertIn("SetPersistentString", buddy_lua)
+        self.assertIn("GetPersistentString", buddy_lua)
+        self.assertIn('if cmd == "setup" then', buddy_lua)
 
         buddy_main = (PROJECT_ROOT / "mods/dst_buddy_agent/modmain.lua").read_text(encoding="utf-8")
         self.assertIn('Pairing.parse(text,"/buddy",8766,false)', buddy_main)
@@ -99,10 +88,7 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
         self.assertIn("2_run_buddy.bat", buddy_main)
         self.assertIn('"jev_buddy_bridge_v1"', buddy_main)
         self.assertIn('version="0.9.0"', buddy_main)
-
-        player_main = (PROJECT_ROOT / "mods/dst_player_agent/modmain.lua").read_text(encoding="utf-8")
-        self.assertIn('"jev_player_bridge_v1"', player_main)
-        self.assertIn("MODROOT", player_main)
+        self.assertLess(buddy_main.index("Pairing.parse"), buddy_main.index("return run(self,...)"))
 
     def test_package_mods_produces_self_contained_workshop_dirs_and_clean_zips(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
@@ -113,8 +99,10 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0, res.stderr)
 
+            self.assertEqual(list(package_mods.MODS), ["dst_buddy_agent"])
+            self.assertFalse((out_dir / "workshop" / "dst_player_agent").exists())
+            self.assertFalse((out_dir / "dst_player_agent.zip").exists())
             expected_versions = {
-                "dst_player_agent": "1.9.1",
                 "dst_buddy_agent": "0.9.0",
             }
             for mod_id, meta in package_mods.MODS.items():
@@ -172,9 +160,9 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                     "dst_agent_runner/data/worldgen_resources.json",
                     "dst_agent_runner/python/requirements-mcp.txt",
                     "dst_agent_runner/python/common/pairing.py",
-                    "dst_agent_runner/python/mcp_server/mcp_server.py",
+                    "dst_agent_runner/python/transport/http_bridge.py",
+                    "dst_agent_runner/python/transport/metrics.py",
                     "dst_agent_runner/python/mcp_server/companion_server.py",
-                    "dst_agent_runner/python/mcp_agent/mcp_agent.py",
                     "dst_agent_runner/python/mcp_agent/companion_agent.py",
                 ):
                     self.assertIn(required, names)
@@ -212,7 +200,7 @@ class WorkshopPairingAndPackagingTests(unittest.TestCase):
                 self.assertEqual((install_dir / "logs" / "companion_bridge.json").read_text(encoding="utf-8"), '{"token":"keep"}')
                 self.assertEqual((install_dir / "data" / "agent_memory" / "global.md").read_text(encoding="utf-8"), "keep-memory")
                 self.assertTrue((install_dir / "run_buddy.bat").is_file())
-                self.assertTrue((install_dir / "run_player.bat").is_file())
+                self.assertFalse((install_dir / "run_player.bat").exists())
                 self.assertTrue((install_dir / "data" / "DSTKnowledge.txt").is_file())
                 self.assertTrue((install_dir / "python" / "mcp_agent" / "companion_agent.py").is_file())
                 self.assertEqual(

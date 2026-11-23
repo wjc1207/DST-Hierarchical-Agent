@@ -14,7 +14,7 @@ from common.places import PLACE_TARGETS, target_progress as building_progress
 from common.placement import validate as validate_placement, resolve as placement_area, inside as inside_placement
 from common.refueling import (validate_target as validate_refuel, maintenance_state as fire_maintenance_state,
                               target_error as refuel_error, has_fuel)
-from common.thermal import refuel_pause
+from common.thermal import seasonal_gear_equip, thermal_comfort_status, refuel_pause
 from mcp_agent import camp_execution
 from mcp_agent.priority_board import PriorityBoardExecutor, validate_goals, merge_goals
 from mcp_agent.companion_search import ResourceSearch
@@ -23,7 +23,7 @@ from common.companion_transfer import (COUNTED_TARGETS, STORAGE_TARGETS, TRANSFE
 
 CAPABILITIES = {"collect", "move", "follow", "stay", "recipes", "equip", "unequip", "work", "craft", "place", "search",
                 "storage", "give_owner", "drop_item", "receive_item", "visit_building", "timed_return", "eat",
-                "refuel", "home", "hunger", "cook_meal", "ignite_tree", "combat"}
+                "heal", "thermal", "refuel", "home", "hunger", "cook_meal", "ignite_tree", "combat"}
 RESOURCE_NAMES = {"grass": "cutgrass", "sapling": "twigs", "berrybush": "berries", "berrybush2": "berries",
                   "carrot_planted": "carrot", "reeds": "cutreeds", "logs": "log"}
 STORAGE_WAIT_SECONDS = 60
@@ -47,6 +47,60 @@ def capabilities(observed):
     return sorted(CAPABILITIES.intersection(observed.get("capabilities") or []))
 
 
+SEASONAL_GEAR_RECIPES = {
+    "winter": ("beefalohat", "winterhat", "earmuffshat"),
+    "summer": ("eyebrellahat", "icehat", "umbrella", "strawhat", "grass_umbrella"),
+    "rain": ("eyebrellahat", "raincoat", "rainhat", "umbrella", "grass_umbrella"),
+}
+THERMAL_FIRE_RECIPES = {
+    "heat": ("firepit", "campfire"),
+    "cool": ("coldfirepit", "coldfire"),
+}
+
+_seasonal_gear_equip = seasonal_gear_equip
+
+
+def _ready_recipe(observed, names, *, placement=False):
+    recipes = observed.get("recipes") or {}
+    for rid in names:
+        row = recipes.get(rid) or {}
+        if row.get("supported") and row.get("ready") and bool(row.get("placement")) == placement:
+            return rid
+    return None
+
+
+def _seasonal_gear_craft(observed, need):
+    if "craft" not in capabilities(observed):
+        return None
+    recipes_for_need = SEASONAL_GEAR_RECIPES.get(need)
+    if not recipes_for_need:
+        return None
+    gear = [r for r in observed.get("equipment", []) if r.get("usable")]
+    if need in {"winter", "summer"}:
+        has_gear = any(
+            ((r.get("insulation") or 0) > 0 and r.get("insulation_type") == need)
+            or r.get("prefab") in recipes_for_need
+            for r in gear
+        )
+    else:
+        has_gear = any((r.get("waterproof") or 0) > 0 or r.get("prefab") in recipes_for_need for r in gear)
+    if has_gear:
+        return None
+    return _ready_recipe(observed, recipes_for_need, placement=False)
+
+
+def _place_thermal_fire(observed, kind):
+    if "place" not in capabilities(observed):
+        return None
+    point = (observed.get("buddy") or {}).get("position") or {}
+    if not (number(point.get("x")) and number(point.get("z"))):
+        return None
+    rid = _ready_recipe(observed, THERMAL_FIRE_RECIPES.get(kind, ()), placement=True)
+    if rid is None:
+        return None
+    return "place", {"recipe_id": rid, "x": point["x"], "z": point["z"], "radius": 6}
+
+
 def validate_target(target, *, supported=CAPABILITIES):
     kind = target.get("type")
     if kind in TRANSFER_TARGETS:
@@ -64,7 +118,8 @@ def validate_target(target, *, supported=CAPABILITIES):
         return {"type": kind, **validate_camp_target(target)}
     required = {"inventory": "craft" if "recipe_id" in target else "collect", "structure": "place", "equip": "equip",
                 "unequip": "unequip", "visit_building": "visit_building", "set_home": "home", "return_home": "home",
-                "stay_home": "home", "hunger_ratio": "hunger", "attack": "combat", "defend_owner": "combat",
+                "stay_home": "home", "hunger_ratio": "hunger", "health_ratio": "heal", "thermal_comfort": "thermal",
+                "attack": "combat", "defend_owner": "combat",
                 "move_to": "move", "return_owner": "follow", "follow": "follow", "stay": "stay"}
     if kind not in required or required[kind] not in supported:
         raise ValueError("Unsupported companion task target/capability: " + str(kind))
@@ -73,6 +128,8 @@ def validate_target(target, *, supported=CAPABILITIES):
               "equip": {"type", "prefab"}, "unequip": {"type", "prefab"}, "visit_building": {"type", "building_id"},
               "set_home": {"type", "anchor_id"}, "return_home": {"type", "home_id"}, "stay_home": {"type", "home_id", "radius"},
               "hunger_ratio": {"type", "at_least"},
+              "health_ratio": {"type", "at_least"},
+              "thermal_comfort": {"type", "min_temp", "max_temp", "charge_heatrock", "max_moisture"},
               "attack": {"type", "target_guid", "prefab", "count", "min_health_ratio"},
               "defend_owner": {"type", "min_health_ratio"}}
     allowed = fields.get(kind, {"type"})
@@ -108,6 +165,28 @@ def validate_target(target, *, supported=CAPABILITIES):
         if not number(ratio) or not 0 < ratio <= 1:
             raise ValueError("Invalid hunger target")
         return {"type": kind, "at_least": float(ratio)}
+    if kind == "health_ratio":
+        ratio = target.get("at_least")
+        if not number(ratio) or not 0 < ratio <= 1:
+            raise ValueError("Invalid health target")
+        return {"type": kind, "at_least": float(ratio)}
+    if kind == "thermal_comfort":
+        min_t = target.get("min_temp", 15)
+        max_t = target.get("max_temp", 55)
+        if not number(min_t) or not number(max_t) or not 5 <= float(min_t) < float(max_t) <= 65:
+            raise ValueError("thermal_comfort requires 5 <= min_temp < max_temp <= 65")
+        clean = {"type": kind, "min_temp": float(min_t), "max_temp": float(max_t)}
+        if "charge_heatrock" in target:
+            mode = target["charge_heatrock"]
+            if mode not in {"warm", "cool"}:
+                raise ValueError("charge_heatrock must be 'warm' or 'cool'")
+            clean["charge_heatrock"] = mode
+        if "max_moisture" in target:
+            max_m = target["max_moisture"]
+            if not number(max_m) or not 5 <= float(max_m) <= 80:
+                raise ValueError("max_moisture must be between 5 and 80")
+            clean["max_moisture"] = float(max_m)
+        return clean
     if kind in {"attack", "defend_owner"}:
         clean = {"type": kind}
         if "min_health_ratio" in target:
@@ -184,7 +263,8 @@ def actor_state(observed):
     """Only normalize observed facts; never invent a map, hunger maximum or recipes."""
     buddy = observed.get("buddy") or {}
     vitals = {"dead": buddy.get("dead")}
-    for key in ("health", "health_max", "hunger", "hunger_max", "sanity", "temperature"):
+    for key in ("health", "health_max", "hunger", "hunger_max", "sanity", "sanity_max",
+                "moisture", "moisture_max", "freezing", "overheating", "temperature"):
         if key in buddy:
             vitals[key] = buddy.get(key)
     inventory = buddy.get("inventory") or {}
@@ -224,6 +304,14 @@ def evaluate_target(target, state):
             ratio = hunger / maximum
             return round(ratio, 3), target["at_least"], True, ""
         return 0, target["at_least"], False, "hunger telemetry missing"
+    if kind == "health_ratio":
+        health, maximum = buddy.get("health"), buddy.get("health_max")
+        if number(health) and number(maximum) and maximum > 0:
+            return round(health / maximum, 3), target["at_least"], True, ""
+        return 0, target["at_least"], False, "health telemetry missing"
+    if kind == "thermal_comfort":
+        st = thermal_comfort_status(target, observed)
+        return int(st["satisfied"]), 1, st["known"], "" if st["known"] else "temperature telemetry missing"
     if kind == "refuel":
         if "at_least" in target:
             status = fire_maintenance_state(target, state)
@@ -341,12 +429,27 @@ class CompanionTasks:
                 else:
                     task.update(progress={"current": 0, "required": 1})
             return
-        if kind == "hunger_ratio":
+        if kind in {"hunger_ratio", "health_ratio", "thermal_comfort"}:
             record.setdefault("transfer_key", uuid.uuid4().hex)
-            key = record["transfer_key"]
+            base_key = record["transfer_key"]
             for receipt in state["_companion"].get("transfer_receipts", []):
-                if receipt.get("task_key") == key and type(receipt.get("count")) is int:
+                tkey = receipt.get("task_key")
+                if not isinstance(tkey, str) or type(receipt.get("count")) is not int:
+                    continue
+                if kind == "hunger_ratio" and tkey == base_key:
                     record["hunger_eaten"] = max(record.get("hunger_eaten", 0), receipt["count"])
+                elif kind == "health_ratio" and tkey.startswith(f"{base_key}_h_"):
+                    prefab = tkey[len(f"{base_key}_h_"):]
+                    counts = record.setdefault("heal_counts", {})
+                    counts[prefab] = max(counts.get(prefab, 0), receipt["count"])
+                elif kind == "health_ratio" and tkey.startswith(f"{base_key}_e_"):
+                    prefab = tkey[len(f"{base_key}_e_"):]
+                    counts = record.setdefault("eat_counts", {})
+                    counts[prefab] = max(counts.get(prefab, 0), receipt["count"])
+                elif kind == "thermal_comfort" and tkey.startswith(f"{base_key}_f_"):
+                    prefab = tkey[len(f"{base_key}_f_"):]
+                    counts = record.setdefault("thermal_fuel_counts", {})
+                    counts[prefab] = max(counts.get(prefab, 0), receipt["count"])
             return
         if kind == "refuel":
             record.setdefault("transfer_key", uuid.uuid4().hex)
@@ -466,13 +569,29 @@ class CompanionTasks:
         record = self.goals.records.get(task_id)
         data = action.get("data") or {}
         task = next((t for t in (self.plan or {}).get("tasks", []) if t["id"] == task_id), None)
-        if record and data.get("task_key") == record.get("transfer_key") and type(data.get("count")) is int:
-            if task and task["target"]["type"] == "refuel":
-                record["fuel_added"] = max(record.get("fuel_added", 0), data["count"])
-            elif task and task["target"]["type"] == "hunger_ratio":
-                record["hunger_eaten"] = max(record.get("hunger_eaten", 0), data["count"])
-            else:
-                record["camp_count"] = max(record.get("camp_count", 0), data["count"])
+        if record and isinstance(data.get("task_key"), str) and record.get("transfer_key") and type(data.get("count")) is int:
+            base_key = record["transfer_key"]
+            tkey = data["task_key"]
+            if tkey == base_key:
+                if task and task["target"]["type"] == "refuel":
+                    record["fuel_added"] = max(record.get("fuel_added", 0), data["count"])
+                elif task and task["target"]["type"] == "hunger_ratio":
+                    record["hunger_eaten"] = max(record.get("hunger_eaten", 0), data["count"])
+                else:
+                    record["camp_count"] = max(record.get("camp_count", 0), data["count"])
+            elif task and task["target"]["type"] == "health_ratio":
+                if tkey.startswith(f"{base_key}_h_"):
+                    prefab = tkey[len(f"{base_key}_h_"):]
+                    counts = record.setdefault("heal_counts", {})
+                    counts[prefab] = max(counts.get(prefab, 0), data["count"])
+                elif tkey.startswith(f"{base_key}_e_"):
+                    prefab = tkey[len(f"{base_key}_e_"):]
+                    counts = record.setdefault("eat_counts", {})
+                    counts[prefab] = max(counts.get(prefab, 0), data["count"])
+            elif task and task["target"]["type"] == "thermal_comfort" and tkey.startswith(f"{base_key}_f_"):
+                prefab = tkey[len(f"{base_key}_f_"):]
+                counts = record.setdefault("thermal_fuel_counts", {})
+                counts[prefab] = max(counts.get(prefab, 0), data["count"])
         if record and task and task.get("at") and action["status"] == "completed" and action.get("reason") == "follow":
             record["return_departed"] = True
         if (record and task and task["target"]["type"] == "visit_building" and action["status"] == "completed"
@@ -580,6 +699,42 @@ class CompanionTasks:
                     threats.append(enemy)
         return threats
 
+    def _thermal_fire_step(self, task, observed, navigation, *, fire_prefabs, place_kind, fuels, missing_reason, fuel_reason, fuel_threshold):
+        buildings = [r for r in (observed.get("places") or {}).get("buildings", []) if r.get("status") not in {"missing", "unavailable"}]
+        refuel_rows = {r.get("building_id"): r for r in (observed.get("refueling") or {}).get("targets", []) if r.get("building_id")}
+        inv = (observed.get("buddy") or {}).get("inventory") or {}
+        fires = [r for r in buildings if r.get("prefab") in fire_prefabs]
+        if not fires:
+            placed = _place_thermal_fire(observed, place_kind)
+            if placed is not None:
+                return task, *placed
+            return task, "needs_replan", {"reason": missing_reason}
+        fire = max(fires, key=lambda r: (
+            1 if (refuel_rows.get(r["id"]) or {}).get("lit") else 0,
+            1 if r.get("prefab") == fire_prefabs[0] else 0,
+            1 if r.get("arrived") else 0,
+            -(r.get("distance") or 999),
+        ))
+        if not fire.get("arrived"):
+            navigation.append((task, "visit_building", {"building_id": fire["id"]}))
+            return None
+        row = refuel_rows.get(fire["id"]) or {}
+        fuel_pct = row.get("fuel_percent")
+        needs_fuel = (not row.get("lit")) or (number(fuel_pct) and fuel_pct < fuel_threshold)
+        if needs_fuel:
+            fuel_prefab = next((f for f in fuels if inv.get(f, 0) > 0), None)
+            if fuel_prefab:
+                record = self.goals.records[task["id"]]
+                base_key = record.setdefault("transfer_key", uuid.uuid4().hex)
+                counts = record.setdefault("thermal_fuel_counts", {})
+                return task, "refuel", {"building_id": fire["id"], "fuel_prefab": fuel_prefab,
+                                        "total_count": counts.get(fuel_prefab, 0) + 1,
+                                        "task_key": f"{base_key}_f_{fuel_prefab}"[:64]}
+            if not row.get("lit"):
+                return task, "needs_replan", {"reason": fuel_reason}
+        navigation.append((task, "waiting", {}))
+        return None
+
     def next_action(self, observed):
         view = self.view(observed)
         resumed = False
@@ -614,8 +769,8 @@ class CompanionTasks:
             kind = target["type"]
             required = {"inventory": "craft" if target.get("recipe_id") else "collect", "structure": "place",
                         "move_to": "move", "return_owner": "follow", "set_home": "home", "return_home": "home",
-                        "stay_home": "home", "hunger_ratio": "hunger", "refuel": "refuel",
-                        "attack": "combat", "defend_owner": "combat",
+                        "stay_home": "home", "hunger_ratio": "hunger", "health_ratio": "heal", "thermal_comfort": "thermal",
+                        "refuel": "refuel", "attack": "combat", "defend_owner": "combat",
                         **{t: "storage" for t in STORAGE_TARGETS}}.get(kind, kind)
             if required not in capabilities(observed):
                 return task, "unsupported", {"reason": "capability_unavailable:" + required}
@@ -665,6 +820,95 @@ class CompanionTasks:
                 record.setdefault("transfer_key", uuid.uuid4().hex)
                 return task, "eat", {"prefab": chosen["prefab"], "total_count": record.get("hunger_eaten", 0) + 1,
                                      "task_key": record["transfer_key"]}
+            if kind == "health_ratio":
+                reserved = {
+                    t["target"].get("product") or t["target"].get("prefab")
+                    for t in view["tasks"]
+                    if t["id"] != task["id"] and t["target"].get("type") in {"heal", "cook_meal", "give_owner", "deposit", "drop_item"}
+                }
+                healers = [row for row in observed.get("healers", []) if number(row.get("health_delta")) and row["health_delta"] > 0]
+                unreserved_healers = [row for row in healers if row.get("prefab") not in reserved]
+                best_healer = max(unreserved_healers or healers, key=lambda r: r["health_delta"], default=None)
+                if best_healer:
+                    record = self.goals.records[task["id"]]
+                    base_key = record.setdefault("transfer_key", uuid.uuid4().hex)
+                    prefab = best_healer["prefab"]
+                    counts = record.setdefault("heal_counts", {})
+                    return task, "heal", {"prefab": prefab, "total_count": counts.get(prefab, 0) + 1,
+                                          "task_key": f"{base_key}_h_{prefab}"[:64]}
+                heal_foods = [row for row in observed.get("foods", []) if number(row.get("health_delta")) and row["health_delta"] > 0]
+                safe_heals = [row for row in heal_foods if (row.get("sanity_delta", 0) or 0) >= 0]
+                unreserved_foods = [row for row in (safe_heals or heal_foods) if row.get("prefab") not in reserved]
+                best_food = max(unreserved_foods or safe_heals or heal_foods, key=lambda r: r["health_delta"], default=None)
+                if best_food:
+                    record = self.goals.records[task["id"]]
+                    base_key = record.setdefault("transfer_key", uuid.uuid4().hex)
+                    prefab = best_food["prefab"]
+                    counts = record.setdefault("eat_counts", {})
+                    return task, "eat", {"prefab": prefab, "total_count": counts.get(prefab, 0) + 1,
+                                         "task_key": f"{base_key}_e_{prefab}"[:64]}
+                return task, "needs_replan", {"reason": "healing_item_missing"}
+            if kind == "thermal_comfort":
+                buddy = observed.get("buddy") or {}
+                temp = buddy.get("temperature")
+                if not number(temp):
+                    return task, "needs_replan", {"reason": "temperature_telemetry_missing"}
+                st = thermal_comfort_status(target, observed)
+                stones = (observed.get("thermal") or {}).get("stones") or []
+                charge = target.get("charge_heatrock")
+                season = (observed.get("world") or {}).get("season")
+                caps = capabilities(observed)
+                need_heat = temp < target["min_temp"] or (charge == "warm" and not st["stone_ok"])
+                need_cool = temp > target["max_temp"] or (charge == "cool" and not st["stone_ok"])
+                if need_heat or need_cool:
+                    need = "winter" if need_heat else "summer"
+                    gear = _seasonal_gear_equip(observed, need)
+                    if gear is not None:
+                        return task, "equip", {"item_guid": gear}
+                    craft_gear = _seasonal_gear_craft(observed, need)
+                    if craft_gear is not None:
+                        return task, "craft", {"recipe_id": craft_gear}
+                    want_charge = (need_heat and charge == "warm") or (need_cool and charge == "cool")
+                    if not stones and (want_charge or season == need):
+                        if "craft" in caps and _ready_recipe(observed, ("heatrock",)):
+                            return task, "craft", {"recipe_id": "heatrock"}
+                        if want_charge:
+                            return task, "needs_replan", {"reason": "heatrock_required"}
+                    action = self._thermal_fire_step(
+                        task, observed, navigation,
+                        fire_prefabs=("firepit", "campfire") if need_heat else ("coldfirepit", "coldfire"),
+                        place_kind="heat" if need_heat else "cool",
+                        fuels=(("log", "charcoal", "twigs", "cutgrass", "pinecone", "acorn", "twiggy_nut") if need_heat
+                               else ("nitre", "log", "charcoal", "twigs", "cutgrass", "pinecone", "acorn", "twiggy_nut")),
+                        missing_reason="heat_source_required" if need_heat else "cooling_source_required",
+                        fuel_reason="fuel_required_for_heat" if need_heat else "fuel_required_for_cooling",
+                        fuel_threshold=0.45 if want_charge else 0.25,
+                    )
+                    if action is not None:
+                        return action
+                    continue
+                if (observed.get("world") or {}).get("israining") or st["wet_issue"]:
+                    gear = _seasonal_gear_equip(observed, "rain")
+                    if gear is not None:
+                        return task, "equip", {"item_guid": gear}
+                    craft_gear = _seasonal_gear_craft(observed, "rain")
+                    if craft_gear is not None:
+                        return task, "craft", {"recipe_id": craft_gear}
+                    if st["wet_issue"] and temp < target["max_temp"] - 5:
+                        action = self._thermal_fire_step(
+                            task, observed, navigation,
+                            fire_prefabs=("firepit", "campfire"),
+                            place_kind="heat",
+                            fuels=("log", "charcoal", "twigs", "cutgrass", "pinecone", "acorn", "twiggy_nut"),
+                            missing_reason="heat_source_required",
+                            fuel_reason="fuel_required_for_heat",
+                            fuel_threshold=0.25,
+                        )
+                        if action is not None:
+                            return action
+                        continue
+                navigation.append((task, "waiting", {}))
+                continue
             if kind == "refuel":
                 state = actor_state(observed)
                 err = refuel_error(target, observed.get("places"))
@@ -789,6 +1033,8 @@ class CompanionTasks:
             if kind in COUNTED_TARGETS:
                 if kind == "eat" and not any(row.get("prefab") == target["prefab"] for row in observed.get("foods", [])):
                     return task, "needs_replan", {"reason": "food_not_carried_or_inedible:" + target["prefab"]}
+                if kind == "heal" and not any(row.get("prefab") == target["prefab"] for row in observed.get("healers", [])):
+                    return task, "needs_replan", {"reason": "healer_not_carried:" + target["prefab"]}
                 if kind in {"give_owner", "deposit", "drop_item"} and not (observed["buddy"].get("inventory") or {}).get(target["prefab"], 0):
                     return task, "needs_replan", {"reason": "transfer_source_missing:" + target["prefab"]}
                 if kind in {"give_owner", "deposit", "drop_item"}:

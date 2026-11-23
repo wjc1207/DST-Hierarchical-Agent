@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import secrets
@@ -34,7 +35,7 @@ from common.pairing import ensure_bridge_token
 from mcp_agent.companion_planner import validate_plan
 from mcp_agent.companion_tasks import CompanionTasks, capabilities
 from mcp_server.companion_bridge import CompanionTeamBridge
-from mcp_server.game_bridge import serve_bridge
+from transport.http_bridge import serve_bridge
 
 DEFAULT_GAME_DIRS = (
     Path(r"C:\Program Files (x86)\Steam\steamapps\common\Don't Starve Together"),
@@ -113,6 +114,18 @@ class HeadlessDSTSandbox:
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._lua_errors: list[str] = []
         self._session_ready = threading.Event()
+        self._session_gen: int = 1
+
+    def _reset_bridge_state(self) -> None:
+        if self.external_bridge or self.bridge is None:
+            return
+        with self.bridge.lock:
+            self.bridge.members.clear()
+            self.bridge.state = None
+            self.bridge.session = None
+            self.bridge.sequence = 0
+            self.bridge.received = -math.inf
+            self.bridge.server_id = secrets.token_hex(12)
 
     def _prepare_cluster(self) -> None:
         if self.reset_world and self.master_dir.exists():
@@ -217,6 +230,9 @@ class HeadlessDSTSandbox:
                                 except json.JSONDecodeError:
                                     pass
                             if tag == "HTTP_REQ" and isinstance(payload, dict) and self.bridge is not None:
+                                req_gen = payload.get("session_gen")
+                                if req_gen is not None and int(req_gen) != self._session_gen:
+                                    continue
                                 req_id = payload.get("req_id")
                                 req_body = payload.get("payload")
                                 try:
@@ -227,6 +243,9 @@ class HeadlessDSTSandbox:
                                     self._lua_errors.append(f"bridge_exchange_error: {exc}")
                                     self.send_lua(f"HEADLESS.http_reply({int(req_id)}, nil)")
                                 continue
+                            if tag == "SCENARIO_RESET" and isinstance(payload, dict):
+                                self._session_gen = int(payload.get("session_gen") or (self._session_gen + 1))
+                                self._reset_bridge_state()
                             if self.verbose or tag in {"NOTICE", "ERROR"}:
                                 print(f"[HEADLESS:{tag}] {payload}", flush=True)
                             self._events.put((tag, payload))
@@ -300,6 +319,7 @@ class HeadlessDSTSandbox:
             f'token="{self.token}", time_scale={self.time_scale}, transport="{self.transport}"}})'
         )
         ready = self.wait_event("READY", timeout=15.0)
+        self._session_gen = int(ready.get("session_gen") or 1)
         print(f"[SANDBOX] Harness READY at ({ready.get('x')}, {ready.get('z')}) scale={ready.get('time_scale')}x transport={self.transport}", flush=True)
 
         if not self.external_bridge and self.bridge:
@@ -337,6 +357,28 @@ class HeadlessDSTSandbox:
 
     def __exit__(self, *args) -> None:
         self.stop()
+
+    def reset_scenario(self, tag: str = "reset", *, timeout: float = 15.0) -> dict[str, Any]:
+        self.send_lua(f"HEADLESS.reset_scenario({json.dumps(tag, ensure_ascii=False)})")
+        reset_payload = self.wait_event(
+            "SCENARIO_RESET",
+            predicate=lambda p: isinstance(p, dict) and p.get("tag") == tag,
+            timeout=timeout,
+        )
+        if not self.external_bridge and self.bridge:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    snap = self.bridge.observe()
+                    state = snap.get("state") or {}
+                    if state.get("team") is True and not (state.get("members") or {}):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            else:
+                raise TimeoutError(f"Timed out waiting for CompanionTeamBridge handshake after reset_scenario({tag})")
+        return reset_payload
 
     def setup_arena(self, spec: dict[str, Any], *, timeout: float = 15.0) -> dict[str, Any]:
         tag = spec.get("tag", f"arena_{int(time.time() * 1000)}")
@@ -500,9 +542,11 @@ class HeadlessDSTSandbox:
             }
             time.sleep(0.06)
 
+        active_res = self.bridge.member_call("result", member_id, active["action_id"]) if active else None
         raise TimeoutError(
             f"Timed out after {timeout:.1f}s running tasks (last_reason={last_reason}, "
-            f"active={active}, view={scheduler.view(observed)['tasks']})"
+            f"active={active}, active_res={active_res}, sim_time={observed.get('sampled_at')}, "
+            f"lua_action={observed.get('action')}, view={scheduler.view(observed)['tasks']})"
         )
 
 
@@ -814,6 +858,9 @@ def run_suite(args: argparse.Namespace) -> int:
                 "tag": "self_pilot",
                 "clear_owner_inventory": True,
                 "reset_owner": True,
+                "reset_buddy": True,
+                "owner_invincible": False,
+                "clear_radius": 26,
                 "give_owner": [
                     {"prefab": "spear", "count": 1},
                     {"prefab": "armorwood", "count": 1},
@@ -821,7 +868,7 @@ def run_suite(args: argparse.Namespace) -> int:
                 ],
                 "spawns": [
                     {"prefab": "grass", "dx": 4, "dz": 0},
-                    {"prefab": "spider", "dx": 6, "dz": 0},
+                    {"prefab": "spider", "dx": -5, "dz": 0},
                 ],
             })
             spider_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "spider")
@@ -864,6 +911,7 @@ def run_suite(args: argparse.Namespace) -> int:
             assert _as_dict(owner.get("inventory")).get("cutgrass", 0) >= 1
         finally:
             sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
             sb.send_lua("HEADLESS.set_simulation(20, 0)")
 
         deadline = time.monotonic() + 8.0
@@ -875,6 +923,272 @@ def run_suite(args: argparse.Namespace) -> int:
         assert "self" not in (sb.bridge.observe()["state"].get("members") or {}), "Expected self slot removed after release"
         return f"self cutgrass>=1, spider_guid={spider_guid} slain @ 150ms delay / r=15, owner_hp={owner_hp:.1f}, clean release"
 
+    def scenario_heal_salve_and_winter_warmup(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.setup_arena({
+            "tag": "winter_heal",
+            "reset_buddy": True,
+            "buddy_health": 45.0,
+            "buddy_temperature": 4.0,
+            "give_buddy": [
+                {"prefab": "healingsalve", "count": 2},
+                {"prefab": "winterhat", "count": 1},
+                {"prefab": "log", "count": 2},
+            ],
+            "spawns": [
+                {"prefab": "firepit", "dx": 5, "dz": 0, "fuel_percent": 0.05},
+            ],
+        })
+        obs0 = sb.wait_observed(
+            lambda o: {"heal", "thermal"}.issubset(set(o.get("capabilities") or []))
+            and any(h.get("prefab") == "healingsalve" for h in (o.get("healers") or []))
+            and any(r.get("prefab") == "winterhat" for r in (o.get("equipment") or []))
+            and any(b.get("prefab") == "firepit" for b in (o.get("places") or {}).get("buildings") or [])
+            and float((o.get("buddy") or {}).get("temperature") or 25) <= 6.0
+        )
+        before = sb.inspect("before_winter_heal")
+        before_fuel = next(b["fuel"] for b in before["buildings"] if b["prefab"] == "firepit")
+        sb.run_plan_tasks(
+            "抹药膏回血并戴冬帽生火取暖",
+            [
+                {"id": "heal_up", "title": "Heal with salve", "priority": 1,
+                 "target": {"type": "health_ratio", "at_least": 0.55}},
+                {"id": "warm_up", "title": "Warm up in winter", "priority": 2,
+                 "target": {"type": "thermal_comfort", "min_temp": 28, "max_temp": 55}},
+            ],
+            timeout=65.0,
+        )
+        obs_after = sb.wait_observed(lambda o: float((o.get("buddy") or {}).get("temperature") or 0) >= 28.0)
+        equipped = {r["prefab"] for r in (obs_after.get("equipment") or []) if r.get("equipped")}
+        assert "winterhat" in equipped, f"Expected winterhat equipped, got {equipped}"
+        after = sb.inspect("after_winter_heal")
+        buddy_hp = float((after.get("buddy") or {}).get("health") or 0)
+        buddy_temp = float((after.get("buddy") or {}).get("temperature") or 0)
+        after_fuel = next(b["fuel"] for b in after["buildings"] if b["prefab"] == "firepit")
+        assert buddy_hp >= 80.0, f"Expected healed hp >= 80, got {buddy_hp}"
+        assert buddy_temp >= 28.0, f"Expected warmed temp >= 28C, got {buddy_temp}"
+        assert after_fuel > before_fuel, f"Expected firepit refueled ({before_fuel} -> {after_fuel})"
+        return f"buddy_hp {45.0:.0f}->{buddy_hp:.1f}, temp->{buddy_temp:.1f}C, fuel {before_fuel:.2f}->{after_fuel:.2f}, winterhat equipped"
+
+    def scenario_summer_overheat_coldfire_and_gear(sb: HeadlessDSTSandbox) -> str:
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            sb.setup_arena({
+                "tag": "summer_coldfire",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "owner_invincible": False,
+                "clear_radius": 26,
+                "owner_temperature": 68.0,
+                "give_owner": [
+                    {"prefab": "strawhat", "count": 1},
+                    {"prefab": "umbrella", "count": 1},
+                    {"prefab": "nitre", "count": 2},
+                ],
+                "spawns": [
+                    {"prefab": "coldfirepit", "dx": 5, "dz": 0, "fuel_percent": 0.12},
+                ],
+            })
+            sb.wait_observed(
+                lambda o: o.get("is_self") is True
+                and "thermal" in (o.get("capabilities") or [])
+                and any(r.get("prefab") == "coldfirepit" for r in (o.get("places") or {}).get("buildings") or [])
+                and ((o.get("buddy") or {}).get("inventory") or {}).get("nitre", 0) >= 2
+                and float((o.get("buddy") or {}).get("temperature") or 25) >= 60.0,
+                member_id="self",
+                timeout=12.0,
+            )
+            before = sb.inspect("before_summer_cold")
+            before_fuel = next(b["fuel"] for b in before["buildings"] if b["prefab"] == "coldfirepit")
+            sb.run_plan_tasks(
+                "穿夏装打伞并用硝石给吸热火坑降温",
+                [
+                    {"id": "cool_down", "title": "Cool down at coldfirepit", "priority": 1,
+                     "target": {"type": "thermal_comfort", "min_temp": 12, "max_temp": 34}},
+                ],
+                member_id="self",
+                timeout=70.0,
+            )
+            obs_after = sb.wait_observed(
+                lambda o: float((o.get("buddy") or {}).get("temperature") or 99) <= 34.0,
+                member_id="self",
+            )
+            equipped = {r["prefab"] for r in (obs_after.get("equipment") or []) if r.get("equipped")}
+            assert {"strawhat", "umbrella"} <= equipped, f"Expected strawhat+umbrella equipped, got {equipped}"
+            after = sb.inspect("after_summer_cold")
+            owner_temp = float((after.get("owner") or {}).get("temperature") or 99)
+            after_fuel = next(b["fuel"] for b in after["buildings"] if b["prefab"] == "coldfirepit")
+            assert owner_temp <= 34.0, f"Expected owner cooled <= 34C, got {owner_temp}"
+            assert after_fuel > before_fuel, f"Expected coldfirepit refueled with nitre ({before_fuel} -> {after_fuel})"
+            return f"self cooled 68->{owner_temp:.1f}C, nitre fuel {before_fuel:.2f}->{after_fuel:.2f}, gear={sorted(equipped)}"
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if "self" not in (sb.bridge.observe()["state"].get("members") or {}):
+                    break
+                time.sleep(0.15)
+
+    def scenario_winter_craft_heatrock_hat_and_roast(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.setup_arena({
+            "tag": "winter_craft_roast",
+            "season": "winter",
+            "reset_buddy": True,
+            "buddy_temperature": 6.0,
+            "give_buddy": [
+                {"prefab": "beefalowool", "count": 4},
+                {"prefab": "silk", "count": 4},
+                {"prefab": "rocks", "count": 10},
+                {"prefab": "pickaxe", "count": 1},
+                {"prefab": "flint", "count": 3},
+                {"prefab": "log", "count": 4},
+            ],
+            "spawns": [
+                {"prefab": "researchlab2", "dx": 2, "dz": -1},
+                {"prefab": "firepit", "dx": 5, "dz": 0, "fuel_percent": 0.0},
+            ],
+        })
+        sb.wait_observed(
+            lambda o: (o.get("world") or {}).get("season") == "winter"
+            and ((o.get("recipes") or {}).get("winterhat") or {}).get("ready") is True
+            and ((o.get("recipes") or {}).get("heatrock") or {}).get("ready") is True
+            and any(b.get("prefab") == "firepit" for b in (o.get("places") or {}).get("buildings") or [])
+            and float((o.get("buddy") or {}).get("temperature") or 25) <= 10.0,
+            timeout=15.0,
+        )
+        sb.run_plan_tasks(
+            "做冬帽戴上、做暖石并在火坑旁烤热过冬",
+            [
+                {"id": "winter_prep", "title": "Craft winterhat, heatrock and roast warm", "priority": 1,
+                 "target": {"type": "thermal_comfort", "min_temp": 28, "max_temp": 55, "charge_heatrock": "warm"}},
+            ],
+            timeout=85.0,
+        )
+        obs_after = sb.wait_observed(
+            lambda o: float((o.get("buddy") or {}).get("temperature") or 0) >= 28.0
+            and any(float(s.get("temperature") or 0) >= 45.0 for s in ((o.get("thermal") or {}).get("stones") or [])),
+        )
+        equipped = {r["prefab"] for r in (obs_after.get("equipment") or []) if r.get("equipped")}
+        assert "winterhat" in equipped, f"Expected winterhat crafted & equipped, got {equipped}"
+        after = sb.inspect("after_winter_roast")
+        stones = (after.get("buddy") or {}).get("thermal_stones") or []
+        stone_temp = max((float(s.get("temperature") or 0) for s in stones), default=0.0)
+        after_fuel = next(b["fuel"] for b in after["buildings"] if b["prefab"] == "firepit")
+        buddy_temp = float((after.get("buddy") or {}).get("temperature") or 0)
+        assert stone_temp >= 45.0, f"Expected heatrock roasted >= 45C, got {stones}"
+        assert after_fuel > 0.1, f"Expected firepit lit (>0.1), got {after_fuel}"
+        assert buddy_temp >= 28.0, f"Expected buddy warmed >= 28C, got {buddy_temp}"
+        return f"season={after.get('season')}, winterhat equipped, heatrock={stone_temp:.1f}C, fire={after_fuel:.2f}, buddy={buddy_temp:.1f}C"
+
+    def scenario_summer_auto_place_coldfire_and_spring_rain(sb: HeadlessDSTSandbox) -> str:
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            # Phase A: Summer overheating with only regular burning firepit -> craft strawhat + auto-place coldfire
+            sb.setup_arena({
+                "tag": "summer_auto_coldfire",
+                "season": "summer",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "owner_invincible": False,
+                "clear_radius": 26,
+                "owner_temperature": 67.0,
+                "give_owner": [
+                    {"prefab": "cutgrass", "count": 15},
+                    {"prefab": "nitre", "count": 4},
+                ],
+                "spawns": [
+                    {"prefab": "researchlab", "dx": 2, "dz": -1},
+                    {"prefab": "firepit", "dx": -4, "dz": 0, "fuel_percent": 0.8},
+                ],
+            })
+            sb.wait_observed(
+                lambda o: (o.get("world") or {}).get("season") == "summer"
+                and ((o.get("recipes") or {}).get("strawhat") or {}).get("ready") is True
+                and ((o.get("recipes") or {}).get("coldfire") or {}).get("ready") is True
+                and float((o.get("buddy") or {}).get("temperature") or 25) >= 60.0,
+                member_id="self",
+                timeout=15.0,
+            )
+            sb.run_plan_tasks(
+                "天热做草帽并在附近自建吸热火堆降温",
+                [
+                    {"id": "summer_cool", "title": "Craft strawhat and place coldfire", "priority": 1,
+                     "target": {"type": "thermal_comfort", "min_temp": 12, "max_temp": 40}},
+                ],
+                member_id="self",
+                timeout=75.0,
+            )
+            obs_summer = sb.wait_observed(
+                lambda o: float((o.get("buddy") or {}).get("temperature") or 99) <= 40.0,
+                member_id="self",
+            )
+            eq_summer = {r["prefab"] for r in (obs_summer.get("equipment") or []) if r.get("equipped")}
+            assert "strawhat" in eq_summer, f"Expected strawhat crafted & equipped, got {eq_summer}"
+            after_summer = sb.inspect("after_summer_auto")
+            assert any(b["prefab"] == "coldfire" for b in after_summer["buildings"]), (
+                f"Expected auto-placed coldfire in buildings, got {after_summer['buildings']}"
+            )
+            summer_temp = float((after_summer.get("owner") or {}).get("temperature") or 99)
+            assert summer_temp <= 40.0, f"Expected owner cooled <= 40C, got {summer_temp}"
+
+            # Phase B: Spring rain / wet owner -> craft grass_umbrella & dry at firepit
+            sb.setup_arena({
+                "tag": "spring_rain_dry",
+                "season": "spring",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "owner_invincible": False,
+                "clear_radius": 26,
+                "owner_temperature": 25.0,
+                "owner_moisture": 80.0,
+                "give_owner": [
+                    {"prefab": "twigs", "count": 4},
+                    {"prefab": "cutgrass", "count": 3},
+                    {"prefab": "petals", "count": 6},
+                ],
+                "spawns": [
+                    {"prefab": "firepit", "dx": 6, "dz": 0, "fuel_percent": 0.7},
+                ],
+            })
+            sb.wait_observed(
+                lambda o: (o.get("world") or {}).get("season") == "spring"
+                and ((o.get("recipes") or {}).get("grass_umbrella") or {}).get("ready") is True
+                and float((o.get("buddy") or {}).get("moisture") or 0) >= 60.0,
+                member_id="self",
+                timeout=15.0,
+            )
+            sb.run_plan_tasks(
+                "春天做花伞并在火坑旁烘干防潮",
+                [
+                    {"id": "spring_dry", "title": "Craft grass_umbrella and dry at firepit", "priority": 1,
+                     "target": {"type": "thermal_comfort", "min_temp": 10, "max_temp": 55, "max_moisture": 45}},
+                ],
+                member_id="self",
+                timeout=50.0,
+            )
+            obs_spring = sb.wait_observed(
+                lambda o: float((o.get("buddy") or {}).get("moisture") or 99) <= 45.0,
+                member_id="self",
+            )
+            eq_spring = {r["prefab"] for r in (obs_spring.get("equipment") or []) if r.get("equipped")}
+            assert "grass_umbrella" in eq_spring, f"Expected grass_umbrella crafted & equipped, got {eq_spring}"
+            after_spring = sb.inspect("after_spring_rain")
+            moisture_now = float((after_spring.get("owner") or {}).get("moisture") or 99)
+            assert moisture_now <= 45.0, f"Expected moisture <= 45, got {moisture_now}"
+            return f"summer={summer_temp:.1f}C (strawhat+coldfire), spring_moisture=80->{moisture_now:.1f} (grass_umbrella)"
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if "self" not in (sb.bridge.observe()["state"].get("members") or {}):
+                    break
+                time.sleep(0.15)
+
     scenarios = [
         ("1. pairing_lua_engine", scenario_pairing),
         ("2. summon_collect_and_work", scenario_collect_and_work),
@@ -885,9 +1199,14 @@ def run_suite(args: argparse.Namespace) -> int:
         ("7. combat_equip_and_slay_spider", scenario_combat_equip_and_slay_spider),
         ("8. cook_perogies_and_honeyham", scenario_cook_perogies_and_honeyham),
         ("9. self_pilot_combat_and_latency", scenario_self_pilot_combat_and_latency),
+        ("10. heal_salve_and_winter_warmup", scenario_heal_salve_and_winter_warmup),
+        ("11. summer_overheat_coldfire_and_gear", scenario_summer_overheat_coldfire_and_gear),
+        ("12. winter_craft_heatrock_hat_and_roast", scenario_winter_craft_heatrock_hat_and_roast),
+        ("13. summer_auto_place_coldfire_and_spring_rain", scenario_summer_auto_place_coldfire_and_spring_rain),
     ]
     if args.only:
-        scenarios = [s for s in scenarios if args.only in s[0]]
+        tokens = [t.strip() for t in args.only.split(",") if t.strip()]
+        scenarios = [s for s in scenarios if any(t in s[0] for t in tokens)]
 
     results: list[tuple[str, bool, float, str]] = []
     with HeadlessDSTSandbox(
@@ -898,10 +1217,11 @@ def run_suite(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         transport=args.transport,
     ) as sb:
-        for name, fn in scenarios:
+        for idx, (name, fn) in enumerate(scenarios, 1):
             t0 = time.monotonic()
             print(f"\n[RUN] {name} ...", flush=True)
             try:
+                sb.reset_scenario(f"before_{idx}")
                 detail = fn(sb)
                 elapsed = time.monotonic() - t0
                 results.append((name, True, elapsed, detail))
