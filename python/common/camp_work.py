@@ -6,7 +6,10 @@ import re
 STORAGE_TARGETS = {"inspect_storage", "deposit", "withdraw"}
 CAMP_TARGETS = STORAGE_TARGETS | {"cook_meal", "ignite_tree"}
 CAMP_ACTIONS = {"open_container", "store_item", "take_item", "start_meal", "harvest_meal", "ignite_tree"}
-SAFE_MEALS = {"meatballs", "ratatouille"}
+SAFE_MEALS = {
+    "meatballs", "ratatouille", "perogies", "baconeggs", "bonestew",
+    "honeyham", "honeynuggets", "taffy", "trailmix", "dragonpie",
+}
 
 
 def prefab(value):

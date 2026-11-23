@@ -164,7 +164,7 @@ function M.new(env)
         end
         if not ({summon=true,bind=true,move=true,collect=true,follow=true,stay=true,stop=true,
             recipes=true,equip=true,unequip=true,eat=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,
-            refuel=true,set_home=true,cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true})[command.op] then
+            refuel=true,set_home=true,cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true})[command.op] then
             save_result(command.id,"failed","unsupported_action",command.revision);return
         end
         self:send(command.op,command.args,nil,command.id)
@@ -183,7 +183,7 @@ function M.new(env)
             self:send("say",{text=text})
         elseif message.finish then
             local goal=env.resume_goal and env.resume_goal()
-            self:interrupt(nil,not goal and "follow" or nil,function() self:send("say",{text=text}) end,goal)
+            self:interrupt(nil,not goal and (env.is_self and "stay" or "follow") or nil,function() self:send("say",{text=text}) end,goal)
         else
             self:send("say",{text=text})
         end
@@ -239,7 +239,7 @@ local TEAM_ACTIVITY={
     collect="采集",search="探索",equip="装备工具",unequip="收起工具",work="工作",CHOP="砍树",MINE="挖矿",
     craft="制作",place="建造",visit_building="前往建筑",move="移动",give_owner="交付物品",
     eat="进食",drop_item="放下物品",deposit="存放物品",withdraw="取出物品",
-    refuel="添燃料",set_home="设置家",cook_load="放食材",start_meal="开始烹饪",harvest_meal="收获料理",ignite_tree="点火烧炭",
+    refuel="添燃料",set_home="设置家",cook_load="放食材",start_meal="开始烹饪",harvest_meal="收获料理",ignite_tree="点火烧炭",attack="战斗",
 }
 
 function M.new_team(env)
@@ -252,7 +252,7 @@ function M.new_team(env)
         local c=self.children[row.id]
         if c and c.team_name==row.name then return c end
         self.child_generation=self.child_generation+1
-        local ce={name=row.name,nonce=env.nonce..":"..row.id..":g"..self.child_generation,now=env.sim_now or env.now,http_enabled=env.http_enabled,managed_http=true,
+        local ce={name=row.name,is_self=(row.id=="self"),nonce=env.nonce..":"..row.id..":g"..self.child_generation,now=env.sim_now or env.now,http_enabled=env.http_enabled,managed_http=true,
             notice=notice,resume_goal=function()
                 local buddy=(c.snapshot or {}).buddy
                 if self.control.mode=="autonomous" and c.control.mode=="instruction"
@@ -281,11 +281,13 @@ function M.new_team(env)
     end
     function self:panel_state()
         local state={mode=self.control.mode,goal=self.control.goal,listening=self.listening,bridge_enabled=env.http_enabled,
-            paused=self.control.mode=="autonomous" and not any_enabled(),roster={}}
+            paused=self.control.mode=="autonomous" and not any_enabled(),self_bound=false,roster={}}
         for _,row in ipairs(self.roster) do
             local c=self.children[row.id]
             local s=c and c.snapshot or {}
             local bound=row.bound and c~=nil and c.token~=nil
+            local is_self=row.id=="self" or row.is_self==true
+            if is_self and bound then state.self_bound=true end
             local status,detail
             local dead=row.dead or (s.buddy or {}).dead
             if dead then
@@ -305,7 +307,7 @@ function M.new_team(env)
             else
                 status=s.mode=="follow" and "跟随" or "待命"
             end
-            state.roster[#state.roster+1]={id=row.id,name=row.name,bound=bound,dead=dead,
+            state.roster[#state.roster+1]={id=row.id,name=row.name,is_self=is_self,bound=bound,dead=dead,
                 status=status,detail=detail,guid=row.guid,roster_version=self.roster_version,deleting=self.deleting[row.id],distance=(s.buddy or {}).owner_distance}
         end
         return state
@@ -328,7 +330,7 @@ function M.new_team(env)
             local companion=self.children[row.id]
             if companion and companion.token then ids[#ids+1]=row.id end
         end
-        if enabled and #ids==0 then notice("请先 /buddy summon 召唤伙伴。");return end
+        if enabled and #ids==0 then notice("请先 /buddy self 托管自己或 /buddy summon 召唤伙伴。");return end
 
         control.mode=enabled and "autonomous" or "instruction"
         if enabled then control.goal=goal end
@@ -394,9 +396,44 @@ function M.new_team(env)
             if pending.callback then pending.callback(packet.status=="completed") end
             return
         end
-        accept_roster(packet)
         local c=self.children[packet.buddy_id or "buddy1"]
+        accept_roster(packet)
         if c then c:receive(packet) end
+    end
+    function self:set_self(enable)
+        if enable then
+            self:fetch_roster(function(ok)
+                if ok==false then notice("主角托管开启失败：名册同步超时。");return end
+                local existing=self.children["self"]
+                for _,row in ipairs(self.roster) do
+                    if row.id=="self" and row.bound and not row.dead and existing and existing.token then
+                        notice("主角托管已开启（@自己 可指定指令）。")
+                        return
+                    end
+                end
+                local join_autonomy=self.control.mode=="autonomous" and any_enabled()
+                local team_revision=self.control.revision
+                local c=child({id="self",name="自己"})
+                c:send("summon",{},function(packet)
+                    if packet.status=="completed" then
+                        notice("主角托管已开启（@自己 可指定指令，/buddy self off 退出）。")
+                        if join_autonomy and self.control.revision==team_revision then
+                            c:interrupt(nil,nil,nil,self.control.goal)
+                        end
+                    else
+                        notice("开启主角托管失败："..tostring(packet.reason))
+                    end
+                end)
+            end)
+        else
+            local existing=self.children["self"]
+            if existing and existing.token then
+                self:interrupt("@自己 release","release")
+                notice("已退出主角托管。")
+            else
+                notice("当前未开启主角托管。")
+            end
+        end
     end
     function self:summon(raw)
         local name=raw~="" and Names.name(raw) or nil
@@ -414,7 +451,7 @@ function M.new_team(env)
         self:fetch_roster(function(ok)
             if ok==false then finished();return end
             local selected
-            for _,row in ipairs(self.roster) do if not name or row.name:lower()==name:lower() then selected=row;break end end
+            for _,row in ipairs(self.roster) do if row.id~="self" and (not name or row.name:lower()==name:lower()) then selected=row;break end end
             if not selected then
                 local occupied={};for _,row in ipairs(self.roster) do occupied[row.id]=true end
                 for i=1,Names.MAX do if not occupied["buddy"..i] then selected={id="buddy"..i,name=name or (i==1 and "一号" or "二号")};break end end
@@ -474,13 +511,25 @@ function M.new_team(env)
     function self:command(command)
         local name,body=command:match("^(%S+)%s*(.-)$")
         if name=="summon" or name=="bind" then self:summon(body)
+        elseif name=="self" then
+            local arg=body:lower()
+            if arg=="" then
+                local existing=self.children["self"]
+                self:set_self(not (existing and existing.token))
+            elseif arg=="on" or arg=="开启" then
+                self:set_self(true)
+            elseif arg=="off" or arg=="关闭" then
+                self:set_self(false)
+            else
+                notice("用法：/buddy self [on|off]")
+            end
         elseif name=="do" then self:interrupt(body)
         elseif name=="auto" then self:set_autonomy(body:lower()~="off",body~="" and body or nil)
         elseif name=="stop" or name=="stay" or name=="follow" or name=="release" then
             self:interrupt((body~="" and body.." " or "")..name,name)
         elseif name=="list" or name=="status" then self:fetch_roster(function()
             local state=self:panel_state()
-            if #state.roster==0 then notice("尚无伙伴：/buddy summon 名字");return end
+            if #state.roster==0 then notice("尚无托管角色或伙伴：/buddy self 或 /buddy summon 名字");return end
             if state.mode=="autonomous" then
                 notice((state.paused and "伙伴自主已暂停" or "伙伴自主模式").."。长期目标："..state.goal)
             else
@@ -491,12 +540,12 @@ function M.new_team(env)
             end
         end)
         elseif name=="ai" then self:set_listening(body:lower()~="off")
-        else notice("用法：/buddy setup | pair <token> [8766] | unpair | summon 名字 | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
+        else notice("用法：/buddy setup | pair <token> [8766] | unpair | self [on|off] | summon 名字 | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
     end
     function self:accepts_chat(text)
         if not self.listening then return false end
         local name=text:match("^%s*@(%S+)")
-        if not name or name=="自己" then return false end
+        if not name then return false end
         if Names.is_all(name) then return true end
         for _,row in ipairs(self.roster) do
             if row.name:lower()==name:lower() then return true end

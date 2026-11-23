@@ -162,10 +162,13 @@ def companion_profile(*, compact=False):
         "When home capability is advertised, set_home {anchor_id}, return_home {home_id} and stay_home {home_id, radius?} with duration or end_at are supported. "
         "When refuel capability is advertised, refuel {building_id, fuel_prefab, count|at_least} supports campfire/firepit refueling and optional duration maintenance with at_least. "
         "When hunger capability is advertised, hunger_ratio {at_least} eats carried safe food and supports optional duration maintenance. "
-        "When cook_meal is advertised, query_meals lists verified Crock Pot combinations for cook_meal {building_id, product, ingredients}. "
+        "When cook_meal is advertised, query_meals lists verified Crock Pot combinations for cook_meal {building_id, product, ingredients} (including meatballs, ratatouille, perogies, baconeggs, bonestew, honeyham, honeynuggets, taffy, trailmix, dragonpie). "
         "When the owner asks you to cook a meal, NEVER plan an eat task to consume the cooked dish yourself unless the owner explicitly tells you to eat it; keep it in inventory, hand it over with give_owner if asked, or store it if asked. "
         "Do not plan eat unless the owner asks you to eat or your own hunger is genuinely low. "
         "When ignite_tree is advertised, ignite_tree {tree_guid} ignites an observed safe isolated tree (evergreen/deciduoustree/twiggytree) with a carried torch. "
+        "When combat is advertised, observed enemies appear in enemies[] with targeting_owner/targeting_buddy/hostile/health. "
+        "Use attack {target_guid} or attack {prefab, count} to hunt/slay enemies, or defend_owner {} (with optional task-level duration) to protect the owner and engage threats near them. "
+        "The executor automatically equips carried armor, helmet, and best melee weapon before fighting, and safely retreats if health drops below min_health_ratio (default 0.35). "
         "places contains bounded memory of buildings actually seen by the buddy; query_places can filter it. "
         "An unconfirmed distant building is REMEMBERED, not missing. Use visit_building with its ID to return over long distances. "
         "Never use move_to for a distant remembered building: move_to still has a 20-unit limit and its center may be occupied. "
@@ -177,7 +180,7 @@ def companion_profile(*, compact=False):
         "search_memory describes historical observations, never proof of current availability. "
         "Keep task IDs, search_budget_seconds and search_budget_distance stable so reviews do not reset spent search budgets. "
         "On search budget exhaustion, assess progress once; retain a useful task to resume after cooldown or explain blockage. "
-        "Do not create unrelated move_to tasks to bypass search budgets. No full-world region graph, unseen-building search or combat exists yet. "
+        "Do not create unrelated move_to tasks to bypass search budgets. No full-world region graph or unseen-building search exists yet. "
         "Explain unsupported requests using agent_reply blocked. "
         "Never invent GUIDs or unseen coordinates; move_to is limited to 20 units, with land checked by the server. "
         "return_owner tracks the moving human and completes within 4 units; follow/stay complete on observed mode. "
@@ -205,7 +208,7 @@ def companion_profile(*, compact=False):
         "If the latest message changes the work, patch the existing board and explicitly cancel obsolete tasks. "
         "For ordered work, keep the required prerequisite task and make the new task depend on it. "
         "The runtime applies updates between native actions using its latest observation. "
-        "After completing the WHOLE instruction, reply with observed evidence; the native actor then follows the owner. "
+        "After completing the WHOLE instruction, reply with observed evidence; the native actor then follows the owner (or stays in place when is_self=true). "
         "If search is unavailable/forbidden or no safe new search point remains, explain the observed limit. "
         "Static game knowledge below is background only; it does not grant unsupported actions.\n"
     )
@@ -404,8 +407,9 @@ class CompanionPlanner:
             return request_plan(self.api_url, self.key, self.model, context, history, cancel,
                                 recipe_query=self.recipe_query, on_error=self.error_handler)
         prompt = (
-            "You are ONE coordinator for up to two DST companions owned by one human. Return JSON only. "
+            "You are ONE coordinator for up to two DST companions and optionally the owner's own piloted character (buddy_id=\"self\", is_self=true). Return JSON only. "
             + COMPACT_FORMAT +
+            "When buddy_id=\"self\" (is_self=true) is requested, that actor IS the human owner's character: do NOT assign follow, return_owner, give_owner, or receive_item to \"self\"; after finishing, speak in first person as the player's autopilot instead of promising to follow. "
             "Provide exactly one assignment per request_ids entry. Other companions continue executing. "
             "Each requested companion speaks in concise single-line Chinese in its own reply. "
             "The matching companion speaks through its native actor and chat; the coordinator never speaks to the player. "

@@ -23,7 +23,7 @@ from common.companion_transfer import (COUNTED_TARGETS, STORAGE_TARGETS, TRANSFE
 
 CAPABILITIES = {"collect", "move", "follow", "stay", "recipes", "equip", "unequip", "work", "craft", "place", "search",
                 "storage", "give_owner", "drop_item", "receive_item", "visit_building", "timed_return", "eat",
-                "refuel", "home", "hunger", "cook_meal", "ignite_tree"}
+                "refuel", "home", "hunger", "cook_meal", "ignite_tree", "combat"}
 RESOURCE_NAMES = {"grass": "cutgrass", "sapling": "twigs", "berrybush": "berries", "berrybush2": "berries",
                   "carrot_planted": "carrot", "reeds": "cutreeds", "logs": "log"}
 STORAGE_WAIT_SECONDS = 60
@@ -64,7 +64,7 @@ def validate_target(target, *, supported=CAPABILITIES):
         return {"type": kind, **validate_camp_target(target)}
     required = {"inventory": "craft" if "recipe_id" in target else "collect", "structure": "place", "equip": "equip",
                 "unequip": "unequip", "visit_building": "visit_building", "set_home": "home", "return_home": "home",
-                "stay_home": "home", "hunger_ratio": "hunger",
+                "stay_home": "home", "hunger_ratio": "hunger", "attack": "combat", "defend_owner": "combat",
                 "move_to": "move", "return_owner": "follow", "follow": "follow", "stay": "stay"}
     if kind not in required or required[kind] not in supported:
         raise ValueError("Unsupported companion task target/capability: " + str(kind))
@@ -72,7 +72,9 @@ def validate_target(target, *, supported=CAPABILITIES):
               "structure": {"type", "prefab", "recipe_id", "x", "z", "radius", "placement"},
               "equip": {"type", "prefab"}, "unequip": {"type", "prefab"}, "visit_building": {"type", "building_id"},
               "set_home": {"type", "anchor_id"}, "return_home": {"type", "home_id"}, "stay_home": {"type", "home_id", "radius"},
-              "hunger_ratio": {"type", "at_least"}}
+              "hunger_ratio": {"type", "at_least"},
+              "attack": {"type", "target_guid", "prefab", "count", "min_health_ratio"},
+              "defend_owner": {"type", "min_health_ratio"}}
     allowed = fields.get(kind, {"type"})
     extra = set(target) - allowed
     if extra:
@@ -106,6 +108,33 @@ def validate_target(target, *, supported=CAPABILITIES):
         if not number(ratio) or not 0 < ratio <= 1:
             raise ValueError("Invalid hunger target")
         return {"type": kind, "at_least": float(ratio)}
+    if kind in {"attack", "defend_owner"}:
+        clean = {"type": kind}
+        if "min_health_ratio" in target:
+            ratio = target["min_health_ratio"]
+            if not number(ratio) or not 0.15 <= float(ratio) <= 0.85:
+                raise ValueError("min_health_ratio must be between 0.15 and 0.85")
+            clean["min_health_ratio"] = float(ratio)
+        if kind == "attack":
+            has_guid = "target_guid" in target
+            has_prefab = "prefab" in target
+            if has_guid == has_prefab:
+                raise ValueError("attack target requires either target_guid or prefab")
+            if has_guid:
+                tguid = target["target_guid"]
+                if type(tguid) is not int or not 0 < tguid <= 2**53 - 1:
+                    raise ValueError("attack target_guid must be a positive integer")
+                clean["target_guid"] = tguid
+                clean["count"] = 1
+            else:
+                prefab = target["prefab"]
+                if not isinstance(prefab, str) or not re.fullmatch(r"[a-z0-9_]{1,60}", prefab):
+                    raise ValueError("attack prefab must be a canonical entity prefab")
+                count = target.get("count", 1)
+                if type(count) is not int or not 1 <= count <= 20:
+                    raise ValueError("attack count must be 1..20")
+                clean.update(prefab=prefab, count=count)
+        return clean
     if kind == "inventory":
         prefab, count = target.get("prefab"), target.get("count")
         if (not isinstance(prefab, str) or not re.fullmatch(r"[a-z0-9_]{1,60}", prefab)
@@ -180,6 +209,10 @@ def evaluate_target(target, state):
     if kind in {"cook_meal", "ignite_tree"}:
         err = camp_error(target, state)
         return 0, 1, not bool(err), err
+    if kind == "attack":
+        return 0, target.get("count", 1), True, ""
+    if kind == "defend_owner":
+        return 0, 1, True, ""
     if kind in {"inventory", "receive_item"}:
         return (buddy.get("inventory") or {}).get(target["prefab"], 0), target["count"], True, ""
     if kind in PLACE_TARGETS:
@@ -292,6 +325,21 @@ class CompanionTasks:
             return
         if kind in {"cook_meal", "ignite_tree"}:
             camp_execution.progress(task, record, state)
+            return
+        if kind == "attack":
+            kills = record.get("combat_kills", 0)
+            req = task["target"].get("count", 1)
+            task.update(progress={"current": min(kills, req), "required": req},
+                        status="done" if kills >= req else "in_progress" if kills else task["status"])
+            if kills >= req:
+                task["blocked_reason"] = ""
+            return
+        if kind == "defend_owner":
+            if task.get("duration") is None and task.get("end_at") is None:
+                if record.get("defend_cleared"):
+                    task.update(progress={"current": 1, "required": 1}, status="done", blocked_reason="")
+                else:
+                    task.update(progress={"current": 0, "required": 1})
             return
         if kind == "hunger_ratio":
             record.setdefault("transfer_key", uuid.uuid4().hex)
@@ -437,6 +485,13 @@ class CompanionTasks:
             synthetic = {"kind": op, **data}
             camp_execution.on_completed(task["target"], record, synthetic, action.get("reason", ""), actor_state(observed))
             return True
+        if record and task and task["target"]["type"] in {"attack", "defend_owner"}:
+            if action["status"] == "completed" and action.get("reason") == "target_killed":
+                record["combat_kills"] = record.get("combat_kills", 0) + 1
+                return True
+            if action.get("reason") == "low_health_retreat":
+                record["blocked"] = "low_health_retreat"
+                return True
         if record and task and task["target"]["type"] in STORAGE_TARGETS:
             if action["status"] == "failed" and action.get("reason") == "chest_busy":
                 record.setdefault("storage_wait_started", self.clock())
@@ -492,6 +547,39 @@ class CompanionTasks:
             return "needs_replan", {"reason": item.get("unequip_reason") or "cannot_stow_equipment"}
         return "unequip", {"item_guid": item["guid"]}
 
+    @staticmethod
+    def _combat_gear_equip(observed):
+        if "equip" not in capabilities(observed):
+            return None
+        gear = [r for r in observed.get("equipment", []) if r.get("usable")]
+        # 1. Equip best body & head armor first
+        for slot in ("body", "head"):
+            slot_armors = [r for r in gear if r.get("slot") == slot and (r.get("armor") or 0) > 0]
+            if slot_armors:
+                best = max(slot_armors, key=lambda r: (r.get("armor") or 0, 1 if r.get("equipped") else 0))
+                if not best.get("equipped"):
+                    return best["guid"]
+        # 2. Equip highest-damage melee weapon (damage > 10)
+        weapons = [r for r in gear if r.get("slot") == "hands" and (r.get("damage") or 0) > 10]
+        if weapons:
+            best_w = max(weapons, key=lambda r: (r.get("damage") or 0, 1 if r.get("equipped") else 0))
+            if not best_w.get("equipped"):
+                return best_w["guid"]
+        return None
+
+    @staticmethod
+    def _owner_threats(observed):
+        owner_pos = (observed.get("owner") or {}).get("position") or {}
+        ox, oz = owner_pos.get("x"), owner_pos.get("z")
+        threats = []
+        for enemy in observed.get("enemies", []):
+            if enemy.get("targeting_owner") or enemy.get("targeting_buddy"):
+                threats.append(enemy)
+            elif enemy.get("hostile") and number(ox) and number(oz) and number(enemy.get("x")) and number(enemy.get("z")):
+                if math.hypot(enemy["x"] - ox, enemy["z"] - oz) <= 12:
+                    threats.append(enemy)
+        return threats
+
     def next_action(self, observed):
         view = self.view(observed)
         resumed = False
@@ -527,6 +615,7 @@ class CompanionTasks:
             required = {"inventory": "craft" if target.get("recipe_id") else "collect", "structure": "place",
                         "move_to": "move", "return_owner": "follow", "set_home": "home", "return_home": "home",
                         "stay_home": "home", "hunger_ratio": "hunger", "refuel": "refuel",
+                        "attack": "combat", "defend_owner": "combat",
                         **{t: "storage" for t in STORAGE_TARGETS}}.get(kind, kind)
             if required not in capabilities(observed):
                 return task, "unsupported", {"reason": "capability_unavailable:" + required}
@@ -640,6 +729,43 @@ class CompanionTasks:
                 if not equipped:
                     return task, "equip", {"item_guid": torches[0]["guid"]}
                 return task, "ignite_tree", {"tree_guid": target["tree_guid"]}
+            if kind in {"attack", "defend_owner"}:
+                buddy = observed.get("buddy") or {}
+                hp, hp_max = buddy.get("health"), buddy.get("health_max")
+                min_hp = target.get("min_health_ratio", 0.35)
+                if number(hp) and number(hp_max) and hp_max > 0 and hp / hp_max < min_hp:
+                    return task, "needs_replan", {"reason": "low_health_retreat"}
+                enemies = observed.get("enemies", [])
+                chosen = None
+                if kind == "attack":
+                    if "target_guid" in target:
+                        chosen = next((e for e in enemies if e.get("guid") == target["target_guid"]), None)
+                    else:
+                        matching = [e for e in enemies if e.get("prefab") == target["prefab"]]
+                        if matching:
+                            chosen = min(matching, key=lambda e: e.get("distance", 99))
+                    if not chosen:
+                        return task, "needs_replan", {"reason": "enemy_not_in_view"}
+                else:
+                    threats = self._owner_threats(observed)
+                    if threats:
+                        chosen = threats[0]
+                    else:
+                        if task.get("duration") is None and task.get("end_at") is None:
+                            self.goals.records[task["id"]]["defend_cleared"] = True
+                            return task, "waiting", {}
+                        if not observed.get("is_self") and number(buddy.get("owner_distance")) and buddy["owner_distance"] > 5:
+                            navigation.append((task, "follow", {}))
+                        else:
+                            navigation.append((task, "waiting", {}))
+                        continue
+                gear_guid = self._combat_gear_equip(observed)
+                if gear_guid is not None:
+                    return task, "equip", {"item_guid": gear_guid}
+                args = {"target_guid": chosen["guid"]}
+                if "min_health_ratio" in target:
+                    args["min_health_ratio"] = target["min_health_ratio"]
+                return task, "attack", args
             if kind in STORAGE_TARGETS:
                 cguid = container_guid_for(target, observed.get("places"))
                 chest = next((r for r in observed.get("containers", []) if r["guid"] == cguid), None)

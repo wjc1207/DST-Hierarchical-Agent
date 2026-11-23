@@ -48,7 +48,7 @@ def validate_timing(task, day):
                 raise ValueError("Only return_owner accepts at, with no other timing fields")
             return {"at": moment(raw["at"], day)}, ""
         stay = kind == "stay_home"
-        maintenance = task["target"]["type"] in {"hunger_ratio", "refuel"}
+        maintenance = task["target"]["type"] in {"hunger_ratio", "refuel", "defend_owner"}
         if task["target"]["type"] == "refuel" and "duration" in raw and "at_least" not in task["target"]:
             raise ValueError("Refuel duration requires at_least; legacy count is one-shot only")
         if "duration" in raw and "end_at" in raw:

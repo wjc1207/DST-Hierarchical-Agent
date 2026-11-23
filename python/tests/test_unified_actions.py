@@ -613,6 +613,101 @@ class Phase2CampWorkUnificationTests(unittest.TestCase):
         rec_action = bridge.start_action("store_item:60:inventory:1", obs_id, transfer_count=10)
         self.assertEqual(rec_action["action"]["transfer_count"], 10)
 
+    def test_companion_combat_auto_equips_armor_weapon_and_kills_or_retreats(self):
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["combat"]),
+            equipment=[
+                {"guid": 301, "prefab": "axe", "slot": "hands", "equipped": True, "usable": True, "tools": ["CHOP"], "damage": 27},
+                {"guid": 302, "prefab": "spear", "slot": "hands", "equipped": False, "usable": True, "tools": [], "damage": 34},
+                {"guid": 303, "prefab": "armorwood", "slot": "body", "equipped": False, "usable": True, "tools": [], "armor": 0.8},
+                {"guid": 304, "prefab": "footballhat", "slot": "head", "equipped": False, "usable": True, "tools": [], "armor": 0.8},
+            ],
+            enemies=[
+                {"guid": 901, "prefab": "spider", "health": 100, "health_max": 100, "distance": 5.0, "x": 5.0, "z": 0.0,
+                 "hostile": True, "targeting_buddy": False, "targeting_owner": True},
+            ],
+        )
+        tasks.adopt({
+            "day": 1, "goal": "Slay spider",
+            "tasks": [{"id": "fight1", "title": "Slay spider", "priority": 1, "target": {"type": "attack", "target_guid": 901}}],
+        }, obs)
+
+        # 1. Auto-equip body armor -> head helmet -> best weapon (spear > axe) -> attack
+        _, op1, args1 = tasks.next_action(obs)
+        self.assertEqual((op1, args1), ("equip", {"item_guid": 303}))
+        obs["equipment"][2]["equipped"] = True
+
+        _, op2, args2 = tasks.next_action(obs)
+        self.assertEqual((op2, args2), ("equip", {"item_guid": 304}))
+        obs["equipment"][3]["equipped"] = True
+
+        _, op3, args3 = tasks.next_action(obs)
+        self.assertEqual((op3, args3), ("equip", {"item_guid": 302}))
+        obs["equipment"][0]["equipped"] = False
+        obs["equipment"][1]["equipped"] = True
+
+        _, op4, args4 = tasks.next_action(obs)
+        self.assertEqual((op4, args4), ("attack", {"target_guid": 901}))
+
+        # Low HP triggers safe retreat instead of suicide
+        low_obs = copy.deepcopy(obs)
+        low_obs["buddy"]["health"] = 30
+        low_obs["buddy"]["health_max"] = 150
+        _, op_low, args_low = tasks.next_action(low_obs)
+        self.assertEqual((op_low, args_low), ("needs_replan", {"reason": "low_health_retreat"}))
+
+        # Kill receipt completes the attack task
+        tasks.on_result("fight1", {"op": "attack", "status": "completed", "reason": "target_killed", "data": {"target_guid": 901}}, obs)
+        self.assertEqual(tasks.view(obs)["status"], "completed")
+
+    def test_companion_defend_owner_and_expanded_meals_validation(self):
+        tasks = CompanionTasks(clock=lambda: 10.0)
+        obs = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["combat"]),
+            enemies=[
+                {"guid": 910, "prefab": "hound", "health": 150, "health_max": 150, "distance": 6.0, "x": 3.0, "z": 0.0,
+                 "hostile": True, "targeting_buddy": False, "targeting_owner": True},
+            ],
+        )
+        tasks.adopt({
+            "day": 1, "goal": "Protect owner",
+            "tasks": [{"id": "def1", "title": "Defend owner", "priority": 1, "duration": 0.2,
+                       "target": {"type": "defend_owner", "min_health_ratio": 0.4}}],
+        }, obs)
+        _, op, args = tasks.next_action(obs)
+        self.assertEqual((op, args), ("attack", {"target_guid": 910, "min_health_ratio": 0.4}))
+
+        # Bridge validates attack capability + observed enemy GUID and expanded meals
+        now = [100.0]
+        bridge = CompanionBridge(TOKEN, clock=lambda: now[0])
+        snap = companion_obs(
+            capabilities=sorted(list(companion_obs()["capabilities"]) + ["combat"]),
+            enemies=obs["enemies"],
+        )
+        snap["places"]["buildings"].append({"id": "building:70", "guid": 70, "prefab": "cookpot", "status": "observed"})
+        bridge.exchange({
+            "token": TOKEN, "session_id": "s2", "sequence": 1,
+            "state": {"ready": True, "snapshot_age_ms": 10,
+                      "control": {"enabled": True, "mode": "instruction", "revision": 1, "instruction": "fight", "messages": []},
+                      "companion": snap},
+        })
+        obs_id = bridge.observe()["observation_id"]
+        rec = bridge.action("attack", obs_id, {"target_guid": 910, "min_health_ratio": 0.4})
+        self.assertEqual(rec["op"], "attack")
+        bridge.actions[rec["id"]]["status"] = "completed"
+        bridge.active = None
+
+        obs_id = bridge.observe()["observation_id"]
+        with self.assertRaises(BridgeError):
+            bridge.action("attack", obs_id, {"target_guid": 99999})
+        for dish in ("perogies", "baconeggs", "bonestew", "honeyham", "honeynuggets", "taffy", "trailmix", "dragonpie"):
+            obs_id = bridge.observe()["observation_id"]
+            rec_m = bridge.action("start_meal", obs_id, {"building_id": "building:70", "product": dish})
+            self.assertEqual(rec_m["op"], "start_meal")
+            bridge.actions[rec_m["id"]]["status"] = "completed"
+            bridge.active = None
+
 
 if __name__ == "__main__":
     unittest.main()

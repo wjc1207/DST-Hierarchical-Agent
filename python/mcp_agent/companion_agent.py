@@ -292,9 +292,11 @@ class CompanionAgent:
                 self.reason = "action_failed:" + reason
             else:
                 self.prerequisite_replans = 0
-                if action["status"] == "completed" and action.get("reason") in {
+                if action["status"] == "completed" and (action.get("reason") in {
                         "one_item_transferred", "one_item_dropped", "inventory_increased", "equipped", "unequipped",
-                        "work_progressed", "work_finished", "new_structure_observed", "arrived", "building_arrived"}:
+                        "work_progressed", "work_finished", "new_structure_observed", "arrived", "building_arrived",
+                        "target_killed", "combat_progressed", "pot_loaded", "pot_started", "tree_ignited"}
+                        or str(action.get("reason") or "").startswith("meal_harvested:")):
                     self.failures = 0  # Only real progress breaks a consecutive failure streak.
             # The result may arrive after the observation read at the start of this cycle.
             # Read a new snapshot next cycle before selecting another target or verifying completion.

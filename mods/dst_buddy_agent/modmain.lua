@@ -25,9 +25,16 @@ local function game_paused()
 end
 local function notice(text) if G.ChatHistory then G.ChatHistory:SendCommandResponse("[Companion] "..text) end end
 local function log(event,reason,details)
-    local row={event=event,reason=reason,version="0.8.1"}
+    local row={event=event,reason=reason,version="0.9.0"}
     for key,value in pairs(details or {}) do row[key]=value end
     print("[JEV_COMPANION]"..json.encode(row))
+end
+local function mod_number(name,default,lo,hi)
+    local ok,val=G.pcall(GetModConfigData,name)
+    val=ok and tonumber(val) or default
+    if not val or val~=val then val=default end
+    if val<lo then val=lo elseif val>hi then val=hi end
+    return val
 end
 local function apply_config(cfg)
     config=cfg or {}
@@ -47,9 +54,13 @@ AddPrefabPostInit("wilson",function(inst) Presentation.attach(G,inst) end)
 local function install_server(world)
     if not world.ismastersim or world.components.jev_companion_persistence then return end
     world:AddComponent("jev_companion_persistence")
+    local opts={
+        scan_radius=mod_number("scan_radius",20,10,25),
+        action_delay_ms=mod_number("action_delay_ms",0,0,1000),
+    }
     world.components.jev_companion_persistence.server=Server.new_team(World.new(G,function(player,packet)
         G.SendModRPCToClient(GetClientModRPC(NS,"reply"),player.userid,json.encode(packet))
-    end,Client.validate_text,function(value) return #json.encode(value) end,function(event,details) log(event,nil,details) end))
+    end,Client.validate_text,function(value) return #json.encode(value) end,function(event,details) log(event,nil,details) end,opts))
 end
 AddPrefabPostInit("forest",install_server)
 AddPrefabPostInit("cave",install_server)

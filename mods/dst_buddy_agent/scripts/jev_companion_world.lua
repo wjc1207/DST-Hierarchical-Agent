@@ -44,8 +44,14 @@ local function world_time(G)
     end
     return time
 end
-function M.new(G,reply,validate_text,encoded_size,trace)
-    local E={now=G.GetTime,reply=reply,validate_text=validate_text,encoded_size=encoded_size,trace=trace}
+function M.new(G,reply,validate_text,encoded_size,trace,options)
+    options=type(options)=="table" and options or {}
+    local scan_radius=tonumber(options.scan_radius) or 20
+    if scan_radius<10 then scan_radius=10 elseif scan_radius>25 then scan_radius=25 end
+    local action_delay_ms=tonumber(options.action_delay_ms) or 0
+    if action_delay_ms<0 then action_delay_ms=0 elseif action_delay_ms>1000 then action_delay_ms=1000 end
+    local E={now=G.GetTime,reply=reply,validate_text=validate_text,encoded_size=encoded_size,trace=trace,
+        scan_radius=scan_radius,action_delay_ms=action_delay_ms}
     function E.position(a) local x,_,z=a.Transform:GetWorldPosition();return x,z end
     function E.distance(a,b) return math.sqrt(a:GetDistanceSqToInst(b)) end
     function E.dead(a)
@@ -209,7 +215,8 @@ function M.new(G,reply,validate_text,encoded_size,trace)
     end
     function E.count(a,prefab) local _,counts=inventory(a);return counts[prefab] or 0 end
     local function target(a,e)
-        if e==a or not e:IsValid() or e:HasTag("INLIMBO") or e:HasTag("heavy") or e:HasTag("fire") or E.distance(a,e)>15 then return end
+        local max_r=math.min(15,E.scan_radius or 20)
+        if e==a or not e:IsValid() or e:HasTag("INLIMBO") or e:HasTag("heavy") or e:HasTag("fire") or E.distance(a,e)>max_r then return end
         local c=e.components or {}
         if c.burnable and c.burnable:IsBurning() then return end
         local kind,product
@@ -235,6 +242,11 @@ function M.new(G,reply,validate_text,encoded_size,trace)
     E.query=native.query
     E.search_point=perception.point
     E.search_arrived=perception.arrived
+    function E.health_ratio(a)
+        local h=a and a:IsValid() and a.components and a.components.health
+        if not h or not h.GetPercent then return 1 end
+        return h:GetPercent()
+    end
     function E.threats(a)
         local x,z=E.position(a)
         local threats={}
@@ -306,11 +318,14 @@ function M.new(G,reply,validate_text,encoded_size,trace)
     end
     function E.snapshot(player,a,r)
         local px,pz=E.position(player)
+        local is_self=r.is_self==true or (a~=nil and a==player)
+        local base_caps=is_self and {"stay","move","collect","stop","say"} or {"follow","stay","move","collect","stop","say"}
         local state={owner={guid=player.GUID,userid=player.userid,position={x=round(px),z=round(pz)}},bound=a~=nil,revision=r.revision or 0,
-            token=r.token,mode=r.mode or "stay",sampled_at=G.GetTime(),capabilities={"follow","stay","move","collect","stop","say"}}
+            token=r.token,mode=r.mode or "stay",is_self=is_self,sampled_at=G.GetTime(),capabilities=base_caps,
+            simulation={scan_radius=E.scan_radius,action_delay_ms=E.action_delay_ms}}
         if not a or not a:IsValid() then state.bound=false;return state end
         local x,z=E.position(a);local c=a.components;local items,counts=inventory(a);local nearby={}
-        local entities=G.TheSim:FindEntities(x,0,z,20,nil,{"INLIMBO","FX","DECOR"})
+        local entities=G.TheSim:FindEntities(x,0,z,E.scan_radius or 20,nil,{"INLIMBO","FX","DECOR"})
         for _,e in ipairs(entities) do local row=target(a,e);if row then nearby[#nearby+1]=row end end
         table.sort(nearby,function(l,r) return l.distance<r.distance end)
         local selected,seen,rest={},{},{}
@@ -353,14 +368,16 @@ function M.new(G,reply,validate_text,encoded_size,trace)
         state.places=places.snapshot(a,state.structures)
         state.refueling=native.refueling(a,entities)
         state.camp_work=native.camp_work(a,entities)
+        state.enemies=native.enemies(a,player,entities)
         state.capabilities[#state.capabilities+1]="visit_building"
         state.capabilities[#state.capabilities+1]="home"
         state.capabilities[#state.capabilities+1]="refuel"
         state.capabilities[#state.capabilities+1]="cook_meal"
         state.capabilities[#state.capabilities+1]="ignite_tree"
+        if c.combat then state.capabilities[#state.capabilities+1]="combat" end
         for name,value in pairs(storage.snapshot(a,entities,r)) do state[name]=value end
-        for _,name in ipairs({"storage","give_owner","drop_item"}) do state.capabilities[#state.capabilities+1]=name end
-        if c.trader then state.capabilities[#state.capabilities+1]="receive_item" end
+        for _,name in ipairs(is_self and {"storage","drop_item"} or {"storage","give_owner","drop_item"}) do state.capabilities[#state.capabilities+1]=name end
+        if not is_self and c.trader then state.capabilities[#state.capabilities+1]="receive_item" end
         state.capabilities[#state.capabilities+1]="equip";state.capabilities[#state.capabilities+1]="unequip";state.capabilities[#state.capabilities+1]="work"
         if c.builder then for _,name in ipairs({"recipes","craft","place"}) do state.capabilities[#state.capabilities+1]=name end end
         state.world=world_time(G)
@@ -369,7 +386,7 @@ function M.new(G,reply,validate_text,encoded_size,trace)
             local speed=loco:GetRunSpeed()
             if speed>0 then
                 state.buddy.run_speed=round(speed)
-                state.capabilities[#state.capabilities+1]="timed_return"
+                if not is_self then state.capabilities[#state.capabilities+1]="timed_return" end
             end
         end
         return state

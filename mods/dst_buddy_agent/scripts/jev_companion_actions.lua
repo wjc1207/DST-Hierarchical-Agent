@@ -6,7 +6,10 @@ local ROCKS={rock1={"rocks","flint","nitre"},rock2={"rocks","flint","goldnugget"
 local WORK_ACTIONS={"CHOP","MINE"}
 local FIRE_PREFABS={campfire=true,firepit=true}
 local FUEL_PREFABS={log=true,charcoal=true,pinecone=true,acorn=true,twiggy_nut=true,twigs=true,cutgrass=true}
-local SAFE_MEALS={meatballs=true,ratatouille=true}
+local SAFE_MEALS={
+    meatballs=true,ratatouille=true,perogies=true,baconeggs=true,bonestew=true,
+    honeyham=true,honeynuggets=true,taffy=true,trailmix=true,dragonpie=true,
+}
 local IGNITE_TREES={evergreen=true,evergreen_sparse=true,deciduoustree=true,twiggytree=true}
 local MEAL_CATALOG={
     {product="ratatouille",ingredients={"carrot","carrot","carrot","carrot"},cook_seconds=20},
@@ -20,8 +23,44 @@ local MEAL_CATALOG={
     {product="meatballs",ingredients={"berries_juicy","berries_juicy","berries_juicy","meat"},cook_seconds=15},
     {product="meatballs",ingredients={"berries_juicy","berries_juicy","berries_juicy","smallmeat"},cook_seconds=15},
     {product="meatballs",ingredients={"berries_juicy","berries_juicy","berries_juicy","monstermeat"},cook_seconds=15},
+    {product="perogies",ingredients={"bird_egg","carrot","berries","meat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","berries","smallmeat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","berries","monstermeat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","carrot","meat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","carrot","smallmeat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","carrot","monstermeat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","ice","meat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","carrot","ice","monstermeat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","red_cap","berries","meat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","green_cap","berries","meat"},cook_seconds=20},
+    {product="perogies",ingredients={"bird_egg","blue_cap","berries","meat"},cook_seconds=20},
+    {product="baconeggs",ingredients={"bird_egg","bird_egg","meat","smallmeat"},cook_seconds=40},
+    {product="baconeggs",ingredients={"bird_egg","bird_egg","meat","monstermeat"},cook_seconds=40},
+    {product="baconeggs",ingredients={"bird_egg","bird_egg","meat","meat"},cook_seconds=40},
+    {product="baconeggs",ingredients={"bird_egg","bird_egg","smallmeat","monstermeat"},cook_seconds=40},
+    {product="bonestew",ingredients={"meat","meat","meat","berries"},cook_seconds=15},
+    {product="bonestew",ingredients={"meat","meat","meat","carrot"},cook_seconds=15},
+    {product="bonestew",ingredients={"meat","meat","smallmeat","smallmeat"},cook_seconds=15},
+    {product="bonestew",ingredients={"meat","meat","monstermeat","smallmeat"},cook_seconds=15},
+    {product="honeyham",ingredients={"meat","meat","honey","honey"},cook_seconds=40},
+    {product="honeyham",ingredients={"meat","meat","honey","berries"},cook_seconds=40},
+    {product="honeyham",ingredients={"meat","monstermeat","honey","honey"},cook_seconds=40},
+    {product="honeyham",ingredients={"meat","monstermeat","honey","berries"},cook_seconds=40},
+    {product="honeynuggets",ingredients={"meat","honey","berries","berries"},cook_seconds=40},
+    {product="honeynuggets",ingredients={"smallmeat","honey","berries","berries"},cook_seconds=40},
+    {product="honeynuggets",ingredients={"monstermeat","honey","berries","berries"},cook_seconds=40},
+    {product="honeynuggets",ingredients={"smallmeat","smallmeat","honey","honey"},cook_seconds=40},
+    {product="taffy",ingredients={"honey","honey","honey","twigs"},cook_seconds=40},
+    {product="taffy",ingredients={"honey","honey","honey","berries"},cook_seconds=40},
+    {product="taffy",ingredients={"honey","honey","honey","honey"},cook_seconds=40},
+    {product="trailmix",ingredients={"acorn_cooked","berries","berries","twigs"},cook_seconds=10},
+    {product="trailmix",ingredients={"acorn_cooked","berries","berries","berries"},cook_seconds=10},
+    {product="trailmix",ingredients={"acorn_cooked","berries_juicy","berries_juicy","twigs"},cook_seconds=10},
+    {product="dragonpie",ingredients={"dragonfruit","twigs","twigs","twigs"},cook_seconds=40},
+    {product="dragonpie",ingredients={"dragonfruit","berries","berries","berries"},cook_seconds=40},
 }
-local DEFAULT_RECIPES={"axe","pickaxe","torch","campfire","firepit","researchlab","rope","boards","cutstone","treasurechest","cookpot"}
+local DEFAULT_RECIPES={"axe","pickaxe","torch","spear","armorwood","footballhat","campfire","firepit","researchlab","rope","boards","cutstone","treasurechest","cookpot"}
+local NON_COMBAT_ALLY={chester=true,hutch=true,glommer=true,abigail=true,bernie_active=true,bernie_big=true}
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<100000 end
 -- Entity IDs are not coordinates; real DST worlds routinely use IDs >100000.
 local function valid_guid(v) return type(v)=="number" and v==v and v>=1 and v<=9007199254740991 and v%1==0 end
@@ -66,7 +105,46 @@ function M.new(G,E)
     end
     local function healthy(item)
         local c=item.components
-        return (not c.finiteuses or c.finiteuses:GetPercent()>0) and (not c.fueled or c.fueled:GetPercent()>0)
+        return (not c.finiteuses or c.finiteuses:GetPercent()>0)
+            and (not c.fueled or c.fueled:GetPercent()>0)
+            and (not c.armor or c.armor:GetPercent()>0)
+            and (not c.perishable or not c.perishable:IsSpoiled())
+    end
+    local function combat_target_valid(a,e,radius)
+        if not e or not e:IsValid() or e==a or e:HasTag("INLIMBO") or e:HasTag("player")
+            or e:HasTag("playerghost") or e:HasTag("companion") or e:HasTag("wall")
+            or NON_COMBAT_ALLY[e.prefab] or e._jev_companion_owner~=nil then return false end
+        local c=e.components or {}
+        if not c.combat or not c.health or c.health:IsDead() then return false end
+        if E.distance(a,e)>(radius or 20) then return false end
+        return a.components.combat and a.components.combat:CanTarget(e) or false
+    end
+    function A.enemies(a,owner,entities)
+        local rows={}
+        local radius=E.scan_radius or 20
+        for _,e in ipairs(entities or {}) do
+            if combat_target_valid(a,e,radius) then
+                local c=e.components or {}
+                local tb=c.combat.target==a
+                local to=owner~=nil and c.combat.target==owner
+                local hostile=tb or to or e:HasTag("hostile") or e:HasTag("monster")
+                local ex,ez=position(e)
+                rows[#rows+1]={guid=e.GUID,prefab=e.prefab,
+                    health=math.floor((c.health.currenthealth or 0)+0.5),
+                    health_max=math.floor((c.health.maxhealth or 0)+0.5),
+                    distance=math.floor(E.distance(a,e)*100+0.5)/100,
+                    x=math.floor(ex*100+0.5)/100,z=math.floor(ez*100+0.5)/100,
+                    hostile=hostile,targeting_buddy=tb,targeting_owner=to}
+            end
+        end
+        table.sort(rows,function(l,r)
+            local lp=(l.targeting_owner and 3 or 0)+(l.targeting_buddy and 2 or 0)+(l.hostile and 1 or 0)
+            local rp=(r.targeting_owner and 3 or 0)+(r.targeting_buddy and 2 or 0)+(r.hostile and 1 or 0)
+            if lp~=rp then return lp>rp end
+            return l.distance<r.distance
+        end)
+        while #rows>12 do table.remove(rows) end
+        return rows
     end
     local function can_equip(a,item)
         local equip=item.components.equippable
@@ -378,6 +456,21 @@ function M.new(G,E)
             local product=stewer.product
             if not stewer:Harvest(a) then return false,"meal_harvest_failed" end
             q.harvested_product=product;return true
+        elseif op=="attack" then
+            local target=valid_guid(args.target_guid) and G.Ents[args.target_guid]
+            if not combat_target_valid(a,target,20) then return false,"enemy_unavailable" end
+            local min_hp=tonumber(args.min_health_ratio) or 0.35
+            if min_hp<0.15 then min_hp=0.15 elseif min_hp>0.85 then min_hp=0.85 end
+            local hp_ratio=a.components.health and a.components.health.GetPercent and a.components.health:GetPercent() or 1
+            if hp_ratio<min_hp then return false,"low_health_retreat" end
+            q.attack_target=target
+            q.target_prefab=target.prefab
+            q.target_hp_before=target.components.health and target.components.health.currenthealth or 0
+            q.min_health_ratio=min_hp
+            q.combat_deadline=E.now()+12
+            q.last_swing=E.now()
+            a.components.combat:SetTarget(target)
+            return push(a,q,G.BufferedAction(a,target,G.ACTIONS.ATTACK))
         elseif op=="ignite_tree" then
             local target=valid_guid(args.tree_guid) and G.Ents[args.tree_guid]
             if not target or not target:IsValid() or not IGNITE_TREES[target.prefab] or target:HasTag("burnt") or target:HasTag("stump") or target:HasTag("monster") or target:HasTag("plantcreature") then
@@ -392,6 +485,7 @@ function M.new(G,E)
             local item=valid_guid(args.item_guid) and carried(a,args.item_guid)
             if not item or not can_equip(a,item) then return false,"item_not_equippable" end
             q.item_guid=item.GUID
+            q.combat_gear=(item.components.armor~=nil) or (item.components.weapon~=nil and item.components.tool==nil)
             return push(a,q,G.BufferedAction(a,nil,G.ACTIONS.EQUIP,item))
         elseif op=="unequip" then
             local item=valid_guid(args.item_guid) and carried(a,args.item_guid)
@@ -451,6 +545,38 @@ function M.new(G,E)
             return "completed","pot_started",{building_id=q.args.building_id,cook_seconds=q.cook_seconds}
         elseif q.op=="harvest_meal" and q.harvested_product then
             return "completed","meal_harvested:"..tostring(q.harvested_product),{building_id=q.args.building_id,product=q.harvested_product}
+        elseif q.op=="attack" then
+            local target=q.attack_target
+            local dead=not target or not target:IsValid() or (target.components.health and target.components.health:IsDead())
+            if dead then
+                if a.components.combat and a.components.combat.target==target then a.components.combat:SetTarget(nil) end
+                return "completed","target_killed",{target_guid=q.args.target_guid,target_prefab=q.target_prefab}
+            end
+            local hp_ratio=a.components.health and a.components.health.GetPercent and a.components.health:GetPercent() or 1
+            if hp_ratio<(q.min_health_ratio or 0.35) then
+                if a.components.combat and a.components.combat.target==target then a.components.combat:SetTarget(nil) end
+                return "interrupted","low_health_retreat",{target_guid=q.args.target_guid,health_ratio=math.floor(hp_ratio*100+0.5)/100}
+            end
+            if E.distance(a,target)>22 then
+                if a.components.combat and a.components.combat.target==target then a.components.combat:SetTarget(nil) end
+                return "failed","target_escaped",{target_guid=q.args.target_guid}
+            end
+            local now=E.now()
+            if now>=(q.combat_deadline or 0) then
+                if a.components.combat and a.components.combat.target==target then a.components.combat:SetTarget(nil) end
+                local hp_now=target.components.health and target.components.health.currenthealth or 0
+                if hp_now<(q.target_hp_before or 0) then
+                    return "completed","combat_progressed",{target_guid=q.args.target_guid,target_prefab=q.target_prefab,remaining_hp=math.floor(hp_now+0.5)}
+                end
+                return "failed","combat_timeout",{target_guid=q.args.target_guid}
+            end
+            local busy=a.sg and a.sg.HasStateTag and (a.sg:HasStateTag("attack") or a.sg:HasStateTag("busy"))
+            if not busy and (not a.components.combat:InCooldown()) and now-(q.last_swing or 0)>=0.35 then
+                q.last_swing=now
+                a.components.combat:SetTarget(target)
+                a.components.locomotor:PushAction(G.BufferedAction(a,target,G.ACTIONS.ATTACK),true)
+            end
+            return
         elseif q.op=="ignite_tree" then
             local target=q.ignite_target
             local lit=target and target:IsValid() and (target:HasTag("burnt") or target:HasTag("fire")
@@ -574,8 +700,11 @@ function M.new(G,E)
             local equipped=not not a.components.inventory:IsItemEquipped(item)
             local can_unequip,unequip_reason
             if equipped then can_unequip,unequip_reason=Storage.can_stow(a,item) end
+            local dmg=item.components.weapon and type(item.components.weapon.damage)=="number" and item.components.weapon.damage or 0
+            local arm=item.components.armor and type(item.components.armor.absorb_percent)=="number" and item.components.armor.absorb_percent or 0
             equipment[#equipment+1]={guid=item.GUID,prefab=item.prefab,slot=item.components.equippable.equipslot,
-                equipped=equipped,can_unequip=can_unequip,unequip_reason=unequip_reason,usable=healthy(item),tools=tools}
+                equipped=equipped,can_unequip=can_unequip,unequip_reason=unequip_reason,usable=healthy(item),
+                tools=tools,damage=dmg>0 and dmg or nil,armor=arm>0 and arm or nil}
             end
         end
         return {work_targets=works,structures=structures,equipment=equipment,recipes=recipes}

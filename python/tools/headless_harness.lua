@@ -197,6 +197,7 @@ function HEADLESS.init(cfg)
     end
 
     local server = Server.new_team(world_env)
+    HEADLESS.world_env = world_env
     HEADLESS.server = server
 
     local clock = rawget(_G, "walltime") or function() return GetTime() end
@@ -294,6 +295,18 @@ function HEADLESS.setup_arena(spec_json)
         clear_inventory(HEADLESS.owner)
     end
     HEADLESS.owner.Transform:SetPosition(ax, 0, az)
+    if spec.reset_owner then
+        local o = HEADLESS.owner
+        if o.components and o.components.health then o.components.health:SetPercent(1) end
+        if o.components and o.components.hunger then o.components.hunger:SetPercent(1) end
+        if o.components and o.components.sanity then o.components.sanity:SetPercent(1) end
+        if o.components and o.components.temperature then o.components.temperature:SetTemperature(25) end
+        o:ClearBufferedAction()
+        if o.components and o.components.locomotor then
+            o.components.locomotor:Clear()
+            o.components.locomotor:Stop()
+        end
+    end
 
     if spec.reset_buddy then
         local b = get_bound_buddy("buddy1")
@@ -369,6 +382,12 @@ function HEADLESS.set_listening(on)
     if HEADLESS.client then HEADLESS.client:set_listening(on == true) end
 end
 
+function HEADLESS.set_simulation(scan_radius, action_delay_ms)
+    if HEADLESS.server and HEADLESS.server.set_simulation then
+        HEADLESS.server:set_simulation({scan_radius = scan_radius, action_delay_ms = action_delay_ms})
+    end
+end
+
 function HEADLESS.give_buddy(prefab, count, buddy_id)
     local b = get_bound_buddy(buddy_id or "buddy1")
     local ok = b ~= nil and give_items(b, prefab, count or 1) or false
@@ -426,6 +445,12 @@ function HEADLESS.inspect(tag)
         tag = tag or "inspect",
         sim_time = round2(GetTime()),
         owner_inventory = inventory_counts(HEADLESS.owner),
+        owner = {
+            guid = HEADLESS.owner.GUID,
+            health = HEADLESS.owner.components.health and round2(HEADLESS.owner.components.health.currenthealth) or nil,
+            hunger = HEADLESS.owner.components.hunger and round2(HEADLESS.owner.components.hunger.current) or nil,
+            inventory = inventory_counts(HEADLESS.owner),
+        },
         buddy = buddy_info,
         buildings = buildings,
         chests = chests,

@@ -41,12 +41,12 @@ flowchart TB
 
 DSH 使用同一套 MCP 工具，也可用 `submit_task` 新增单项任务。游戏动作和看板工具详见 [MCP 接口](MCP.md)。
 
-## 架构决策：为什么玩家版坚持客户端 Mod
+## 架构决策：统一服务端智能体核心（`self` + `buddy1` + `buddy2`）与可配置仿真约束
 
-- **定位差异**：`DST Player Agent`（玩家版）不仅是自动化游玩工具，更是面向大模型的 **《饥荒联机版》智能体评测集 / Benchmark**；`DST Buddy Agent`（伙伴版）则定位为面向真实玩家的联机 AI 队友。
-- **保留战争迷雾与局部视野**：作为评测基准，智能体必须与人类玩家处于完全公平的信息边界——仅能感知客户端 `ThePlayer` 视野与已探索地图/记忆，**不得**通过服务端 `TheWorld` 上帝视角提前获知未探索地形、资源分布或隐藏实体。
-- **保留客户端网络延迟与真实同步**：角色操控必须经由真实客户端 `playercontroller`、`SendRPCToServer` 和 `replica` 复制链路，真实保留网络往返延迟、移动预测/回滚、背包同步与动作打断等实机约束。
-- **零服务端侵入**：客户端 Mod 无需服主开启任何服务端插件，可在任意标准房间或本地无头服中运行。
-- **自动化测试策略（不以牺牲真实性换取测试便利）**：
-  - 玩家版不迁移至服务端，而是通过 `python/tools/client_e2e_sandbox.py` 拉起**静音小窗隔离真客户端**连接本地 `-offline` 无头服，在保留完整客户端延迟、迷雾与 RPC 链路的前提下完成自动化 E2E 回归与基准评测。
-  - 伙伴版因本身需在服务端生成并控制独立 NPC，保留服务端 Mod 形态，并通过 `python/tools/headless_sandbox.py`（Klei 官方 `nullrenderer`）进行高速无头实机回归。
+为避免一套新功能（战斗、多菜谱烹饪、后续季节生存/农耕）在客户端与服务端各自重复维护两套 Lua 执行层，项目从 `DST Buddy Agent 0.9.0` 起采用**统一服务端智能体核心**：
+
+- **单模组统一双形态**：`DST Buddy Agent`（服务端 Mod）同时承载**主角托管（`self` 槽位，`/buddy self`、`@自己` 或 HUD「托管自己」按钮）**与**最多 2 名 AI 威尔逊伙伴（`buddy1` / `buddy2`）**。三者共用同一套服务端 `BufferedAction` 执行与状态机，共享营地记忆并由同一个 Python MCP / 规划协同层调度，一次创意工坊更新即可同时赋予主角托管与 AI 伙伴新能力。
+- **保留纯本地视野边界 + 可配置仿真延迟（Benchmark 兼容性）**：
+  - 服务端严格通过本地实体扫描半径 `scan_radius`（Mod 配置项：`10 / 15 / 20`，默认 `20`）感知周边世界与敌人，禁止读取未探索地形或全图坐标。
+  - 提供 Mod 配置项 `action_delay_ms`（`0 / 100 / 200 / 350` ms，默认 `0`），用于在服务端主动注入动作执行延迟，可在单机/无头服务端复现客户端网络往返延迟约束，用于智能体评测与消融实验。
+- **历史纯客户端基线冻结**：`mods/dst_player_agent` 冻结保留为纯客户端（免服务端 Mod 入房、客户端 `playercontroller` + `SendRPCToServer` 链路）历史评测基线，配合 `python/tools/client_e2e_sandbox.py` 可随时复现 6 场景小窗真客户端 E2E；新增玩法与功能统一在 `mods/dst_buddy_agent` 上高速迭代，并通过 `python/tools/headless_sandbox.py`（Klei 官方 `nullrenderer`）跑 9 场景全自动无头真引擎回归。

@@ -18,7 +18,7 @@ from mcp_server.game_bridge import BridgeError
 TERMINAL = {"completed", "failed", "interrupted"}
 OPS = {"summon", "bind", "follow", "stay", "stop", "move", "collect", "recipes", "equip", "unequip", "work", "craft",
        "place", "search", "visit_building", "refuel", "set_home",
-       "cook_load", "start_meal", "harvest_meal", "ignite_tree"} | COUNTED_TARGETS
+       "cook_load", "start_meal", "harvest_meal", "ignite_tree", "attack"} | COUNTED_TARGETS
 
 
 class CompanionBridge:
@@ -219,6 +219,18 @@ class CompanionBridge:
                 else:
                     if set(args) != {"building_id", "product"} or args.get("product") not in SAFE_MEALS:
                         raise BridgeError(op + " requires building_id and supported meal product")
+            if op == "attack":
+                if "combat" not in snapshot.get("capabilities", []):
+                    raise BridgeError("Companion capability unavailable; update the server mod")
+                extra = set(args) - {"target_guid", "min_health_ratio"}
+                if extra or type(args.get("target_guid")) is not int:
+                    raise BridgeError("attack requires an observed target_guid")
+                if "min_health_ratio" in args:
+                    ratio = args["min_health_ratio"]
+                    if type(ratio) not in {int, float} or not math.isfinite(ratio) or not 0.15 <= float(ratio) <= 0.85:
+                        raise BridgeError("min_health_ratio must be between 0.15 and 0.85")
+                if not any(r.get("guid") == args["target_guid"] for r in snapshot.get("enemies", [])):
+                    raise BridgeError("attack requires an observed enemy target_guid")
             if op == "ignite_tree":
                 if (set(args) != {"tree_guid"} or type(args.get("tree_guid")) is not int
                         or not any(r.get("guid") == args["tree_guid"] and r.get("status") == "ignitable"
@@ -389,7 +401,7 @@ class CompanionBridge:
             return {"queued": True}
 
 
-IDS = {"buddy1", "buddy2"}
+IDS = {"self", "buddy1", "buddy2"}
 ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
@@ -442,7 +454,7 @@ class CompanionTeamBridge:
                 raise BridgeError("Invalid team intent")
             control.update(target_ids=target_ids, request_kind=kind)
             roster = state.get("roster", [])
-            if not isinstance(roster, list) or len(roster) > 2:
+            if not isinstance(roster, list) or len(roster) > 3:
                 raise BridgeError("Invalid roster")
             seen_ids, seen_names = set(), set()
             for row in roster:
@@ -450,7 +462,8 @@ class CompanionTeamBridge:
                 if (not isinstance(row, dict) or row.get("id") not in IDS or row["id"] in seen_ids
                         or not isinstance(name, str) or not 1 <= len(name) <= 12 or name.translate(ASCII_LOWER) in seen_names
                         or any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "@/,[]\"'" for c in name)
-                        or name.translate(ASCII_LOWER) in {"all", "全体"}):
+                        or name.translate(ASCII_LOWER) in {"all", "全体"}
+                        or (row.get("id") != "self" and name == "自己")):
                     raise BridgeError("Invalid or duplicate companion name")
                 seen_ids.add(row["id"])
                 seen_names.add(name.translate(ASCII_LOWER))

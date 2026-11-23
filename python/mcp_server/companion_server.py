@@ -23,19 +23,19 @@ def create_server(bridge, *, poll=.2, timing_path=None):
     tasks = TaskService(bridge, companion=True, poll=poll, timing_path=timing_path)
     from mcp.server import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
-    server = MCPServer("DSTCompanion", version="0.8.1", lifespan=tasks.lifespan, instructions=(
-        "Companion tools control up to two named bound Wilsons, not your human player. Observe first. Without buddy_id, buddy_observe returns the team; specify buddy_id for other tools when two members exist. Use buddy_reply for each companion's own first-person speech. A member finish ends only that contribution. "
+    server = MCPServer("DSTCompanion", version="0.9.0", lifespan=tasks.lifespan, instructions=(
+        "Unified server tools control up to two named bound Wilsons (buddy1, buddy2) and optionally the human owner's own character (buddy_id=\"self\", is_self=true). Observe first. Without buddy_id, buddy_observe returns the team; specify buddy_id for other tools when multiple members exist. Use buddy_reply for each actor's own first-person speech. A member finish ends only that contribution. "
         "Use only offered collection target GUIDs. Poll buddy_result: queued/running are not success. "
-        "follow completes when follow mode is set, not when arrival occurs. Read owner_distance for arrival. "
-        "Use buddy_recipes for current server recipes. Native work, equip/unequip, crafting and land placement are supported when advertised. "
+        "follow completes when follow mode is set, not when arrival occurs; follow/give_owner/receive_item/timed_return are omitted when is_self=true. Read owner_distance for arrival. "
+        "Use buddy_recipes for current server recipes. Native work, equip/unequip, combat (attack with armor/weapon auto-equip and low-HP retreat), crafting and land placement are supported when advertised. "
         "unequip requires a currently equipped item GUID and stows it without dropping overflow; can_unequip reports capacity/restrictions. "
         "When search is advertised, perception offers local terrain, hazards and validated short search points. "
         "Search accepts only offered points; resource_found is not inventory completion. "
         "Companion observations list carried foods and their per-serving hunger, sanity and health deltas. Use eat for named food. Use buddy_storage for nearby observed chest contents. give_owner, drop_item, deposit and withdraw move one unit per action; "
         "task_key and total_count preserve a cumulative receipt across retries. Never take items from owner inventory. "
-        "Use buddy_places for buildings actually seen by the companion. visit_building={building_id} returns over long distances; "
+        "Use buddy_places for buildings actually seen by the actor. visit_building={building_id} returns over long distances; "
         "unconfirmed means outside local observation, not missing. Ordinary move still has a 20-unit limit. "
-        "Players can give the companion items using native give. Combat, cooking and a full-world region graph are not yet supported."))
+        "Use buddy_meals / cook_load / start_meal / harvest_meal for supported Crock Pot recipes (meatballs, ratatouille, perogies, baconeggs, bonestew, honeyham, honeynuggets, taffy, trailmix, dragonpie). A full-world region graph is not yet supported."))
     def invoke(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)

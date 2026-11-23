@@ -689,5 +689,47 @@ class TeamMCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bridge.member_call("result","buddy1",work["id"])["status"],"running")
         finally:stopped.set();await task
 
+    def test_self_slot_coexists_with_two_buddies_and_rejects_reserved_name_on_buddies(self):
+        from mcp_server.game_bridge import BridgeError
+
+        raw = team_state()
+        self_entry = state()
+        self_obs = self_entry["companion"]
+        self_obs.update(
+            buddy_id="self",
+            buddy_name="自己",
+            is_self=True,
+            token="bound:self",
+            capabilities=[c for c in self_obs.get("capabilities", [])
+                          if c not in {"follow", "give_owner", "receive_item", "timed_return"}],
+        )
+        self_obs["buddy"]["guid"] = 20
+        self_obs["nearby"] = [{"guid": 98, "prefab": "grass", "product": "cutgrass", "distance": 1, "x": 1, "z": 0}]
+        raw["roster"].insert(0, {"id": "self", "name": "自己", "is_self": True, "bound": True})
+        raw["members"]["self"] = self_entry
+        raw["control"].update(target_ids=["self", "buddy1", "buddy2"], request_kind="message")
+
+        bridge = CompanionTeamBridge(TOKEN, clock=lambda: 0)
+        bridge.exchange({"token": TOKEN, "session_id": "team-self", "sequence": 1, "state": raw, "results": []})
+        obs = bridge.member_call("observe", "self")
+        self.assertTrue(obs["state"]["companion"]["is_self"])
+        self.assertEqual(set(bridge.observe()["state"]["members"]), {"self", "buddy1", "buddy2"})
+
+        plan = validate_team_plan({
+            "assignments": {
+                "self": {"reply": "我去割草。", "tasks": [{"type": "collect", "prefab": "cutgrass", "count": 1}]},
+                "buddy1": {"reply": "我去捡树枝。", "tasks": [{"type": "collect", "prefab": "twigs", "count": 1}]},
+                "buddy2": {"reply": "收到，我待命。", "outcome": "reply"},
+            }
+        }, context(raw, requests=["self", "buddy1", "buddy2"]))
+        self.assertEqual({a["buddy_id"] for a in plan["assignments"]}, {"self", "buddy1", "buddy2"})
+
+        bad = copy.deepcopy(raw)
+        bad["roster"][1]["name"] = "自己"
+        with self.assertRaises(BridgeError):
+            CompanionTeamBridge(TOKEN, clock=lambda: 0).exchange(
+                {"token": TOKEN, "session_id": "bad-self", "sequence": 1, "state": bad, "results": []}
+            )
+
 
 if __name__=="__main__":unittest.main()

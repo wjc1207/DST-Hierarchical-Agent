@@ -379,26 +379,28 @@ class HeadlessDSTSandbox:
             time.sleep(0.15)
         raise TimeoutError(f"Timed out waiting for buddy '{name}' to summon and bind")
 
-    def activate_instruction(self, text: str, *, buddy_name: str = "小威", timeout: float = 15.0) -> dict[str, Any]:
+    def activate_instruction(self, text: str, *, buddy_name: str | None = None, member_id: str = "buddy1", timeout: float = 15.0) -> dict[str, Any]:
         assert self.bridge is not None
-        before = self.bridge.member_call("observe", "buddy1")["state"]["control"]["revision"]
+        if buddy_name is None:
+            buddy_name = "自己" if member_id == "self" else "小威"
+        before = self.bridge.member_call("observe", member_id)["state"]["control"]["revision"]
         self.send_lua(f"HEADLESS.command({json.dumps(f'do @{buddy_name} {text}', ensure_ascii=False)})")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            pkt = self.bridge.member_call("observe", "buddy1")
+            pkt = self.bridge.member_call("observe", member_id)
             ctrl = pkt["state"]["control"]
             if ctrl["revision"] > before and ctrl.get("enabled") and pkt["state"].get("ready"):
                 return pkt
             time.sleep(0.1)
         raise TimeoutError(f"Timed out waiting for instruction revision > {before}")
 
-    def wait_observed(self, predicate, *, timeout: float = 8.0) -> dict[str, Any]:
+    def wait_observed(self, predicate, *, member_id: str = "buddy1", timeout: float = 8.0) -> dict[str, Any]:
         assert self.bridge is not None
         deadline = time.monotonic() + timeout
         last_obs: dict[str, Any] = {}
         while time.monotonic() < deadline:
             try:
-                obs = self.bridge.member_call("observe", "buddy1")["state"]["companion"]
+                obs = self.bridge.member_call("observe", member_id)["state"]["companion"]
                 last_obs = obs
                 if predicate(obs):
                     return obs
@@ -412,11 +414,13 @@ class HeadlessDSTSandbox:
         instruction: str,
         tasks_spec: list[dict[str, Any]],
         *,
+        member_id: str = "buddy1",
+        buddy_name: str | None = None,
         timeout: float = 75.0,
     ) -> dict[str, Any]:
         """Run our real CompanionTasks scheduler against the live headless DST engine."""
         assert self.bridge is not None
-        pkt = self.activate_instruction(instruction)
+        pkt = self.activate_instruction(instruction, buddy_name=buddy_name, member_id=member_id)
         observed = pkt["state"]["companion"]
         plan = validate_plan(
             {"kind": "task_board", "goal": instruction, "reply": "收到", "tasks": tasks_spec},
@@ -430,7 +434,7 @@ class HeadlessDSTSandbox:
         deadline = time.monotonic() + timeout
         last_reason = "init"
         while time.monotonic() < deadline:
-            pkt = self.bridge.member_call("observe", "buddy1")
+            pkt = self.bridge.member_call("observe", member_id)
             state = pkt["state"]
             observed = state["companion"]
             obs_id = pkt["observation_id"]
@@ -438,7 +442,7 @@ class HeadlessDSTSandbox:
                 sim_clock[0] = max(sim_clock[0], float(observed["sampled_at"]))
 
             if active is not None:
-                res = self.bridge.member_call("result", "buddy1", active["action_id"])
+                res = self.bridge.member_call("result", member_id, active["action_id"])
                 status = res["status"]
                 if status in {"completed", "failed", "interrupted"}:
                     reason = res.get("reason") or status
@@ -467,6 +471,13 @@ class HeadlessDSTSandbox:
                 last_reason = f"{op}:{(args or {}).get('reason', '')}"
                 time.sleep(0.12)
                 continue
+            if op == "idle" and any(
+                row.get("status") in {"maintaining", "scheduled"} or row.get("meal_started")
+                for row in view["tasks"]
+            ):
+                last_reason = "idle:maintaining"
+                time.sleep(0.15)
+                continue
             if op in {"idle", "blocked", "unsupported", "needs_replan"}:
                 raise AssertionError(
                     f"Task board stopped with op={op} args={args} view={view['tasks']}"
@@ -474,7 +485,7 @@ class HeadlessDSTSandbox:
             if self.verbose:
                 print(f"  [ACTION_START] task={task['id']} op={op} args={args}", flush=True)
             try:
-                rec = self.bridge.member_call("action", "buddy1", op, obs_id, args)
+                rec = self.bridge.member_call("action", member_id, op, obs_id, args)
             except ValueError as exc:
                 if "stale" in str(exc).lower() or "ready" in str(exc).lower():
                     time.sleep(0.12)
@@ -717,6 +728,153 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         return f"home_id={home_id}, stay_home 12s completed cleanly"
 
+    def scenario_combat_equip_and_slay_spider(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        arena = sb.setup_arena({
+            "tag": "combat_spider",
+            "reset_buddy": True,
+            "give_buddy": [
+                {"prefab": "spear", "count": 1},
+                {"prefab": "armorwood", "count": 1},
+                {"prefab": "footballhat", "count": 1},
+            ],
+            "spawns": [
+                {"prefab": "spider", "dx": 5, "dz": 0},
+            ],
+        })
+        spider_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "spider")
+        sb.wait_observed(
+            lambda o: "combat" in (o.get("capabilities") or [])
+            and any(e.get("guid") == spider_guid for e in (o.get("enemies") or []))
+            and ((o.get("buddy") or {}).get("inventory") or {}).get("spear", 0) >= 1
+        )
+        sb.run_plan_tasks(
+            "穿上护甲拿长矛清理蜘蛛",
+            [
+                {"id": "slay1", "title": "Slay spider", "priority": 1,
+                 "target": {"type": "attack", "target_guid": spider_guid}},
+            ],
+            timeout=30.0,
+        )
+        obs_after = sb.wait_observed(lambda o: not any(e.get("guid") == spider_guid for e in (o.get("enemies") or [])))
+        equipped = {r["prefab"] for r in (obs_after.get("equipment") or []) if r.get("equipped")}
+        assert {"spear", "armorwood", "footballhat"} <= equipped, f"Expected armor+helmet+spear equipped, got {equipped}"
+        after = sb.inspect("after_combat_spider")
+        buddy_hp = float((after.get("buddy") or {}).get("health") or 0)
+        assert buddy_hp > 80, f"Buddy took unexpected damage fighting 1 spider with armor: hp={buddy_hp}"
+        return f"spider_guid={spider_guid} slain with {sorted(equipped)}, buddy_hp={buddy_hp:.1f}"
+
+    def scenario_cook_perogies_and_honeyham(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        arena = sb.setup_arena({
+            "tag": "cook_perogies",
+            "reset_buddy": True,
+            "give_buddy": [
+                {"prefab": "bird_egg", "count": 1},
+                {"prefab": "carrot", "count": 1},
+                {"prefab": "berries", "count": 1},
+                {"prefab": "meat", "count": 3},
+                {"prefab": "honey", "count": 2},
+            ],
+            "spawns": [
+                {"prefab": "cookpot", "dx": 5, "dz": 0},
+            ],
+        })
+        cookpot_id = f"building:{next(r['guid'] for r in arena['spawned'] if r['prefab'] == 'cookpot')}"
+        sb.wait_observed(
+            lambda o: any(r.get("id") == cookpot_id for r in (o.get("places") or {}).get("buildings") or [])
+            and ((o.get("buddy") or {}).get("inventory") or {}).get("bird_egg", 0) >= 1
+            and ((o.get("buddy") or {}).get("inventory") or {}).get("honey", 0) >= 2
+        )
+        sb.run_plan_tasks(
+            "用烹饪锅做一份饺子和一份蜜汁火腿",
+            [
+                {"id": "cook_perogies", "title": "Cook perogies", "priority": 1,
+                 "target": {"type": "cook_meal", "building_id": cookpot_id, "product": "perogies",
+                            "ingredients": ["bird_egg", "carrot", "berries", "meat"]}},
+                {"id": "cook_honeyham", "title": "Cook honeyham", "priority": 2,
+                 "depends_on": ["cook_perogies"],
+                 "target": {"type": "cook_meal", "building_id": cookpot_id, "product": "honeyham",
+                            "ingredients": ["meat", "meat", "honey", "honey"]}},
+            ],
+            timeout=90.0,
+        )
+        after = sb.inspect("after_cook_perogies")
+        inv = _as_dict(after["buddy"]["inventory"])
+        assert inv.get("perogies", 0) >= 1, f"Expected >=1 perogies in buddy inventory, got {inv}"
+        assert inv.get("honeyham", 0) >= 1, f"Expected >=1 honeyham in buddy inventory, got {inv}"
+        return f"perogies={inv.get('perogies')}, honeyham={inv.get('honeyham')} verified in real DST cookpot"
+
+    def scenario_self_pilot_combat_and_latency(sb: HeadlessDSTSandbox) -> str:
+        sb.send_lua("HEADLESS.set_simulation(15, 150)")
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            arena = sb.setup_arena({
+                "tag": "self_pilot",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "give_owner": [
+                    {"prefab": "spear", "count": 1},
+                    {"prefab": "armorwood", "count": 1},
+                    {"prefab": "footballhat", "count": 1},
+                ],
+                "spawns": [
+                    {"prefab": "grass", "dx": 4, "dz": 0},
+                    {"prefab": "spider", "dx": 6, "dz": 0},
+                ],
+            })
+            spider_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "spider")
+            obs0 = sb.wait_observed(
+                lambda o: o.get("is_self") is True
+                and "combat" in (o.get("capabilities") or [])
+                and o.get("simulation") == {"scan_radius": 15, "action_delay_ms": 150}
+                and ((o.get("buddy") or {}).get("inventory") or {}).get("spear", 0) >= 1
+                and any(e.get("guid") == spider_guid for e in (o.get("enemies") or []))
+                and any(n.get("product") == "cutgrass" for n in (o.get("nearby") or [])),
+                member_id="self",
+                timeout=12.0,
+            )
+            caps = set(obs0.get("capabilities") or [])
+            assert not (caps & {"follow", "give_owner", "receive_item", "timed_return"}), (
+                f"Self slot should omit companion-only capabilities, got {sorted(caps)}"
+            )
+            sb.run_plan_tasks(
+                "AI托管我自己：采一株草并穿甲拿长矛清理蜘蛛",
+                [
+                    {"id": "self_slay", "title": "Slay spider", "priority": 1,
+                     "target": {"type": "attack", "target_guid": spider_guid}},
+                    {"id": "self_grass", "title": "Pick grass", "priority": 2,
+                     "target": {"type": "inventory", "prefab": "cutgrass", "count": 1}},
+                ],
+                member_id="self",
+                timeout=35.0,
+            )
+            obs_after = sb.wait_observed(
+                lambda o: not any(e.get("guid") == spider_guid for e in (o.get("enemies") or []))
+                and ((o.get("buddy") or {}).get("inventory") or {}).get("cutgrass", 0) >= 1,
+                member_id="self",
+            )
+            equipped = {r["prefab"] for r in (obs_after.get("equipment") or []) if r.get("equipped")}
+            assert {"spear", "armorwood", "footballhat"} <= equipped, f"Expected self armor+helmet+spear equipped, got {equipped}"
+            after = sb.inspect("after_self_pilot")
+            owner = after.get("owner") or {}
+            owner_hp = float(owner.get("health") or 0)
+            assert owner_hp > 80, f"Self-piloted owner took unexpected damage: hp={owner_hp}"
+            assert _as_dict(owner.get("inventory")).get("cutgrass", 0) >= 1
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_simulation(20, 0)")
+
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            members = (sb.bridge.observe()["state"].get("members") or {})
+            if "self" not in members:
+                break
+            time.sleep(0.15)
+        assert "self" not in (sb.bridge.observe()["state"].get("members") or {}), "Expected self slot removed after release"
+        return f"self cutgrass>=1, spider_guid={spider_guid} slain @ 150ms delay / r=15, owner_hp={owner_hp:.1f}, clean release"
+
     scenarios = [
         ("1. pairing_lua_engine", scenario_pairing),
         ("2. summon_collect_and_work", scenario_collect_and_work),
@@ -724,6 +882,9 @@ def run_suite(args: argparse.Namespace) -> int:
         ("4. storage_batch_and_give_owner", scenario_storage_and_give_owner),
         ("5. refuel_and_cook_meatballs", scenario_refuel_and_cook_meatballs),
         ("6. set_home_and_stay_home", scenario_set_home_and_stay_home),
+        ("7. combat_equip_and_slay_spider", scenario_combat_equip_and_slay_spider),
+        ("8. cook_perogies_and_honeyham", scenario_cook_perogies_and_honeyham),
+        ("9. self_pilot_combat_and_latency", scenario_self_pilot_combat_and_latency),
     ]
     if args.only:
         scenarios = [s for s in scenarios if args.only in s[0]]

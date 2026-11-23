@@ -7,7 +7,10 @@ local kinds={open_container=true,store_item=true,take_item=true,start_meal=true,
 local trees={evergreen=true,evergreen_sparse=true,deciduoustree=true,twiggytree=true}
 local fixtures={treasurechest=true,dragonflychest=true,icebox=true,cookpot=true}
 local storages={treasurechest=true,dragonflychest=true,icebox=true}
-local safe_meals={meatballs=true,ratatouille=true}
+local safe_meals={
+    meatballs=true,ratatouille=true,perogies=true,baconeggs=true,bonestew=true,
+    honeyham=true,honeynuggets=true,taffy=true,trailmix=true,dragonpie=true,
+}
 local TREE_SPREAD_MAX=7 -- Vanilla evergreen uses MakeMediumPropagator (5..7).
 local SPREAD_MARGIN=.5
 local HOME_MARGIN=1
