@@ -31,6 +31,40 @@ HAND_GATHERED_TOOL_MATERIALS = {"twigs", "flint"}
 RETURN_RADIUS = 4
 RETURN_DEPARTURE_BUFFER = 2
 RETURN_ALERTS = {"at_risk": "return_at_risk", "missed": "return_deadline_missed"}
+EXPLORE_DIRECTIONS = {"north", "south", "east", "west", "ne", "nw", "se", "sw"}
+HOME_TREE_PROTECTION_RADIUS = 10.0
+
+
+def _nearby_matches(row, target):
+    if row.get("product") != target["prefab"]:
+        return False
+    source_prefabs = target.get("source_prefabs")
+    if source_prefabs and row.get("kind") != "pickup" and row.get("prefab") != target["prefab"]:
+        if row.get("prefab") not in source_prefabs:
+            return False
+    return True
+
+
+def _work_matches(row, target):
+    if target["prefab"] not in row.get("products", []):
+        return False
+    source_prefabs = target.get("source_prefabs")
+    if source_prefabs and row.get("prefab") not in source_prefabs:
+        return False
+    return True
+
+
+def _work_score(row, observed):
+    """Default work heuristic: softly protect trees near home and prefer larger trees."""
+    in_home = 0
+    if row.get("work") == "CHOP" and number(row.get("x")) and number(row.get("z")):
+        home = (observed.get("places") or {}).get("home") or {}
+        if number(home.get("x")) and number(home.get("z")):
+            if math.hypot(row["x"] - home["x"], row["z"] - home["z"]) <= HOME_TREE_PROTECTION_RADIUS:
+                in_home = 1
+    dist = row.get("distance", 99)
+    stage_bonus = min(4.0, max(0, (row.get("stage") or 1) - 1) * 1.5) if row.get("work") == "CHOP" else 0.0
+    return (in_home, dist - stage_bonus, dist)
 
 
 def collection_prefab(prefab, state):
@@ -119,11 +153,13 @@ def validate_target(target, *, supported=CAPABILITIES):
     required = {"inventory": "craft" if "recipe_id" in target else "collect", "structure": "place", "equip": "equip",
                 "unequip": "unequip", "visit_building": "visit_building", "set_home": "home", "return_home": "home",
                 "stay_home": "home", "hunger_ratio": "hunger", "health_ratio": "heal", "thermal_comfort": "thermal",
-                "attack": "combat", "defend_owner": "combat",
+                "attack": "combat", "defend_owner": "combat", "explore": "search",
                 "move_to": "move", "return_owner": "follow", "follow": "follow", "stay": "stay"}
     if kind not in required or required[kind] not in supported:
         raise ValueError("Unsupported companion task target/capability: " + str(kind))
-    fields = {"inventory": {"type", "prefab", "count", "recipe_id", "allow_search"}, "move_to": {"type", "x", "z", "arrival_radius"},
+    fields = {"inventory": {"type", "prefab", "count", "recipe_id", "allow_search", "source_prefabs"},
+              "move_to": {"type", "x", "z", "arrival_radius"},
+              "explore": {"type", "cells", "direction", "stop_on_products"},
               "structure": {"type", "prefab", "recipe_id", "x", "z", "radius", "placement"},
               "equip": {"type", "prefab"}, "unequip": {"type", "prefab"}, "visit_building": {"type", "building_id"},
               "set_home": {"type", "anchor_id"}, "return_home": {"type", "home_id"}, "stay_home": {"type", "home_id", "radius"},
@@ -224,10 +260,33 @@ def validate_target(target, *, supported=CAPABILITIES):
             if type(target["allow_search"]) is not bool:
                 raise ValueError("allow_search must be a boolean")
             clean["allow_search"] = target["allow_search"]
+        if "source_prefabs" in target:
+            sp = target["source_prefabs"]
+            if (not isinstance(sp, list) or not 1 <= len(sp) <= 6
+                    or any(not isinstance(s, str) or not re.fullmatch(r"[a-z0-9_]{1,60}", s) for s in sp)):
+                raise ValueError("source_prefabs must be a list of 1..6 canonical prefab names")
+            clean["source_prefabs"] = list(dict.fromkeys(sp))
         if "recipe_id" in target:
             if not isinstance(target["recipe_id"], str) or not re.fullmatch(r"[a-z0-9_]{1,100}", target["recipe_id"]):
                 raise ValueError("Invalid companion recipe_id")
             clean["recipe_id"] = target["recipe_id"]
+        return clean
+    if kind == "explore":
+        cells = target.get("cells", 24)
+        if type(cells) is not int or not 4 <= cells <= 256:
+            raise ValueError("explore cells must be an integer 4..256")
+        clean = {"type": kind, "cells": cells}
+        if "direction" in target:
+            direction = target["direction"]
+            if not isinstance(direction, str) or direction not in EXPLORE_DIRECTIONS:
+                raise ValueError("explore direction must be one of north, south, east, west, ne, nw, se, sw")
+            clean["direction"] = direction
+        if "stop_on_products" in target:
+            prods = target["stop_on_products"]
+            if (not isinstance(prods, list) or not 1 <= len(prods) <= 6
+                    or any(not isinstance(p, str) or not re.fullmatch(r"[a-z0-9_]{1,60}", p) for p in prods)):
+                raise ValueError("explore stop_on_products must be 1..6 canonical product prefabs")
+            clean["stop_on_products"] = list(dict.fromkeys(prods))
         return clean
     if kind in {"equip", "unequip"}:
         prefab = target.get("prefab")
@@ -293,6 +352,8 @@ def evaluate_target(target, state):
         return 0, target.get("count", 1), True, ""
     if kind == "defend_owner":
         return 0, 1, True, ""
+    if kind == "explore":
+        return 0, target["cells"], True, ""
     if kind in {"inventory", "receive_item"}:
         return (buddy.get("inventory") or {}).get(target["prefab"], 0), target["count"], True, ""
     if kind in PLACE_TARGETS:
@@ -429,6 +490,37 @@ class CompanionTasks:
                 else:
                     task.update(progress={"current": 0, "required": 1})
             return
+        if kind == "explore":
+            observed = state["_companion"]
+            total_cells = state.get("_search_cells", 0)
+            if "explore_start_cells" not in record:
+                record["explore_start_cells"] = total_cells
+            additional = max(0, total_cells - record["explore_start_cells"])
+            required = task["target"]["cells"]
+            stop_products = set(task["target"].get("stop_on_products") or ())
+            found_product = None
+            if stop_products:
+                for row in observed.get("nearby", []):
+                    if row.get("product") in stop_products:
+                        found_product = row["product"]
+                        break
+                if not found_product:
+                    for row in observed.get("work_targets", []):
+                        match = next((p for p in row.get("products", []) if p in stop_products), None)
+                        if match:
+                            found_product = match
+                            break
+            if found_product:
+                record["explore_found_product"] = found_product
+            done = bool(record.get("explore_found_product")) or additional >= required
+            task.update(
+                progress={"current": required if done else min(additional, required), "required": required},
+                status="done" if done else ("in_progress" if additional > 0 else "ready"),
+                blocked_reason="" if done else task.get("blocked_reason", ""),
+            )
+            if record.get("explore_found_product"):
+                task["found_product"] = record["explore_found_product"]
+            return
         if kind in {"hunger_ratio", "health_ratio", "thermal_comfort"}:
             record.setdefault("transfer_key", uuid.uuid4().hex)
             base_key = record["transfer_key"]
@@ -502,7 +594,9 @@ class CompanionTasks:
             self.search.observe(observed)
         if not self.plan or not self.observed:
             return None
-        result = self.goals.view(self.plan, actor_state(self.observed))
+        state = actor_state(self.observed)
+        state["_search_cells"] = len(self.search.cells)
+        result = self.goals.view(self.plan, state)
         unavailable = {t["id"] for t in result["tasks"] if t["status"] in {"failed", "expired"}
                        or (t["status"] == "blocked" and self.goals.records[t["id"]]["blocked"])}
         if unavailable:
@@ -557,7 +651,10 @@ class CompanionTasks:
         self.goals.pause_accounting()
         if op == "search":
             self.search.start_leg(task["id"], args)
-            self.goals.selected, self.goals.navigation, self.goals.navigation_mode = task["id"], True, "search"
+            if self.search.strategy == "known_source":
+                self.goals.selected, self.goals.navigation, self.goals.navigation_mode = task["id"], False, "known_source"
+            else:
+                self.goals.selected, self.goals.navigation, self.goals.navigation_mode = task["id"], True, "search"
 
     def on_result(self, task_id, action, observed):
         if action.get("reason") == "enemy_targeting":
@@ -744,18 +841,35 @@ class CompanionTasks:
                     for product in row.get("products", [])}
         for task in view["tasks"]:
             target = task["target"]
+            record = self.goals.records[task["id"]]
+            reason = record.get("companion_deferred", "")
+            if target["type"] == "explore":
+                if (reason == record["blocked"] and reason == "no_safe_unsearched_frontier"
+                        and self.search.select_explore(
+                            observed, max_distance=task["search_budget_distance"] - record["distance"],
+                            direction=target.get("direction"), stop_on_products=target.get("stop_on_products"))):
+                    self.clear_task_deferrals(task["id"])
+                    resumed = True
+                continue
             if target["type"] != "inventory":
                 continue
             product = target["prefab"]
-            if product in offered:
+            sp = target.get("source_prefabs")
+            has_local = any(_nearby_matches(row, target) for row in observed.get("nearby", []))
+            has_work = any(row["work"] in tools and _work_matches(row, target) for row in observed.get("work_targets", []))
+            has_known = bool(
+                target.get("allow_search", True) and "search" in capabilities(observed)
+                and self.search.select_known(product, observed, source_prefabs=sp)
+            )
+            if has_local or has_work or has_known:
                 resumed = self.goals.resume_local_work(task["id"]) or resumed
-            record = self.goals.records[task["id"]]
-            reason = record.get("companion_deferred", "")
             if reason == record["blocked"] and (
                     reason == "no_safe_unsearched_frontier" or reason.startswith("no_nearby_source_for_")):
-                if (product in offered or product in workable or (
+                if (has_local or has_work or has_known or (
                         reason == "no_safe_unsearched_frontier"
-                        and self.search.select(product, observed, max_distance=task["search_budget_distance"]-record["distance"]))):
+                        and self.search.select(
+                            product, observed, max_distance=task["search_budget_distance"] - record["distance"],
+                            source_prefabs=sp, mode="frontier_only"))):
                     self.clear_task_deferrals(task["id"])
                     resumed = True
         if resumed:
@@ -770,7 +884,7 @@ class CompanionTasks:
             required = {"inventory": "craft" if target.get("recipe_id") else "collect", "structure": "place",
                         "move_to": "move", "return_owner": "follow", "set_home": "home", "return_home": "home",
                         "stay_home": "home", "hunger_ratio": "hunger", "health_ratio": "heal", "thermal_comfort": "thermal",
-                        "refuel": "refuel", "attack": "combat", "defend_owner": "combat",
+                        "refuel": "refuel", "attack": "combat", "defend_owner": "combat", "explore": "search",
                         **{t: "storage" for t in STORAGE_TARGETS}}.get(kind, kind)
             if required not in capabilities(observed):
                 return task, "unsupported", {"reason": "capability_unavailable:" + required}
@@ -1065,14 +1179,14 @@ class CompanionTasks:
             if kind == "inspect_storage":
                 return task, "needs_replan", {"reason": "chest_unavailable"}
             if kind == "inventory":
-                candidates = [row for row in observed.get("nearby", []) if row["product"] == target["prefab"]]
+                candidates = [row for row in observed.get("nearby", []) if _nearby_matches(row, target)]
                 if candidates:
                     return task, "collect", {"target_guid": min(candidates, key=lambda r: r["distance"])["guid"]}
                 if target.get("recipe_id"):
                     return task, *self.recipe_action(target, observed)
-                works = [r for r in observed.get("work_targets", []) if target["prefab"] in r.get("products", [])]
+                works = [r for r in observed.get("work_targets", []) if _work_matches(r, target)]
                 if works and {"work", "equip"}.issubset(capabilities(observed)):
-                    work = min(works, key=lambda r: r["distance"])
+                    work = min(works, key=lambda r: _work_score(r, observed))
                     tools = [r for r in observed.get("equipment", []) if r.get("usable") and work["work"] in r.get("tools", [])]
                     if tools:
                         equipped = next((r for r in tools if r.get("equipped")), None)
@@ -1111,21 +1225,57 @@ class CompanionTasks:
                         continue
                     if "search" in capabilities(observed) and target.get("allow_search", True):
                         record = self.goals.records[task["id"]]
-                        point = self.search.select(target["prefab"], observed,
-                            max_distance=task["search_budget_distance"]-record["distance"])
+                        sp = target.get("source_prefabs")
+                        point = self.search.select_known(target["prefab"], observed, source_prefabs=sp)
+                        if point is None:
+                            point = self.search.select(
+                                target["prefab"], observed,
+                                max_distance=task["search_budget_distance"] - record["distance"],
+                                source_prefabs=sp, mode="frontier_only",
+                            )
                         if point:
+                            excluded_products = set()
+                            for t in eligible:
+                                tg = t["target"]
+                                if tg["type"] == "inventory" and not tg.get("recipe_id") and tg.get("source_prefabs"):
+                                    p = tg["prefab"]
+                                    if any(p in r.get("products", []) and not _work_matches(r, tg) for r in observed.get("work_targets", [])):
+                                        excluded_products.add(p)
                             products = list(dict.fromkeys(t["target"]["prefab"] for t in eligible
-                                if t["target"]["type"] == "inventory" and not t["target"].get("recipe_id")))[:6]
-                            remaining = task["search_budget_seconds"]-record["seconds"]
+                                if t["target"]["type"] == "inventory" and not t["target"].get("recipe_id")
+                                and t["target"]["prefab"] not in excluded_products))[:6]
+                            remaining = 8 if self.search.strategy == "known_source" else task["search_budget_seconds"] - record["seconds"]
                             navigation.append((task, "search", {"point_id": point["id"], "x": point["x"], "z": point["z"],
                                 "products": products, "timeout_seconds": max(.2, min(8, remaining))}))
                         else:
-                            if self.search.select(target["prefab"], observed):
+                            if self.search.select(target["prefab"], observed, source_prefabs=sp, mode="frontier_only"):
                                 self.goals.suspend_search(task["id"])
                             else:
                                 navigation.append((task, "blocked", {"reason": "no_safe_unsearched_frontier", "prefab": target["prefab"]}))
                     else:
                         navigation.append((task, "blocked", {"reason": "no_nearby_source_for_" + target["prefab"], "prefab": target["prefab"]}))
+            if kind == "explore":
+                record = self.goals.records[task["id"]]
+                point = self.search.select_explore(
+                    observed,
+                    max_distance=task["search_budget_distance"] - record["distance"],
+                    direction=target.get("direction"),
+                    stop_on_products=target.get("stop_on_products"),
+                )
+                if point:
+                    products = list(target.get("stop_on_products") or [])[:6]
+                    remaining = task["search_budget_seconds"] - record["seconds"]
+                    navigation.append((task, "search", {"point_id": point["id"], "x": point["x"], "z": point["z"],
+                        "products": products, "timeout_seconds": max(.2, min(8, remaining))}))
+                else:
+                    if self.search.select_explore(
+                        observed, direction=target.get("direction"),
+                        stop_on_products=target.get("stop_on_products"),
+                    ):
+                        self.goals.suspend_search(task["id"])
+                    else:
+                        navigation.append((task, "blocked", {"reason": "no_safe_unsearched_frontier"}))
+                continue
             if kind == "structure":
                 return task, *self.recipe_action(target, observed)
             if kind == "equip":

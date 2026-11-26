@@ -1189,6 +1189,60 @@ def run_suite(args: argparse.Namespace) -> int:
                     break
                 time.sleep(0.15)
 
+    def scenario_search_filter_and_explore(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.setup_arena({
+            "tag": "search_filter_explore",
+            "reset_buddy": True,
+            "spawns": [
+                {"prefab": "evergreen_short", "dx": 4, "dz": 0},
+                {"prefab": "deciduoustree_tall", "dx": 7, "dz": 2},
+            ],
+            "give_buddy": [{"prefab": "axe", "count": 1}],
+        })
+        time.sleep(0.5)
+        snap = sb.bridge.member_call("observe", "buddy1")["state"]["companion"]
+        assert snap.get("work_targets_complete") is True, (
+            f"Expected work_targets_complete=True in real Lua snapshot, got {snap.get('work_targets_complete')!r}"
+        )
+        wt_by_prefab = {r.get("prefab"): r for r in (snap.get("work_targets") or [])}
+        assert "evergreen" in wt_by_prefab and "deciduoustree" in wt_by_prefab, (
+            f"Expected both evergreen and deciduoustree in work_targets, got {list(wt_by_prefab)}"
+        )
+        ev_stage = wt_by_prefab["evergreen"].get("stage")
+        dc_stage = wt_by_prefab["deciduoustree"].get("stage")
+        assert isinstance(ev_stage, int) and isinstance(dc_stage, int) and dc_stage > ev_stage, (
+            f"Expected deciduoustree stage > evergreen stage, got dc={dc_stage!r} ev={ev_stage!r}"
+        )
+        sb.run_plan_tasks(
+            "只砍大桦树并向东探索",
+            [
+                {
+                    "id": "chop_birch",
+                    "title": "Chop tall birch",
+                    "priority": 1,
+                    "target": {
+                        "type": "inventory",
+                        "prefab": "log",
+                        "count": 2,
+                        "source_prefabs": ["deciduoustree"],
+                    },
+                },
+                {
+                    "id": "scout_east",
+                    "title": "Explore east",
+                    "priority": 2,
+                    "depends_on": ["chop_birch"],
+                    "target": {"type": "explore", "cells": 8, "direction": "east"},
+                },
+            ],
+            timeout=70.0,
+        )
+        truth = sb.inspect("after_search_filter_explore")
+        inv = truth["buddy"]["inventory"]
+        assert inv.get("log", 0) >= 2, f"Expected >=2 log after chopping birch, got {inv}"
+        return f"work_targets_complete=True, stages=(ev:{ev_stage},dc:{dc_stage}), logs={inv.get('log', 0)}, explore_east=done"
+
     scenarios = [
         ("1. pairing_lua_engine", scenario_pairing),
         ("2. summon_collect_and_work", scenario_collect_and_work),
@@ -1203,6 +1257,7 @@ def run_suite(args: argparse.Namespace) -> int:
         ("11. summer_overheat_coldfire_and_gear", scenario_summer_overheat_coldfire_and_gear),
         ("12. winter_craft_heatrock_hat_and_roast", scenario_winter_craft_heatrock_hat_and_roast),
         ("13. summer_auto_place_coldfire_and_spring_rain", scenario_summer_auto_place_coldfire_and_spring_rain),
+        ("14. search_filter_and_explore", scenario_search_filter_and_explore),
     ]
     if args.only:
         tokens = [t.strip() for t in args.only.split(",") if t.strip()]

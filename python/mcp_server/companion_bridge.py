@@ -288,7 +288,7 @@ class CompanionBridge:
                 if not any(r.get("id") == args.get("point_id") and r.get("x") == args.get("x") and r.get("z") == args.get("z") for r in points):
                     raise BridgeError("Search requires a currently offered point")
                 products = args.get("products")
-                if (not isinstance(products, list) or not 1 <= len(products) <= 6
+                if (not isinstance(products, list) or not 0 <= len(products) <= 6
                         or any(not isinstance(p, str) or not re.fullmatch(r"[a-z0-9_]{1,60}", p) for p in products)
                         or type(args.get("timeout_seconds")) not in (int, float) or not .2 <= args["timeout_seconds"] <= 8):
                     raise BridgeError("Invalid search resource targets or deadline")

@@ -8,3 +8,19 @@ mods/dst_buddy_agent/scripts/jev_companion_config.lua
 dist/
 .vscode/
 data/agent_memory/
+
+# Skin pipeline generated previews, backups, and large local art sources
+skins/*.zip
+skins/*/work/
+skins/*/reference/
+skins/*/preview/
+skins/*/gifs/
+skins/*/review_data/
+skins/*/player_data/
+skins/*/tuner_data/
+skins/*/review.html
+skins/*/anim_player.html
+skins/*/skin_tuner.html
+skins/*/rework_plan.json
+assets/*-[12].png
+assets/*-[12].jpg

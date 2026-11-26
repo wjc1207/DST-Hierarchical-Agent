@@ -212,7 +212,7 @@ function M.new(env)
             local a_args=req.args or {}
             if req.op=="search" then
                 local products=a_args.products
-                if type(products)~="table" or #products<1 or #products>6 or not finite(a_args.timeout_seconds)
+                if type(products)~="table" or #products>6 or not finite(a_args.timeout_seconds)
                     or a_args.timeout_seconds<.2 or a_args.timeout_seconds>8 then return false,"invalid_search" end
                 for _,name in ipairs(products) do
                     if type(name)~="string" or #name>60 or not name:match("^[a-z0-9_]+$") then return false,"invalid_search" end
@@ -289,7 +289,7 @@ function M.new(env)
                     elseif q.op=="search" then
                         if now>=(q.next_sense or 0) then
                             q.next_sense=now+.25
-                            if env.search_found(r.buddy,q.args.products) then finish(r,"completed","resource_found") end
+                            if #q.args.products>0 and env.search_found(r.buddy,q.args.products) then finish(r,"completed","resource_found") end
                         end
                         if r.active==q then
                             if env.search_arrived(r.buddy,q.x,q.z) then finish(r,"completed","search_leg_arrived")
@@ -373,7 +373,7 @@ function M.new_team(env)
             if slot then
                 local r=slot.engine.owners[owner.userid]
                 local a=get_actor(owner,slot)
-                result[#result+1]={id=slot.id,name=slot.name,is_self=(slot.id=="self"),guid=a and a:IsValid() and a.GUID or nil,
+                result[#result+1]={id=slot.id,name=slot.name,is_self=(slot.id=="self"),skin=slot.skin or "",guid=a and a:IsValid() and a.GUID or nil,
                     bound=r~=nil and r.buddy~=nil and r.buddy:IsValid(),dead=a and a:IsValid() and env.dead(a) or false}
             end
         end
@@ -382,8 +382,9 @@ function M.new_team(env)
     local function fail(player,q,owner,reason)
         env.reply(player,{id=q.id,seq=q.seq,op=q.op,status="failed",reason=reason,buddy_id=q.buddy_id,roster_version=owner.roster_version,roster=roster(owner)})
     end
-    local function create(owner,id,name)
-        local slot={id=id,name=name};local wrapped={}
+    local function create(owner,id,name,skin)
+        if skin==nil then skin=(id~="self" and env.infer_skin) and env.infer_skin(name) or "" end
+        local slot={id=id,name=name,skin=skin};local wrapped={}
         for key,value in pairs(env) do wrapped[key]=value end
         wrapped.action_delay_ms=function() return env.action_delay_ms or 0 end
         local function remember(a)
@@ -411,6 +412,7 @@ function M.new_team(env)
                     if id=="self" then owner.roster_version=owner.roster_version+1 end
                 end
             elseif id=="self" and packet.op=="release" and packet.status=="completed" then
+                if env.set_skin and slot.actor and slot.actor:IsValid() then env.set_skin(slot.actor,"") end
                 owner.slots["self"]=nil
                 owner.roster_version=owner.roster_version+1
             end
@@ -429,7 +431,7 @@ function M.new_team(env)
                 if env.dead(player) then return nil,"owner_not_alive" end
                 return player
             end
-            wrapped.activate=function() end
+            wrapped.activate=function(a) if env.set_skin and slot.skin~="" then env.set_skin(a,slot.skin) end end
             wrapped.deactivate=function(a) env.stop(a) end
             wrapped.map_bind=nil
             wrapped.unmap=nil
@@ -438,6 +440,7 @@ function M.new_team(env)
             wrapped.activate=function(a)
                 a._jev_companion_name=slot.name
                 if env.set_name then env.set_name(a,slot.name) end
+                if env.set_skin then env.set_skin(a,slot.skin or "") end
                 if env.activate then env.activate(a) end
             end
             wrapped.find_buddy=function(player)
@@ -490,7 +493,7 @@ function M.new_team(env)
                     record=slot.restore_failed
                 end
                 if record then
-                    entries[#entries+1]={userid=userid,id=id,name=slot.name,actor=record}
+                    entries[#entries+1]={userid=userid,id=id,name=slot.name,skin=slot.skin,actor=record}
                     for _,ref in pairs(refs or {}) do references[#references+1]=ref end
                 end
             end
@@ -509,11 +512,13 @@ function M.new_team(env)
                 local name=Names.name(entry.name)
                 local owner=get_owner(entry.userid)
                 if name and not owner.slots[entry.id] then
-                    local slot=create(owner,entry.id,name)
+                    local skin=(type(entry.skin)=="string" and env.resolve_skin) and env.resolve_skin(entry.skin) or nil
+                    local slot=create(owner,entry.id,name,skin)
                     local actor=env.load_buddy(entry.actor,entities)
                     if actor then
                         slot.remember(actor)
                         if env.set_name then env.set_name(actor,name) end
+                        if env.set_skin then env.set_skin(actor,slot.skin or "") end
                     else
                         slot.restore_failed=entry.actor
                     end
@@ -554,6 +559,24 @@ function M.new_team(env)
             owner.slots[id]=nil
             owner.roster_version=owner.roster_version+1
             env.reply(player,{id=q.id,seq=q.seq,op=q.op,status="completed",buddy_id=id,
+                roster_version=owner.roster_version,roster=roster(owner)})
+            return
+        end
+        if q.op=="skin" then
+            if not slot then fail(player,q,owner,"buddy_not_summoned");return end
+            local raw_skin=type(q.args)=="table" and q.args.skin or ""
+            local resolved=env.resolve_skin and env.resolve_skin(raw_skin) or nil
+            if resolved==nil then fail(player,q,owner,"unknown_skin");return end
+            local actor=get_actor(owner,slot)
+            if not actor or not actor:IsValid() then fail(player,q,owner,"buddy_not_bound");return end
+            local ok,res=true,resolved
+            if env.set_skin then ok,res=env.set_skin(actor,resolved) end
+            if not ok then fail(player,q,owner,tostring(res or "skin_failed"));return end
+            slot.skin=resolved
+            owner.roster_version=owner.roster_version+1
+            env.reply(player,{id=q.id,seq=q.seq,op=q.op,status="completed",
+                reason=resolved=="" and "skin_cleared" or ("skin:"..resolved),
+                buddy_id=id,buddy_name=slot.name,skin=resolved,
                 roster_version=owner.roster_version,roster=roster(owner)})
             return
         end

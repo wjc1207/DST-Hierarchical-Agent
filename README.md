@@ -2,14 +2,14 @@
 
 [English](README.EN.md) · [系统架构](docs/ARCHITECTURE.md) · [技术说明](docs/TECHNICAL.md) · [创意工坊指南](docs/WORKSHOP.md)
 
-本仓库主线提供一套统一的《饥荒联机版》服务端智能体模组 **`DST Buddy Agent`**（[mods/dst_buddy_agent](mods/dst_buddy_agent)）与 `python/` 下的三层分层框架（`mcp_agent` 规划端 → `mcp_server` + `executor` 任务拆分与执行器 → Lua 原生原子动作）。
+本仓库主线提供一套统一的《饥荒联机版》服务端智能体模组 **`DST Buddy Agent`**（[mods/dst_buddy_agent](mods/dst_buddy_agent)）与 `python/` 下的三层分层架构（**规划层** `mcp_agent` → **协调层** `mcp_server` + `executor` → **执行层** Lua 原子动作）。
 
 | 模组 | 形态与定位 | 安装说明 |
 | --- | --- | --- |
 | **DST Buddy Agent** | **统一服务端智能体 Mod（主线唯一推荐，v0.9.0+）** · 单个 Mod 同时支持 **AI 托管主角自己（`/buddy self`、`@自己`）** 与 **召唤 1~2 名可命名 AI 伙伴（`buddy1`/`buddy2`）**；支持局部视野 `scan_radius` 与可选模拟延迟 `action_delay_ms` 供 Benchmark 使用（见[系统架构](docs/ARCHITECTURE.md#架构决策统一服务端智能体核心self--buddy1--buddy2与可配置仿真约束)） | [快速开始](#快速开始统一服务端) |
 | **历史纯客户端归档** | 已彻底解耦迁至 [`archive/`](archive/README.md)（原纯客户端 Mod `dst_player_agent` 及重命名后的 `player_server.py`/`player_agent.py`/`player_bridge.py`/`player_planner.py`/`player_probe.py` 与独立测试套件） | [历史归档说明](#历史归档archive) |
 
-《饥荒联机版》智能体实验项目。DeepSeek 维护有优先级的多目标看板，执行器优先完成眼前任务，并结合 Klei 区域资源配置与探索记忆寻找所需物资。MCP 服务调度看板并处理紧急安全动作，Lua 模组执行和验证动作。
+《饥荒联机版》分层智能体实验项目。**规划层**（DeepSeek / 外部 Agent）维护有优先级的多目标看板；**协调层**（MCP 服务 + 5Hz 确定性协调器）调度多角色任务、前置依赖、探索记忆与安全监控，并在异常时唤醒重规划；**执行层**（Lua 服务端模组）在 Klei 原生动作层执行 28 个原子动作并验证效果。
 
 已完成的阶段：[活过第一晚](https://bilibili.com/video/BV1aehE6DEji) · [制作科学机器](https://www.bilibili.com/video/BV1mFaV6aEQ2) · [制作科学机器v2](https://www.bilibili.com/video/BV1pRnR62Ex3) · 伙伴模式实机演示：[和两个 AI 队友在饥荒里过一天](https://www.bilibili.com/video/BV187Wb6oEUU)
 

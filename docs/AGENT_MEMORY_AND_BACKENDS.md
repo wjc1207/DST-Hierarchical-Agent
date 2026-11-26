@@ -2,22 +2,23 @@
 
 [项目首页](../README.md) · [MCP 服务说明](MCP.md) · [共用规划与任务层](SHARED_PLANNING.md)
 
-## 核心分层：纯游戏 I/O 的 MCP + 可插拔上层 Agent
+## 核心分层：规划 — 协调 — 执行（可插拔上层 Agent）
 
-本项目将 **游戏观测 / 原生执行 / 安全护栏**（`mods/` + `python/mcp_server/`）与 **上层规划 / 记忆 / 上下文管理**（`python/mcp_agent/` 或外部 Agent）彻底解耦：
+本项目采用严格的 **规划层 — 协调层 — 执行层** 三层单向分层架构，将 **高层规划 / 记忆 / 上下文管理**（`python/mcp_agent/` 或外部 Agent）与 **多角色任务协调 / 桥接**（`python/mcp_server/` + `python/executor/`）及 **游戏原生动作执行**（`mods/dst_buddy_agent`）彻底解耦：
 
 ```text
-上层规划 Agent（自研 DeepSeek Harness / Claude Code CLI / Codex CLI / DSH CLI & HTTP）
+Layer 1 · 规划层（自研 DeepSeek Harness / Claude Code CLI / Codex CLI / DSH CLI & HTTP）
         │  统一规划契约：get_planning_state / submit_task_board / send_planning_reply
         ▼
-纯游戏 I/O 的 MCP Server（mcp_server.py:8765 / companion_server.py:8766）
-        │  确定性看板调度、动作校验、本地安全护栏
+Layer 2 · 协调层（companion_server.py:8766 + python/executor/）
+        │  5Hz 多角色任务协调、前置依赖编排、安全监控、DirectBridgeClient 直驱内存桥接
         ▼
-DST 游戏 Mod（dst_player_agent 玩家端 / dst_buddy_agent 伙伴服务端）
+Layer 3 · 执行层（mods/dst_buddy_agent 统一服务端 Mod）
+           Klei 原生 BufferedAction 28 个原子动作 + 底层被动避险（evade）
 ```
 
-- **MCP Server 不包含任何 LLM 调用与长期记忆逻辑**，只负责游戏状态观测、动作合法性校验与执行。
-- 无论上层接自研 DeepSeek Harness 还是外部 Claude Code / Codex / DSH，都复用同一套 MCP Server 与 Mod 能力。
+- **协调层（`mcp_server` + `executor`）不包含任何 LLM 调用与长期记忆逻辑**，只负责确定性的多角色任务协调、动作合法性校验与桥接调度。
+- 无论规划层接自研 DeepSeek Harness 还是外部 Claude Code / Codex / DSH，都复用同一套协调层 MCP 接口与 Mod 执行能力。
 
 ---
 

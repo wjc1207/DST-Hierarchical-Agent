@@ -195,6 +195,9 @@ def collect_mod_files(mod_id: str, *, include_optional: bool = True) -> list[tup
     if not scripts:
         raise FileNotFoundError(source / "scripts")
     files.extend(scripts)
+    anim_dir = source / "anim"
+    if anim_dir.is_dir():
+        files.extend(sorted(anim_dir.glob("*.zip")))
     result: list[tuple[Path, str]] = []
     for path in files:
         if not path.is_file() or path.resolve() != path:
@@ -244,6 +247,17 @@ def verify_workshop_dir(stage_dir: Path, mod_id: str) -> None:
     pairing_lua = stage_dir / "scripts" / "jev_bridge_pairing.lua"
     if not pairing_lua.is_file():
         raise ValueError(f"[{mod_id}] Missing Workshop pairing module: scripts/jev_bridge_pairing.lua")
+
+    src_anim = ROOT / "mods" / mod_id / "anim"
+    if src_anim.is_dir():
+        for anim_src in sorted(src_anim.glob("*.zip")):
+            staged_anim = stage_dir / "anim" / anim_src.name
+            if not staged_anim.is_file():
+                raise ValueError(f"[{mod_id}] Missing staged anim archive: anim/{anim_src.name}")
+            with ZipFile(staged_anim, "r") as zf:
+                names = set(zf.namelist())
+                if "build.bin" not in names or "atlas-0.tex" not in names:
+                    raise ValueError(f"[{mod_id}] Invalid anim archive anim/{anim_src.name}")
 
     config_path = stage_dir / "scripts" / config_name
     expected = blank_config_lua(port)

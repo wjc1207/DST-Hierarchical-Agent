@@ -229,7 +229,8 @@ function M.new(G,E)
         elseif not burnt and ROCKS[e.prefab] and w:GetWorkAction()==G.ACTIONS.MINE then kind,products="MINE",ROCKS[e.prefab] end
         if not kind then return end
         local x,z=position(e)
-        return {guid=e.GUID,prefab=e.prefab,work=kind,products=products,remaining=w:GetWorkLeft(),distance=E.distance(a,e),x=x,z=z}
+        local stage=e.components.growable and e.components.growable.stage or nil
+        return {guid=e.GUID,prefab=e.prefab,work=kind,products=products,remaining=w:GetWorkLeft(),stage=stage,distance=E.distance(a,e),x=x,z=z}
     end
     local function watch(a,id)
         local ids=a._jev_companion_recipes
@@ -759,6 +760,7 @@ function M.new(G,E)
         for _,row in ipairs(works) do
             if not seen[row.prefab] then selected[#selected+1]=row;seen[row.prefab]=true else rest[#rest+1]=row end
         end
+        local work_targets_complete=#works<=24
         for _,row in ipairs(rest) do if #selected>=24 then break end;selected[#selected+1]=row end
         while #selected>24 do table.remove(selected) end
         works=selected
@@ -796,7 +798,7 @@ function M.new(G,E)
                 insulation=ins>0 and ins or nil,insulation_type=ins_type,waterproof=wp>0 and wp or nil}
             end
         end
-        return {work_targets=works,structures=structures,equipment=equipment,recipes=recipes}
+        return {work_targets=works,work_targets_complete=work_targets_complete,structures=structures,equipment=equipment,recipes=recipes}
     end
     return A
 end

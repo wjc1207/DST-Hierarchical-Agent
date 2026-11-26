@@ -1,4 +1,5 @@
 local G=GLOBAL
+local tonumber,tostring,type,pairs,string,print=G.tonumber,G.tostring,G.type,G.pairs,G.string,G.print
 local json=require("json")
 local Server=require("jev_companion_server")
 local Client=require("jev_companion_client")
@@ -8,6 +9,9 @@ local UI=require("jev_companion_ui")
 local Pairing=require("jev_bridge_pairing")
 local MOD_DIR=type(MODROOT)=="string" and MODROOT or ""
 local NS="jev_ai_companion"
+Assets={
+    Asset("ANIM","anim/skin_deepseek.zip"),
+}
 local config={}
 local pairing_version=0
 local pairing_loaded=false
@@ -25,7 +29,7 @@ local function game_paused()
 end
 local function notice(text) if G.ChatHistory then G.ChatHistory:SendCommandResponse("[Companion] "..text) end end
 local function log(event,reason,details)
-    local row={event=event,reason=reason,version="0.9.0"}
+    local row={event=event,reason=reason,version="0.10.0"}
     for key,value in pairs(details or {}) do row[key]=value end
     print("[JEV_COMPANION]"..json.encode(row))
 end
@@ -51,6 +55,7 @@ local function ensure_pairing_loaded()
     end)
 end
 AddPrefabPostInit("wilson",function(inst) Presentation.attach(G,inst) end)
+AddPlayerPostInit(function(inst) Presentation.attach(G,inst) end)
 local function install_server(world)
     if not world.ismastersim or world.components.jev_companion_persistence then return end
     world:AddComponent("jev_companion_persistence")

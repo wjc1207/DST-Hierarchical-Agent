@@ -286,3 +286,145 @@ class SearchAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(agent.tasks.search, memory)
             self.assertGreater(len(memory.cells), 0)
         finally: await agent.close()
+
+
+class SearchEnhancementTests(unittest.TestCase):
+    def test_known_source_revisit_exceeds_80_unit_limit_and_does_not_burn_blind_search_budget(self):
+        clock = [0.0]
+        observed = observation()
+        # Build a 120-unit observed land corridor eastward (gx = 0..30, gz = 0)
+        observed["perception"]["cells"] = [
+            {"gx": gx, "gz": gz, "land": True}
+            for gx in range(-2, 32) for gz in (-1, 0, 1)
+        ]
+        observed["perception"]["points"] = [
+            {"id": "4:0", "x": 16, "z": 0},
+            {"id": "-2:0", "x": -8, "z": 0},
+        ]
+        runtime = CompanionTasks(clock=lambda: clock[0])
+        # Remember a cutgrass at x=120, z=0 (beyond LOCAL_ROUTE_LIMIT=80, within KNOWN_ROUTE_LIMIT=320)
+        runtime.search.observe(observed)
+        runtime.search.sources[501] = {
+            "guid": 501, "prefab": "grass", "product": "cutgrass",
+            "x": 120, "z": 0, "seen_at": 0.0, "available": True,
+        }
+        # Advance clock past old 300s TTL (to 500s, still within 900s KNOWN_SOURCE_TTL)
+        clock[0] = 500.0
+        # Give a tiny blind-search distance budget (8 units) so a 16-unit leg would fail if charged to blind budget
+        runtime.adopt(board(task("grass", "cutgrass", search_budget_distance=8)), observed)
+        selected, op, args = runtime.next_action(observed)
+        self.assertEqual((selected["id"], op, args["point_id"]), ("grass", "search", "4:0"))
+        self.assertEqual(runtime.search.strategy, "known_source")
+        runtime.note_action(selected, op, args)
+        # Revisit must not charge blind-search budget
+        self.assertFalse(runtime.goals.navigation)
+        clock[0] = 504.0
+        relocate(observed, 16, 0)
+        runtime.on_result("grass", {"status": "completed", "reason": "search_leg_arrived"}, observed)
+        self.assertEqual(runtime.goals.records["grass"]["distance"], 0.0)
+        self.assertEqual(runtime.goals.records["grass"]["seconds"], 0.0)
+
+    def test_truncated_work_targets_cleans_stale_near_trees_but_preserves_far_memory(self):
+        observed = observation()
+        observed["work_targets_complete"] = False
+        observed["work_targets"] = [
+            {"guid": 200, "prefab": "evergreen", "work": "CHOP", "products": ["log"], "distance": 4, "x": 4, "z": 0},
+            {"guid": 201, "prefab": "evergreen", "work": "CHOP", "products": ["log"], "distance": 12, "x": 12, "z": 0},
+        ]
+        memory = ResourceSearch()
+        memory.observe(observed)
+        # Simulate dense forest: 24 trees reported up to distance 10, guid=200 (at dist 4) is gone, guid=201 (at dist 12) is outside cutoff
+        observed["version"] += 1
+        observed["work_targets"] = [
+            {"guid": 300 + i, "prefab": "evergreen", "work": "CHOP", "products": ["log"],
+             "distance": 6.0 + (i % 5), "x": 6.0 + (i % 5), "z": 0}
+            for i in range(24)
+        ]
+        memory.observe(observed)
+        self.assertFalse(memory.sources[(200, "log")]["available"])
+        self.assertTrue(memory.sources[(201, "log")]["available"])
+
+    def test_inventory_default_heuristics_and_source_prefabs_filter(self):
+        observed = observation()
+        observed["capabilities"] += ["work", "equip"]
+        observed["equipment"] = [{"guid": 50, "prefab": "axe", "usable": True, "equipped": True, "tools": ["CHOP"]}]
+        observed["places"] = {"home": {"id": "home:1", "x": 0, "z": 0}}
+        observed["work_targets"] = [
+            # Inside home protection radius (<=10)
+            {"guid": 10, "prefab": "evergreen", "work": "CHOP", "products": ["log"], "remaining": 15, "stage": 3, "distance": 3, "x": 3, "z": 0},
+            # Outside home protection radius (>10): small vs tall
+            {"guid": 11, "prefab": "deciduoustree", "work": "CHOP", "products": ["log"], "remaining": 5, "stage": 1, "distance": 11, "x": 11, "z": 0},
+            {"guid": 12, "prefab": "deciduoustree", "work": "CHOP", "products": ["log"], "remaining": 15, "stage": 3, "distance": 13, "x": 13, "z": 0},
+        ]
+        # 1) Default heuristic (no extra LLM params): skips home tree (10) and prefers tall tree (12) over small tree (11)
+        runtime = CompanionTasks()
+        runtime.adopt(board(task("wood", "log")), observed)
+        selected, op, args = runtime.next_action(observed)
+        self.assertEqual((selected["id"], op, args), ("wood", "work", {"target_guid": 12, "work": "CHOP"}))
+
+        # 2) source_prefabs=['evergreen'] filters out deciduoustree; if no evergreen exists, search omits excluded product
+        observed_only_birch = observation()
+        observed_only_birch["capabilities"] += ["work", "equip"]
+        observed_only_birch["equipment"] = [{"guid": 50, "prefab": "axe", "usable": True, "equipped": True, "tools": ["CHOP"]}]
+        observed_only_birch["work_targets"] = [
+            {"guid": 12, "prefab": "deciduoustree", "work": "CHOP", "products": ["log"], "remaining": 15, "stage": 3, "distance": 6, "x": 6, "z": 0},
+        ]
+        t_ev = {"id": "ev_only", "title": "Only evergreen", "target": {"type": "inventory", "prefab": "log", "count": 4, "source_prefabs": ["evergreen"]}}
+        runtime2 = CompanionTasks()
+        runtime2.adopt(board(t_ev), observed_only_birch)
+        _, op2, args2 = runtime2.next_action(observed_only_birch)
+        self.assertEqual((op2, args2["products"]), ("search", []))
+
+        # 3) Dropped pickup log on the ground is still collected even when source_prefabs=['deciduoustree']
+        observed["nearby"] = [{"guid": 99, "prefab": "log", "product": "log", "kind": "pickup", "distance": 2, "x": 2, "z": 0}]
+        t_birch = {"id": "birch", "title": "Chop birch", "target": {"type": "inventory", "prefab": "log", "count": 4, "source_prefabs": ["deciduoustree"]}}
+        runtime3 = CompanionTasks()
+        runtime3.adopt(board(t_birch), observed)
+        self.assertEqual(runtime3.next_action(observed)[1:], ("collect", {"target_guid": 99}))
+
+    def test_standalone_explore_task_direction_prior_progress_and_stop_on_products(self):
+        observed = observation()
+        observed["perception"]["cells"] = [
+            {"gx": gx, "gz": gz, "land": True, "room_type": "BGGrass" if gx < 0 else "BGDirt"}
+            for gx in range(-4, 5) for gz in range(-2, 3)
+        ]
+        observed["perception"]["points"] = [
+            {"id": "4:0", "x": 16, "z": 0},
+            {"id": "-4:0", "x": -16, "z": 0},
+        ]
+        # 1) Direction bias: east picks 4:0
+        runtime = CompanionTasks()
+        runtime.adopt(board({"id": "scout_e", "title": "Scout east", "target": {"type": "explore", "cells": 8, "direction": "east"}}), observed)
+        selected, op, args = runtime.next_action(observed)
+        self.assertEqual((selected["id"], op, args["point_id"], args["products"]), ("scout_e", "search", "4:0", []))
+        self.assertEqual(runtime.search.strategy, "explore_direction")
+
+        # Verify CompanionBridge accepts empty products list for pure explore
+        bridge = CompanionBridge(TOKEN, clock=lambda: 0)
+        data = state()
+        data["companion"] = observed
+        bridge.exchange({"token": TOKEN, "session_id": "local", "sequence": 1, "state": data})
+        self.assertEqual(bridge.action("search", bridge.observe()["observation_id"], args)["status"], "queued")
+
+        # 2) stop_on_products automatically routes via room_resources prior without needing room_types
+        runtime2 = CompanionTasks()
+        runtime2.adopt(board({"id": "scout_grass", "title": "Find grass", "target": {"type": "explore", "cells": 8, "stop_on_products": ["cutgrass"]}}), observed)
+        _, op2, args2 = runtime2.next_action(observed)
+        self.assertEqual((op2, args2["point_id"], args2["products"]), ("search", "-4:0", ["cutgrass"]))
+        self.assertEqual(runtime2.search.strategy, "explore_prior")
+
+        # 3) Cell progress completion
+        relocate(observed, 16, 0)
+        self.assertEqual(runtime.view(observed)["status"], "completed")
+
+        # 4) stop_on_products completes immediately when goldnugget rock appears
+        observed2 = observation()
+        runtime3 = CompanionTasks()
+        runtime3.adopt(board({"id": "find_gold", "title": "Find gold", "target": {"type": "explore", "cells": 40, "stop_on_products": ["goldnugget"]}}), observed2)
+        _, op3, args3 = runtime3.next_action(observed2)
+        self.assertEqual((op3, args3["products"]), ("search", ["goldnugget"]))
+        observed2["version"] += 1
+        observed2["work_targets"] = [{"guid": 88, "prefab": "rock2", "work": "MINE", "products": ["rocks", "flint", "goldnugget"], "distance": 5, "x": 5, "z": 0}]
+        view3 = runtime3.view(observed2)
+        self.assertEqual(view3["status"], "completed")
+        self.assertEqual(view3["tasks"][0].get("found_product"), "goldnugget")

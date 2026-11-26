@@ -76,6 +76,9 @@ function M.new(G,reply,validate_text,encoded_size,trace,options)
     end
     function E.stop(a) a:ClearBufferedAction();a.components.locomotor:Clear();a.components.locomotor:Stop() end
     function E.set_name(a,name) return Presentation.set_name(G,a,name) end
+    function E.set_skin(a,skin) return Presentation.set_skin(G,a,skin) end
+    E.infer_skin=Presentation.infer_skin
+    E.resolve_skin=Presentation.resolve_skin
     function E.activate(a)
         if trace and a.ListenForEvent and not a._jev_companion_death_listener then
             a._jev_companion_death_listener=true

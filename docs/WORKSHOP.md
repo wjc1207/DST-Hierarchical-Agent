@@ -4,7 +4,7 @@
 
 | 模组目录 | 模组名称 | 类型 | 默认端口 | 游戏内命令 | 当前版本 |
 | --- | --- | --- | --- | --- | --- |
-| `dist/workshop/dst_buddy_agent` | **DST Buddy Agent** | 服务端/联机模组 (`all_clients_require_mod = true`) | `8766` | `/buddy setup` · `/buddy pair <token>` | `0.8.0` |
+| `dist/workshop/dst_buddy_agent` | **DST Buddy Agent** | 服务端/联机模组 (`all_clients_require_mod = true`) | `8766` | `/buddy setup` · `/buddy pair <token>` | `0.10.0` |
 | `dist/workshop/dst_player_agent` | **DST Player Agent** | 纯客户端模组 (`client_only_mod = true`) | `8765` | `/agent setup` · `/agent pair <token>` | `1.9.0` |
 
 ---

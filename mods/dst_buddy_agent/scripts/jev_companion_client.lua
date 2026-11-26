@@ -369,6 +369,53 @@ function M.new_team(env)
         end}
         env.send(q)
     end
+    function self:skin(raw)
+        local text=type(raw)=="string" and raw:match("^%s*(.-)%s*$") or ""
+        if text=="" then
+            notice("用法：/buddy skin [self|伙伴名] <deepseek|off>")
+            return
+        end
+        local first,second=text:match("^(%S+)%s+(%S+)$")
+        self:fetch_roster(function(ok)
+            if ok==false then notice("外观切换失败：名册同步超时。");return end
+            local target_row
+            local skin_arg
+            if first and second then
+                local low=first:lower()
+                for _,row in ipairs(self.roster) do
+                    if row.id:lower()==low or row.name:lower()==low or (low=="self" and row.id=="self") or (first=="自己" and row.id=="self") then
+                        target_row=row;break
+                    end
+                end
+                skin_arg=second
+            else
+                skin_arg=text
+                if #self.roster==1 then
+                    target_row=self.roster[1]
+                else
+                    for _,row in ipairs(self.roster) do
+                        if row.id=="self" then target_row=row;break end
+                    end
+                    target_row=target_row or self.roster[1]
+                end
+            end
+            if not target_row then
+                notice("未找到已召唤角色或伙伴，请先 /buddy self 或 /buddy summon 名字。")
+                return
+            end
+            self.serial=self.serial+1
+            local q={id=env.nonce..":skin:"..self.serial,seq=self.serial,op="skin",buddy_id=target_row.id,args={skin=skin_arg}}
+            self.requests[q.id]={seq=q.seq,at=(env.sim_now or env.now)(),op=q.op,callback=function(success,packet)
+                if success then
+                    local applied=packet and packet.skin or ""
+                    notice(applied=="" and ("已恢复 "..target_row.name.." 默认外观。") or ("已为 "..target_row.name.." 切换外观："..applied))
+                else
+                    notice("切换外观失败："..tostring(packet and packet.reason or "未知错误"))
+                end
+            end}
+            env.send(q)
+        end)
+    end
     local function accept_roster(packet)
         local version=packet.roster_version or 0
         if type(packet.roster)=="table" and version>=self.roster_version then
@@ -385,7 +432,7 @@ function M.new_team(env)
     end
     function self:receive(packet)
         if type(packet)~="table" then return end
-        if packet.op=="roster" or packet.op=="delete" then
+        if packet.op=="roster" or packet.op=="delete" or packet.op=="skin" then
             local pending=self.requests[packet.id]
             if not pending or pending.seq~=packet.seq or (pending.op or "roster")~=packet.op then return end
             self.requests[packet.id]=nil
@@ -393,7 +440,7 @@ function M.new_team(env)
             if packet.op=="delete" and packet.status=="completed" then
                 self.children[packet.buddy_id]=nil
             end
-            if pending.callback then pending.callback(packet.status=="completed") end
+            if pending.callback then pending.callback(packet.status=="completed",packet) end
             return
         end
         local c=self.children[packet.buddy_id or "buddy1"]
@@ -540,7 +587,8 @@ function M.new_team(env)
             end
         end)
         elseif name=="ai" then self:set_listening(body:lower()~="off")
-        else notice("用法：/buddy setup | pair <token> [8766] | unpair | self [on|off] | summon 名字 | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
+        elseif name=="skin" then self:skin(body)
+        else notice("用法：/buddy setup | pair <token> [8766] | unpair | self [on|off] | summon 名字 | skin [对象] <deepseek|off> | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
     end
     function self:accepts_chat(text)
         if not self.listening then return false end

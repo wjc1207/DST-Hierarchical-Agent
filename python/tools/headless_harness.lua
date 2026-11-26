@@ -145,13 +145,23 @@ local function rebuild_session()
     HEADLESS._http_req_id = HEADLESS._http_req_id or 0
 
     local client
-    local function reply_fn(player, packet)
-        local encoded = (json.encode_compliant or json.encode)(packet)
-        TheWorld:DoTaskInTime(0, function()
-            if gen ~= HEADLESS._session_gen or not client then return end
-            local ok, decoded = pcall(json.decode, encoded)
+    local reply_queue, reply_scheduled = {}, false
+    local function flush_replies()
+        reply_scheduled = false
+        if gen ~= HEADLESS._session_gen or not client then reply_queue = {}; return end
+        local batch = reply_queue
+        reply_queue = {}
+        for i = 1, #batch do
+            local ok, decoded = pcall(json.decode, batch[i])
             if ok and decoded then client:receive(decoded) end
-        end)
+        end
+    end
+    local function reply_fn(player, packet)
+        reply_queue[#reply_queue + 1] = (json.encode_compliant or json.encode)(packet)
+        if not reply_scheduled then
+            reply_scheduled = true
+            TheWorld:DoTaskInTime(0, flush_replies)
+        end
     end
     local function trace_fn(event, details)
         local row = {event = event}
@@ -172,6 +182,20 @@ local function rebuild_session()
     end
 
     local server = mods.Server.new_team(world_env)
+    local send_queue, send_scheduled = {}, false
+    local function flush_sends()
+        send_scheduled = false
+        if gen ~= HEADLESS._session_gen then send_queue = {}; return end
+        local batch = send_queue
+        send_queue = {}
+        for i = 1, #batch do
+            local ok, decoded = pcall(json.decode, batch[i])
+            if ok and decoded then
+                local handled, err = pcall(function() server:request(owner, decoded) end)
+                if not handled then emit("ERROR", {stage = "server_request", detail = tostring(err)}) end
+            end
+        end
+    end
     local clock = rawget(_G, "walltime") or function() return GetTime() end
     local transport_mode = HEADLESS._transport_mode or "http"
     client = mods.Client.new_team({
@@ -182,15 +206,11 @@ local function rebuild_session()
         http_enabled = true,
         notice = function(text) emit("NOTICE", {text = tostring(text)}) end,
         send = function(q)
-            local encoded = (json.encode_compliant or json.encode)(q)
-            TheWorld:DoTaskInTime(0, function()
-                if gen ~= HEADLESS._session_gen then return end
-                local ok, decoded = pcall(json.decode, encoded)
-                if ok and decoded then
-                    local handled, err = pcall(function() server:request(owner, decoded) end)
-                    if not handled then emit("ERROR", {stage = "server_request", detail = tostring(err)}) end
-                end
-            end)
+            send_queue[#send_queue + 1] = (json.encode_compliant or json.encode)(q)
+            if not send_scheduled then
+                send_scheduled = true
+                TheWorld:DoTaskInTime(0, flush_sends)
+            end
         end,
         http = function(payload, callback)
             payload.token = HEADLESS.config.token

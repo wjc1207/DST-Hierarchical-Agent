@@ -23,7 +23,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
     tasks = TaskService(bridge, companion=True, poll=poll, timing_path=timing_path)
     from mcp.server import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
-    server = MCPServer("DSTCompanion", version="0.9.0", lifespan=tasks.lifespan, instructions=(
+    server = MCPServer("DSTCompanion", version="0.10.0", lifespan=tasks.lifespan, instructions=(
         "Unified server tools control up to two named bound Wilsons (buddy1, buddy2) and optionally the human owner's own character (buddy_id=\"self\", is_self=true). Observe first. Without buddy_id, buddy_observe returns the team; specify buddy_id for other tools when multiple members exist. Use buddy_reply for each actor's own first-person speech. A member finish ends only that contribution. "
         "Use only offered collection target GUIDs. Poll buddy_result: queued/running are not success. "
         "follow completes when follow mode is set, not when arrival occurs; follow/give_owner/receive_item/timed_return are omitted when is_self=true. Read owner_distance for arrival. "
@@ -52,7 +52,7 @@ def create_server(bridge, *, poll=.2, timing_path=None):
 
     @server.tool()
     def buddy_action(op: str, observation_id: str, args: dict[str, Any] | None = None, buddy_id: str | None = None) -> dict[str, Any]:
-        """Queue a native action. visit_building={building_id} accepts remembered buildings only, with up to 300 seconds of travel. work={target_guid,work:CHOP|MINE}, equip/unequip={item_guid}, craft={recipe_id}, place={recipe_id,x,z,radius?}, search={point_id,x,z,products:[prefab],timeout_seconds:0.2..8}. eat/give_owner/drop_item={prefab,total_count:1..100,task_key}; deposit/withdraw additionally require container_guid. Poll actual results."""
+        """Queue a native action. visit_building={building_id} accepts remembered buildings only, with up to 300 seconds of travel. work={target_guid,work:CHOP|MINE}, equip/unequip={item_guid}, craft={recipe_id}, place={recipe_id,x,z,radius?}, search={point_id,x,z,products:[prefab](0..6),timeout_seconds:0.2..8}. eat/give_owner/drop_item={prefab,total_count:1..100,task_key}; deposit/withdraw additionally require container_guid. Poll actual results."""
         if op not in {"summon", "bind", "recipes"}:
             invoke(tasks.check_manual_action, buddy_id)
         return member("action",buddy_id,op,observation_id,args)
