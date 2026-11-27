@@ -30,7 +30,7 @@ local function game_paused()
 end
 local function notice(text) if G.ChatHistory then G.ChatHistory:SendCommandResponse("[Companion] "..text) end end
 local function log(event,reason,details)
-    local row={event=event,reason=reason,version="0.11.1"}
+    local row={event=event,reason=reason,version="0.11.2"}
     for key,value in pairs(details or {}) do row[key]=value end
     print("[JEV_COMPANION]"..json.encode(row))
 end
