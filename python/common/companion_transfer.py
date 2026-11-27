@@ -2,9 +2,10 @@
 from copy import deepcopy
 import re
 
-COUNTED_TARGETS = {"give_owner", "drop_item", "deposit", "withdraw", "eat", "heal"}
+COUNTED_TARGETS = {"give_owner", "give_buddy", "drop_item", "deposit", "withdraw", "eat", "heal"}
 STORAGE_TARGETS = {"inspect_storage", "deposit", "withdraw"}
 TRANSFER_TARGETS = COUNTED_TARGETS | STORAGE_TARGETS | {"receive_item"}
+BUDDY_SLOTS = {"self", "buddy1", "buddy2"}
 
 
 def guid(value):
@@ -50,6 +51,12 @@ def validate_target(target):
             clean["container_guid"] = parsed_guid
         else:
             clean["container_guid"] = guid(target.get("container_guid"))
+    if kind == "give_buddy":
+        fields.add("target_buddy_id")
+        tid = target.get("target_buddy_id")
+        if not isinstance(tid, str) or tid not in BUDDY_SLOTS:
+            raise ValueError("give_buddy requires target_buddy_id in self, buddy1, buddy2")
+        clean["target_buddy_id"] = tid
     if kind != "inspect_storage":
         fields.update({"prefab", "count"})
         if not isinstance(target.get("prefab"), str) or not re.fullmatch(r"[a-z0-9_]{1,60}", target["prefab"]):

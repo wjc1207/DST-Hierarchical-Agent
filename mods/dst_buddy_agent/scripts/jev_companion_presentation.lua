@@ -2,6 +2,7 @@
 local M={}
 M.SKINS={
     deepseek="skin_deepseek",
+    gemini="skin_gemini",
 }
 local BODY_SYMBOLS={
     "headbase","headbase_hat","hair","hair_hat","hairpigtails","tail","face","cheeks",
@@ -24,6 +25,9 @@ function M.resolve_skin(raw)
     if key=="deepseek" or key=="skin_deepseek" or key=="dschan" or key=="小鲸" or key=="大肥鱼" then
         return "deepseek"
     end
+    if key=="gemini" or key=="skin_gemini" or key=="双子" or key=="吉米尼" then
+        return "gemini"
+    end
     return nil
 end
 
@@ -33,6 +37,9 @@ function M.infer_skin(name)
     if low:find("deepseek",1,true) or low:find("deep_seek",1,true)
         or low:find("dschan",1,true) or name:find("小鲸",1,true) or name:find("大肥鱼",1,true) then
         return "deepseek"
+    end
+    if low:find("gemini",1,true) or name:find("双子",1,true) or name:find("吉米尼",1,true) then
+        return "gemini"
     end
     return ""
 end

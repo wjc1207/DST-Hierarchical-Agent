@@ -5,7 +5,7 @@
 > - **脚本依据**：核对 `data/databundles/scripts.zip` 中的 `scripts/stategraphs/SGwilson.lua`（`444` 个角色 State）、`scripts/emotes.lua` 与 `scripts/emote_items.lua`；
 > - **原版图素对比**：逐一比对 [manifest.json](file:///c:/Users/16425/Documents/Codex-workspace/DST-Hierarchical-Agent/jev_dst_agent/skins/deepseek/work/manifest.json) 收录的原版 `wendy.zip` 全部 **`159` 张基础精灵**（外加通用同伴架构新增的 `hair:0..3`、`tail:0, 6`）的像素结构、余弦相似度矩阵与人工肉眼核验。
 >
-> 配套生图/工作流/Prompt 模板请见 [prompts.md](file:///c:/Users/16425/Documents/Codex-workspace/DST-Hierarchical-Agent/jev_dst_agent/skins/deepseek/prompts.md)。
+> 配套可复用 v2 6 表生成与零耦合架构指南请见 [SKIN_GENERATION_PLAYBOOK.md](file:///c:/Users/16425/Documents/Codex-workspace/DST-Hierarchical-Agent/jev_dst_agent/skins/SKIN_GENERATION_PLAYBOOK.md)；DeepSeek 实战/Prompt 请见 [prompts.md](file:///c:/Users/16425/Documents/Codex-workspace/DST-Hierarchical-Agent/jev_dst_agent/skins/deepseek/prompts.md)。
 
 ---
 

@@ -3,8 +3,12 @@ local M={}
 local Storage=require("jev_companion_storage")
 local TREES={evergreen={"log","pinecone"},evergreen_sparse={"log","pinecone"},deciduoustree={"log","acorn"},twiggytree={"log","twigs","twiggy_nut"}}
 local ROCKS={rock1={"rocks","flint","nitre"},rock2={"rocks","flint","goldnugget"},rock_flintless={"rocks"},rock_flintless_med={"rocks"},rock_flintless_low={"rocks"},rock_ice={"ice"}}
-local WORK_ACTIONS={"CHOP","MINE"}
-local FIRE_PREFABS={campfire=true,firepit=true,coldfire=true,coldfirepit=true}
+local DIGGABLES={grass={"dug_grass"},sapling={"dug_sapling"},berrybush={"dug_berrybush"},berrybush2={"dug_berrybush2"},berrybush_juicy={"dug_berrybush_juicy"}}
+local WORK_ACTIONS={"CHOP","MINE","DIG"}
+local FIRE_PREFABS={campfire=true,firepit=true,coldfire=true,coldfirepit=true,firesuppressor=true}
+local DEPLOYABLES={dug_grass=true,dug_sapling=true,dug_berrybush=true,dug_berrybush2=true,dug_berrybush_juicy=true,pinecone=true,acorn=true,twiggy_nut=true}
+local FERTILIZERS={spoiled_food=true,poop=true,guano=true,compost=true,glommerfuel=true}
+local DRYABLE_MEATS={meat=true,smallmeat=true,monstermeat=true,drumstick=true,froglegs=true,fishmeat=true,fishmeat_small=true}
 local FUEL_PREFABS={log=true,charcoal=true,pinecone=true,acorn=true,twiggy_nut=true,twigs=true,cutgrass=true,nitre=true}
 local SAFE_MEALS={
     meatballs=true,ratatouille=true,perogies=true,baconeggs=true,bonestew=true,
@@ -59,8 +63,14 @@ local MEAL_CATALOG={
     {product="dragonpie",ingredients={"dragonfruit","twigs","twigs","twigs"},cook_seconds=40},
     {product="dragonpie",ingredients={"dragonfruit","berries","berries","berries"},cook_seconds=40},
 }
-local DEFAULT_RECIPES={"pickaxe","torch","spear","armorwood","footballhat","healingsalve","bandage","rope","boards","cutstone","treasurechest","cookpot","researchlab","researchlab2","campfire","firepit","coldfire","coldfirepit","earmuffshat","winterhat","beefalohat","strawhat","grass_umbrella","umbrella","rainhat","heatrock","axe"}
+local DEFAULT_RECIPES={"pickaxe","torch","spear","armorwood","footballhat","healingsalve","bandage","rope","boards","cutstone","treasurechest","cookpot","researchlab","researchlab2","researchlab3","researchlab4","campfire","firepit","coldfire","coldfirepit","earmuffshat","winterhat","beefalohat","strawhat","grass_umbrella","umbrella","rainhat","heatrock","shovel","meatrack","lightning_rod","firesuppressor","icebox","dragonflychest","hambat","tent","siestahut","axe"}
 local NON_COMBAT_ALLY={chester=true,hutch=true,glommer=true,abigail=true,bernie_active=true,bernie_big=true}
+local KITE_HITS={
+    hound=2,firehound=2,icehound=2,spider_warrior=2,merm=2,pigman=2,pigguard=2,
+    tallbird=2,tentacle=1,knight=2,bishop=2,rook=2,leif=3,leif_sparse=3,
+    deerclops=2,bearger=2,moose=2,dragonfly=2,koalefant_summer=4,koalefant_winter=4,
+}
+local NO_KITE={spider=true,frog=true,butterfly=true,bee=true,killerbee=true,mosquito=true,rabbit=true,mole=true}
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<100000 end
 -- Entity IDs are not coordinates; real DST worlds routinely use IDs >100000.
 local function valid_guid(v) return type(v)=="number" and v==v and v>=1 and v<=9007199254740991 and v%1==0 end
@@ -226,7 +236,8 @@ function M.new(G,E)
         if not w or not w:CanBeWorked() or w:GetWorkLeft()<=0 then return end
         local kind,products
         if TREES[e.prefab] and w:GetWorkAction()==G.ACTIONS.CHOP then kind,products="CHOP",burnt and {"charcoal"} or TREES[e.prefab]
-        elseif not burnt and ROCKS[e.prefab] and w:GetWorkAction()==G.ACTIONS.MINE then kind,products="MINE",ROCKS[e.prefab] end
+        elseif not burnt and ROCKS[e.prefab] and w:GetWorkAction()==G.ACTIONS.MINE then kind,products="MINE",ROCKS[e.prefab]
+        elseif not burnt and DIGGABLES[e.prefab] and w:GetWorkAction()==G.ACTIONS.DIG then kind,products="DIG",DIGGABLES[e.prefab] end
         if not kind then return end
         local x,z=position(e)
         local stage=e.components.growable and e.components.growable.stage or nil
@@ -414,7 +425,7 @@ function M.new(G,E)
         return {available=true,ratio_available=true,targets=targets}
     end
     function A.camp_work(a,entities)
-        local fixtures,trees={},{}
+        local fixtures,trees,barren_plants={},{},{}
         for _,e in ipairs(entities or {}) do
             if e and e:IsValid() and not e:HasTag("INLIMBO") then
                 if e.prefab=="cookpot" then
@@ -438,6 +449,36 @@ function M.new(G,E)
                     end
                     fixtures[#fixtures+1]={building_id="building:"..tostring(e.GUID),guid=e.GUID,prefab="cookpot",
                         phase=phase,contents_known=known,items=items,product=stewer and stewer.product or nil}
+                elseif e.prefab=="meatrack" and not e:HasTag("burnt") then
+                    local dryer=e.components and e.components.dryer
+                    local rack=e.components and e.components.dryingrack
+                    local c=e.components and e.components.container
+                    local phase,product="unavailable",nil
+                    if dryer then
+                        if dryer:IsDone() then phase="ready";product=dryer.product
+                        elseif dryer:IsDrying() then phase="drying";product=dryer.product
+                        else phase="empty" end
+                    elseif rack and c then
+                        local has_dried,has_item,free_slot=false,false,false
+                        for slot=1,(c.numslots or 3) do
+                            local it=(c.slots or {})[slot]
+                            if it and it:IsValid() then
+                                has_item=true
+                                if tostring(it.prefab):find("_dried",1,true) then has_dried=true;product=it.prefab end
+                            else
+                                free_slot=true
+                            end
+                        end
+                        if has_dried then phase="ready"
+                        elseif free_slot then phase="empty"
+                        elseif has_item then phase="drying" end
+                    end
+                    fixtures[#fixtures+1]={building_id="building:"..tostring(e.GUID),guid=e.GUID,prefab="meatrack",
+                        phase=phase,product=product}
+                elseif e.components and e.components.pickable and e.components.pickable.IsBarren and e.components.pickable:IsBarren()
+                    and not e:HasTag("burnt") and E.distance(a,e)<=18 and #barren_plants<16 then
+                    local ex,ez=position(e)
+                    barren_plants[#barren_plants+1]={guid=e.GUID,prefab=e.prefab,distance=E.distance(a,e),x=ex,z=ez}
                 elseif (IGNITE_TREES[e.prefab] or (TREES[e.prefab] and (e:HasTag("burnt") or e:HasTag("fire") or (e.components.burnable and e.components.burnable:IsBurning()))))
                     and not e:HasTag("stump") and not e:HasTag("monster") and not e:HasTag("plantcreature") and E.distance(a,e)<=15 then
                     local dist=E.distance(a,e)
@@ -477,7 +518,7 @@ function M.new(G,E)
                 end
             end
         end
-        return {available=true,fixtures=fixtures,trees=trees,meals=MEAL_CATALOG}
+        return {available=true,fixtures=fixtures,trees=trees,barren_plants=barren_plants,meals=MEAL_CATALOG}
     end
     function A.start(a,q,r)
         local args=q.args or {};local op=q.op
@@ -534,6 +575,115 @@ function M.new(G,E)
             local product=stewer.product
             if not stewer:Harvest(a) then return false,"meal_harvest_failed" end
             q.harvested_product=product;return true
+        elseif op=="dry_meat" then
+            local target,reason
+            if E.place_target then target,reason=E.place_target(a,args.building_id) end
+            if not target or target.prefab~="meatrack" then return false,reason or "meatrack_missing" end
+            if E.distance(a,target)>4 then return false,"meatrack_too_far" end
+            local prefab=args.prefab
+            if not identifier(prefab) or not DRYABLE_MEATS[prefab] then return false,"invalid_dryable_meat" end
+            local found=a.components.inventory:FindItems(function(i)
+                return i:IsValid() and i.prefab==prefab and (i.components.dryable~=nil or i:HasTag("dryable"))
+            end)
+            local item=found[1]
+            if not item then return false,"dryable_meat_not_carried" end
+            local dryer=target.components and target.components.dryer
+            if dryer then
+                if dryer:IsDrying() or dryer:IsDone() then return false,"meatrack_not_empty" end
+                local action=G.BufferedAction(a,target,G.ACTIONS.DRY,item)
+                action.distance=3.5
+                action:AddSuccessAction(function() q.dry_started=true end)
+                return push(a,q,action)
+            end
+            local rack=target.components and target.components.dryingrack
+            local c=target.components and target.components.container
+            if not rack or not c then return false,"meatrack_unavailable" end
+            local slot
+            for i=1,(c.numslots or 3) do
+                if not (c.slots or {})[i] and c:CanTakeItemInSlot(item,i) then slot=i;break end
+            end
+            if not slot then return false,"meatrack_not_empty" end
+            local single=a.components.inventory:RemoveItem(item,false)
+            if not single then return false,"dryable_meat_split_failed" end
+            if not c:GiveItem(single,slot) then a.components.inventory:GiveItem(single);return false,"meatrack_insert_failed" end
+            q.dry_started=true;return true
+        elseif op=="harvest_rack" then
+            local target,reason
+            if E.place_target then target,reason=E.place_target(a,args.building_id) end
+            if not target or target.prefab~="meatrack" then return false,reason or "meatrack_missing" end
+            if E.distance(a,target)>4 then return false,"meatrack_too_far" end
+            local dryer=target.components and target.components.dryer
+            if dryer then
+                if not dryer:IsDone() then return false,"rack_not_ready" end
+                local product=dryer.product
+                if not dryer:Harvest(a) then return false,"rack_harvest_failed" end
+                q.rack_harvested=product;return true
+            end
+            local rack=target.components and target.components.dryingrack
+            local c=target.components and target.components.container
+            if not rack or not c then return false,"meatrack_unavailable" end
+            for i=1,(c.numslots or 3) do
+                local it=(c.slots or {})[i]
+                if it and it:IsValid() and tostring(it.prefab):find("_dried",1,true) then
+                    local taken=c:RemoveItemBySlot(i)
+                    if taken then
+                        local product=taken.prefab
+                        a.components.inventory:GiveItem(taken)
+                        q.rack_harvested=product;return true
+                    end
+                end
+            end
+            return false,"rack_not_ready"
+        elseif op=="deploy" then
+            local prefab=args.prefab
+            if not identifier(prefab) or not DEPLOYABLES[prefab] then return false,"invalid_deployable" end
+            local found=a.components.inventory:FindItems(function(i)
+                return i:IsValid() and i.prefab==prefab and i.components.deployable~=nil
+            end)
+            local item=found[1]
+            if not item then return false,"deployable_not_carried" end
+            local ax,az=position(a)
+            local cx=finite(args.x) and args.x or ax
+            local cz=finite(args.z) and args.z or az
+            local radius=finite(args.radius) and math.max(2,math.min(12,args.radius)) or 6
+            local pt
+            for _,rad in ipairs({0,2.5,4,6,8,10}) do
+                if rad<=radius then
+                    local steps=rad==0 and 1 or 8
+                    for n=0,steps-1 do
+                        local x,z=cx+math.cos(n*2*math.pi/steps)*rad,cz+math.sin(n*2*math.pi/steps)*rad
+                        local cand=G.Vector3(x,0,z)
+                        if E.valid_point(a,x,z,18) and item.components.deployable:CanDeploy(cand) then
+                            pt=cand;break
+                        end
+                    end
+                    if pt then break end
+                end
+            end
+            if not pt then return false,"no_deploy_site" end
+            q.deploy_prefab=prefab;q.before=E.count(a,prefab)
+            local action=G.BufferedAction(a,nil,G.ACTIONS.DEPLOY,item,pt)
+            action:AddSuccessAction(function() q.deployed=true end)
+            return push(a,q,action)
+        elseif op=="fertilize" then
+            local target=valid_guid(args.target_guid) and G.Ents[args.target_guid]
+            if not target or not target:IsValid() or target:HasTag("INLIMBO") or target:HasTag("burnt") or E.distance(a,target)>15 then
+                return false,"fertilize_target_unavailable"
+            end
+            if not (target.components and target.components.pickable and target.components.pickable.IsBarren and target.components.pickable:IsBarren()) then
+                return false,"plant_not_barren"
+            end
+            local prefab=args.fertilizer_prefab
+            if not identifier(prefab) or not FERTILIZERS[prefab] then return false,"invalid_fertilizer" end
+            local found=a.components.inventory:FindItems(function(i)
+                return i:IsValid() and i.prefab==prefab and i.components.fertilizer~=nil
+            end)
+            local item=found[1]
+            if not item then return false,"fertilizer_not_carried" end
+            q.fert_target=target;q.fert_prefab=prefab;q.before=E.count(a,prefab)
+            local action=G.BufferedAction(a,target,G.ACTIONS.FERTILIZE,item)
+            action:AddSuccessAction(function() q.fertilized=true end)
+            return push(a,q,action)
         elseif op=="attack" then
             local target=valid_guid(args.target_guid) and G.Ents[args.target_guid]
             if not combat_target_valid(a,target,20) then return false,"enemy_unavailable" end
@@ -544,8 +694,13 @@ function M.new(G,E)
             q.attack_target=target
             q.target_prefab=target.prefab
             q.target_hp_before=target.components.health and target.components.health.currenthealth or 0
+            local max_hp=target.components.health and target.components.health.maxhealth or 0
+            q.kite_hits=KITE_HITS[target.prefab] or ((not NO_KITE[target.prefab] and max_hp>=250) and 2 or nil)
+            q.kite_state="engage"
+            q.swings_since_dodge=0
+            q.dodge_until=0
             q.min_health_ratio=min_hp
-            q.combat_deadline=E.now()+12
+            q.combat_deadline=E.now()+(q.kite_hits and 20 or 12)
             q.last_swing=E.now()
             a.components.combat:SetTarget(target)
             return push(a,q,G.BufferedAction(a,target,G.ACTIONS.ATTACK))
@@ -625,6 +780,20 @@ function M.new(G,E)
             return "completed","pot_started",{building_id=q.args.building_id,cook_seconds=q.cook_seconds}
         elseif q.op=="harvest_meal" and q.harvested_product then
             return "completed","meal_harvested:"..tostring(q.harvested_product),{building_id=q.args.building_id,product=q.harvested_product}
+        elseif q.op=="dry_meat" then
+            if q.dry_started then return "completed","meat_drying",{building_id=q.args.building_id,prefab=q.args.prefab} end
+        elseif q.op=="harvest_rack" and q.rack_harvested then
+            return "completed","rack_harvested:"..tostring(q.rack_harvested),{building_id=q.args.building_id,product=q.rack_harvested}
+        elseif q.op=="deploy" then
+            if q.deployed or (q.deploy_prefab and E.count(a,q.deploy_prefab)<(q.before or 0)) then
+                return "completed","deployed",{prefab=q.deploy_prefab}
+            end
+        elseif q.op=="fertilize" then
+            local t=q.fert_target
+            local ok_barren=t and t:IsValid() and t.components and t.components.pickable and t.components.pickable.IsBarren and not t.components.pickable:IsBarren()
+            if q.fertilized or ok_barren or (q.fert_prefab and E.count(a,q.fert_prefab)<(q.before or 0)) then
+                return "completed","fertilized",{target_guid=q.args.target_guid,fertilizer_prefab=q.fert_prefab}
+            end
         elseif q.op=="attack" then
             local target=q.attack_target
             local dead=not target or not target:IsValid() or (target.components.health and target.components.health:IsDead())
@@ -651,8 +820,42 @@ function M.new(G,E)
                 return "failed","combat_timeout",{target_guid=q.args.target_guid}
             end
             local busy=a.sg and a.sg.HasStateTag and (a.sg:HasStateTag("attack") or a.sg:HasStateTag("busy"))
+            -- Team aggro coop: only kite when this actor holds aggro; free-DPS when enemy targets a teammate.
+            local enemy_target=target.components.combat and target.components.combat.target
+            local should_kite=q.kite_hits~=nil and (enemy_target==nil or enemy_target==a)
+            local dist=E.distance(a,target)
+            local enemy_attacking=target.sg and target.sg.HasStateTag and target.sg:HasStateTag("attack")
+            if q.kite_state=="dodge" then
+                if now>=(q.dodge_until or 0) or (not enemy_attacking and dist>=4.5) or not should_kite then
+                    q.kite_state="engage"
+                    q.swings_since_dodge=0
+                else
+                    return
+                end
+            elseif should_kite and not busy and dist<=4.2 and (enemy_attacking or (q.swings_since_dodge or 0)>=q.kite_hits) then
+                local ax,az=position(a);local tx,tz=position(target)
+                local dx,dz=ax-tx,az-tz;local norm=math.sqrt(dx*dx+dz*dz)
+                if norm<0.01 then dx,dz,norm=1,0,1 end
+                local ux,uz=dx/norm,dz/norm
+                local dodge_x,dodge_z
+                for _,ang in ipairs({0,0.78,-0.78,1.57,-1.57}) do
+                    local c,s=math.cos(ang),math.sin(ang)
+                    local cx=ax+(ux*c-uz*s)*4.5
+                    local cz=az+(ux*s+uz*c)*4.5
+                    if E.valid_point(a,cx,cz,8) then dodge_x,dodge_z=cx,cz;break end
+                end
+                if dodge_x then
+                    q.kite_state="dodge"
+                    q.dodge_until=now+0.75
+                    q.swings_since_dodge=0
+                    a:ClearBufferedAction()
+                    E.move(a,dodge_x,dodge_z)
+                    return
+                end
+            end
             if not busy and (not a.components.combat:InCooldown()) and now-(q.last_swing or 0)>=0.35 then
                 q.last_swing=now
+                q.swings_since_dodge=(q.swings_since_dodge or 0)+1
                 a.components.combat:SetTarget(target)
                 a.components.locomotor:PushAction(G.BufferedAction(a,target,G.ACTIONS.ATTACK),true)
             end

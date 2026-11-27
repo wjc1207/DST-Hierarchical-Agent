@@ -5,6 +5,15 @@ local CELL=4
 local MIN_LEG_SQ=3^2
 local MAX_LEG_SQ=20^2
 local ARRIVAL_RADIUS=.5
+local POI_PREFABS={
+    pigking="landmark",pighouse="settlement",mermhouse="settlement",
+    wormhole="portal",cave_entrance="portal",cave_entrance_open="portal",
+    multiplayer_portal="portal",multiplayer_portal_moonrock="portal",
+    beefalo="herd",pond="resource",pond_mos="resource",pond_cave="resource",
+    walrus_camp="camp",beehive="nest",wasphive="nest",spiderden="nest",
+    catcoonden="nest",tallbirdnest="nest",statueglommer="landmark",
+    resurrectionstone="landmark",moonbase="landmark",oasis_lake="landmark",
+}
 local function key(gx,gz) return tostring(gx)..":"..tostring(gz) end
 local function grid(value) return math.floor(value/CELL+.5) end
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<100000 end
@@ -73,8 +82,12 @@ function M.new(G,E)
                     if row.land and G.TheWorld.Map.GetTopologyIDAtPoint then
                         local topology=G.TheWorld.Map:GetTopologyIDAtPoint(x,0,z)
                         if type(topology)=="string" and topology~="" then
+                            row.node_id=topology
                             row.room_type=topology:match("([^:]+)$")
                         end
+                    end
+                    if row.land and G.RoadManager and G.RoadManager.IsOnRoad and G.RoadManager:IsOnRoad(x,0,z) then
+                        row.road=true
                     end
                     cache.cells[#cache.cells+1]=row
                 end
@@ -97,8 +110,24 @@ function M.new(G,E)
                 if clear_hazards(px,pz,p.x,p.z,dangers) then points[#points+1]=p end
             end
         end
+        local pois,seen_poi={},{}
+        for _,e in ipairs(entities) do
+            if e:IsValid() and e~=a then
+                local kind=POI_PREFABS[e.prefab]
+                if kind then
+                    local ex,ez=E.position(e)
+                    local dedup=e.prefab=="beefalo" and ("beefalo:"..grid(ex)..":"..grid(ez)) or e.GUID
+                    if not seen_poi[dedup] then
+                        seen_poi[dedup]=true
+                        pois[#pois+1]={guid=e.GUID,prefab=e.prefab,kind=kind,
+                            x=math.floor(ex*100+.5)/100,z=math.floor(ez*100+.5)/100}
+                        if #pois>=12 then break end
+                    end
+                end
+            end
+        end
         return {cell_size=CELL,radius=20,resource_radius=15,observed_at=now,cells=cache.cells,points=points,
-            hazards=dangers,walkable_points=walkable}
+            hazards=dangers,walkable_points=walkable,pois=pois}
     end
     function P.escape_point(a,threats,entities)
         local data=P.observe(a,entities)

@@ -1,4 +1,4 @@
-"""Local frontier/memory adapter. Server offers facts; shared tasks own budgets."""
+"""Local frontier/memory adapter backed by WorldGraph two-level topological routing."""
 import heapq
 import math
 import time
@@ -7,14 +7,13 @@ from collections import OrderedDict
 from common.task_timing import number
 from executor.navigation_intents import WORK_SOURCES, sources_for
 from executor.region_resources import room_resources
+from executor.world_graph import CELL, NEIGHBORS, MAX_SOURCES, WorldGraph, cell_at
 
 
-CELL = 4
-NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 LOCAL_ROUTE_LIMIT = 80
 KNOWN_ROUTE_LIMIT = 320
 KNOWN_SOURCE_TTL = 900
-MAX_SOURCES = 512
+ROAD_EXPLORE_BONUS = 12.0
 DIRECTIONS = {
     "east": (1.0, 0.0),
     "west": (-1.0, 0.0),
@@ -27,14 +26,12 @@ DIRECTIONS = {
 }
 
 
-def cell_at(x, z):
-    return math.floor(x/CELL+.5), math.floor(z/CELL+.5)
-
-
 class ResourceSearch:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, *, graph: WorldGraph | None = None):
         self.clock = clock
-        self.cells, self.sources = OrderedDict(), OrderedDict()
+        self.graph = graph if graph is not None else WorldGraph(clock=clock)
+        self.cells = self.graph.cells
+        self.sources = self.graph.sources
         self.paused = {}
         self.recent_legs = OrderedDict()
         self.last_version = None
@@ -53,14 +50,8 @@ class ResourceSearch:
         size = perception.get("cell_size")
         if size != CELL:
             return
+        self.graph.observe(observed)
         now = self.clock()
-        for row in perception.get("cells", []):
-            if type(row.get("gx")) is int and type(row.get("gz")) is int and type(row.get("land")) is bool:
-                identity = (row["gx"], row["gz"])
-                self.cells[identity] = dict(row)
-                self.cells.move_to_end(identity)
-        while len(self.cells) > 8192:
-            self.cells.popitem(last=False)
         point = (observed.get("buddy") or {}).get("position") or {}
         if not all(number(point.get(k)) for k in ("x", "z")):
             return
@@ -72,12 +63,14 @@ class ResourceSearch:
                 continue
             identity = row["guid"]
             seen.add(identity)
+            nid = self.graph.node_at(row["x"], row["z"])
             self.sources[identity] = {
                 "guid": identity,
                 "prefab": row.get("prefab"),
                 "product": row["product"],
                 "x": row["x"],
                 "z": row["z"],
+                "node_id": nid,
                 "seen_at": now,
                 "available": True,
             }
@@ -86,6 +79,7 @@ class ResourceSearch:
         for row in work_targets or []:
             if not all(number(row.get(k)) for k in ("guid", "x", "z")):
                 continue
+            nid = self.graph.node_at(row["x"], row["z"])
             for product in row.get("products", []):
                 identity = (row["guid"], product)
                 seen.add(identity)
@@ -98,6 +92,7 @@ class ResourceSearch:
                     "stage": row.get("stage"),
                     "x": row["x"],
                     "z": row["z"],
+                    "node_id": nid,
                     "seen_at": now,
                     "available": True,
                 }
@@ -163,16 +158,110 @@ class ResourceSearch:
             heapq.heappush(queue, (distance, -distance, identity, cell))
         return origin, first_legs, queue
 
+    def _step_toward_point(self, points, target_x, target_z, max_distance):
+        """Route along observed grid (<=320u) toward (target_x, target_z), else pick closest safe offered leg."""
+        target_cell = cell_at(target_x, target_z)
+        origin, first_legs, queue = self._offered_first_legs(points, max_distance)
+        if not first_legs:
+            return None
+        visited = {origin}
+        best_cell_dist = math.inf
+        best_first = None
+        while queue:
+            distance, first_distance, first, cell = heapq.heappop(queue)
+            if cell in visited:
+                continue
+            visited.add(cell)
+            if cell == target_cell:
+                return first_legs[first]
+            d_to_target = math.hypot(cell[0] * CELL - target_x, cell[1] * CELL - target_z)
+            if d_to_target < best_cell_dist:
+                best_cell_dist = d_to_target
+                best_first = first
+            if distance + CELL <= KNOWN_ROUTE_LIMIT:
+                gx, gz = cell
+                for dx, dz in NEIGHBORS:
+                    ncell = (gx + dx, gz + dz)
+                    if ncell not in visited and self.cells.get(ncell, {}).get("land"):
+                        heapq.heappush(queue, (distance + CELL, first_distance, first, ncell))
+        if best_first is not None:
+            return first_legs[best_first]
+        return min(first_legs.values(), key=lambda p: math.hypot(p["x"] - target_x, p["z"] - target_z))
+
+    def select_waypoint(self, target_x, target_z, observed, *, max_distance=20):
+        """Two-level routing to any observed land coordinate (local grid <=320u, else region-graph portal)."""
+        self.observe(observed)
+        self.strategy = None
+        perception = observed.get("perception") or {}
+        if not self.position or perception.get("cell_size") != CELL:
+            return None
+        points = perception.get("points", [])
+        target_cell = cell_at(target_x, target_z)
+        # Level 1: direct local grid Dijkstra if target cell is known land within 320u
+        if self.cells.get(target_cell, {}).get("land"):
+            origin, first_legs, queue = self._offered_first_legs(points, max_distance)
+            visited = {origin}
+            while queue:
+                distance, first_distance, first, cell = heapq.heappop(queue)
+                if cell in visited:
+                    continue
+                visited.add(cell)
+                if cell == target_cell:
+                    self.strategy = "waypoint"
+                    return first_legs[first]
+                if distance + CELL <= KNOWN_ROUTE_LIMIT:
+                    gx, gz = cell
+                    for dx, dz in NEIGHBORS:
+                        ncell = (gx + dx, gz + dz)
+                        if ncell not in visited and self.cells.get(ncell, {}).get("land"):
+                            heapq.heappush(queue, (distance + CELL, first_distance, first, ncell))
+        # Level 2: cross-region topological graph routing
+        start_node = self.graph.node_at(*self.position)
+        target_node = self.graph.nearest_node_to(target_x, target_z)
+        if start_node and target_node:
+            if start_node == target_node:
+                leg = self._step_toward_point(points, target_x, target_z, max_distance)
+                if leg is not None:
+                    self.strategy = "waypoint"
+                    return leg
+            else:
+                hop = self.graph.next_portal_toward(start_node, {target_node})
+                if hop is not None:
+                    portal = hop[0]
+                    leg = self._step_toward_point(points, portal["x"], portal["z"], max_distance)
+                    if leg is not None:
+                        self.strategy = "waypoint"
+                        return leg
+        return None
+
     def select_known(self, product, observed, *, max_distance=20, source_prefabs=None):
         self.observe(observed)
         self.strategy = None
         perception = observed.get("perception") or {}
         if not self.position or perception.get("cell_size") != CELL:
             return None
+        points = perception.get("points", [])
         memory = self._matching_memory(product, observed, source_prefabs=source_prefabs)
-        if not memory:
+        if memory:
+            local = self.route_to_frontier(points, memory, set(), max_distance, mode="known_only")
+            if local is not None:
+                return local
+        # Level 2 macro fallback: route via region graph to a distant region with matching memory or observed product.
+        start_node = self.graph.node_at(*self.position)
+        if not start_node:
             return None
-        return self.route_to_frontier(perception.get("points", []), memory, set(), max_distance, mode="known_only")
+        target_nodes = {r["node_id"] for r in memory if r.get("node_id") and r["node_id"] != start_node}
+        if not target_nodes and not source_prefabs:
+            target_nodes = self.graph.product_nodes(product, exclude={start_node})
+        if not target_nodes:
+            return None
+        hop = self.graph.next_portal_toward(start_node, target_nodes)
+        if hop is None:
+            return None
+        leg = self._step_toward_point(points, hop[0]["x"], hop[0]["z"], max_distance)
+        if leg is not None:
+            self.strategy = "known_source"
+        return leg
 
     def select(self, product, observed, *, max_distance=20, source_prefabs=None, mode="any"):
         self.observe(observed)
@@ -190,9 +279,27 @@ class ResourceSearch:
                 sources = filtered
         memory = ([] if mode == "frontier_only"
                   else self._matching_memory(product, observed, source_prefabs=source_prefabs))
-        return self.route_to_frontier(perception.get("points", []), memory, sources, max_distance, mode=mode)
+        points = perception.get("points", [])
+        leg = self.route_to_frontier(points, memory, sources, max_distance, mode=mode)
+        if leg is not None or mode == "known_only":
+            return leg
+        # Level 2 macro fallback when local 80u frontier is exhausted (e.g. dead-end peninsula).
+        start_node = self.graph.node_at(*self.position)
+        if not start_node:
+            return None
+        prior_nodes, any_nodes = self.graph.frontier_nodes(sources=sources, exclude={start_node})
+        for target_nodes, strategy in ((prior_nodes, "room_prior"), (any_nodes, "unknown_frontier")):
+            if not target_nodes:
+                continue
+            hop = self.graph.next_portal_toward(start_node, target_nodes)
+            if hop is not None:
+                portal_leg = self._step_toward_point(points, hop[0]["x"], hop[0]["z"], max_distance)
+                if portal_leg is not None:
+                    self.strategy = strategy
+                    return portal_leg
+        return None
 
-    def select_explore(self, observed, *, max_distance=20, direction=None, stop_on_products=None):
+    def select_explore(self, observed, *, max_distance=20, direction=None, stop_on_products=None, stop_on_pois=None):
         self.observe(observed)
         self.strategy = None
         perception = observed.get("perception") or {}
@@ -206,10 +313,26 @@ class ResourceSearch:
                 for source in sources_for(product):
                     if source not in WORK_SOURCES or ("CHOP" if WORK_SOURCES[source][0] == "axe" else "MINE") in tools:
                         sources.add(source)
-        return self.route_to_explore(
-            perception.get("points", []), max_distance,
-            direction=direction, sources=sources,
-        )
+        poi_set = set(stop_on_pois) if stop_on_pois else None
+        points = perception.get("points", [])
+        leg = self.route_to_explore(points, max_distance, direction=direction, sources=sources, poi_prefabs=poi_set)
+        if leg is not None:
+            return leg
+        # Level 2 macro fallback: escape fully-explored dead-end region via region graph.
+        start_node = self.graph.node_at(*self.position)
+        if not start_node:
+            return None
+        prior_nodes, any_nodes = self.graph.frontier_nodes(sources=sources, poi_prefabs=poi_set, exclude={start_node})
+        for target_nodes in (prior_nodes, any_nodes):
+            if not target_nodes:
+                continue
+            hop = self.graph.next_portal_toward(start_node, target_nodes)
+            if hop is not None:
+                portal_leg = self._step_toward_point(points, hop[0]["x"], hop[0]["z"], max_distance)
+                if portal_leg is not None:
+                    self.strategy = "explore_region_hop"
+                    return portal_leg
+        return None
 
     def route_to_frontier(self, points, memory, sources, max_distance, *, mode="any"):
         # Rank destinations along observed land. Only dispatch the first,
@@ -250,7 +373,7 @@ class ResourceSearch:
             return first_legs[fallback]
         return None
 
-    def route_to_explore(self, points, max_distance, *, direction=None, sources=None):
+    def route_to_explore(self, points, max_distance, *, direction=None, sources=None, poi_prefabs=None):
         origin, first_legs, queue = self._offered_first_legs(points, max_distance)
         priors = room_resources()
         visited = {origin}
@@ -263,9 +386,14 @@ class ResourceSearch:
             gx, gz = cell
             neighbors = [(gx + dx, gz + dz) for dx, dz in NEIGHBORS]
             if any(next_cell not in self.cells for next_cell in neighbors):
-                room_type = self.cells[cell].get("room_type")
-                matches_prior = bool(sources and sources.intersection(priors.get(room_type, ())))
-                frontiers.append((first, cell, distance, matches_prior))
+                info = self.cells[cell]
+                room_type = info.get("room_type")
+                matches_prior = bool(
+                    (sources and sources.intersection(priors.get(room_type, ())))
+                    or WorldGraph.room_matches_poi(room_type, poi_prefabs)
+                )
+                on_road = bool(info.get("road"))
+                frontiers.append((first, cell, distance, matches_prior, on_road))
             if distance + CELL <= LOCAL_ROUTE_LIMIT:
                 for next_cell in neighbors:
                     if next_cell not in visited and self.cells.get(next_cell, {}).get("land"):
@@ -276,7 +404,7 @@ class ResourceSearch:
         dir_vec = DIRECTIONS.get(direction)
 
         def score(item):
-            first, cell, distance, matches_prior = item
+            first, cell, distance, matches_prior, on_road = item
             tier = 0 if matches_prior else 1
             if dir_vec is not None:
                 cx, cz = cell[0] * CELL, cell[1] * CELL
@@ -284,13 +412,16 @@ class ResourceSearch:
                 norm = math.hypot(vx, vz) or 1.0
                 alignment = (vx * dir_vec[0] + vz * dir_vec[1]) / norm
                 return (tier, -round(alignment, 3), distance)
-            return (tier, distance)
+            eff_dist = distance - (ROAD_EXPLORE_BONUS if on_road else 0.0)
+            return (tier, eff_dist, distance)
 
-        chosen_first, _, _, matches_prior = min(frontiers, key=score)
+        chosen_first, _, _, matches_prior, on_road = min(frontiers, key=score)
         if matches_prior:
             self.strategy = "explore_prior"
         elif dir_vec is not None:
             self.strategy = "explore_direction"
+        elif on_road:
+            self.strategy = "explore_road"
         else:
             self.strategy = "explore_frontier"
         return first_legs[chosen_first]

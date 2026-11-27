@@ -18,7 +18,8 @@ from transport.http_bridge import BridgeError
 TERMINAL = {"completed", "failed", "interrupted"}
 OPS = {"summon", "bind", "follow", "stay", "stop", "move", "collect", "recipes", "equip", "unequip", "work", "craft",
        "place", "search", "visit_building", "refuel", "set_home",
-       "cook_load", "start_meal", "harvest_meal", "ignite_tree", "attack"} | COUNTED_TARGETS
+       "cook_load", "start_meal", "harvest_meal", "ignite_tree", "attack",
+       "deploy", "fertilize", "dry_meat", "harvest_rack"} | COUNTED_TARGETS
 
 
 class CompanionBridge:
@@ -205,7 +206,9 @@ class CompanionBridge:
             if not isinstance(args, dict):
                 raise BridgeError("Invalid action arguments")
             snapshot = self.state.get("companion") or {}
-            if op in {"recipes", "equip", "unequip", "work", "craft", "place", "search", "visit_building", "refuel", "ignite_tree"} and op not in snapshot.get("capabilities", []):
+            if op in {"recipes", "equip", "unequip", "work", "craft", "place", "search", "visit_building", "refuel", "ignite_tree", "deploy", "fertilize", "dry_meat"} and op not in snapshot.get("capabilities", []):
+                raise BridgeError("Companion capability unavailable; update the server mod")
+            if op == "harvest_rack" and "dry_meat" not in snapshot.get("capabilities", []):
                 raise BridgeError("Companion capability unavailable; update the server mod")
             if op in {"cook_load", "start_meal", "harvest_meal"}:
                 if "cook_meal" not in snapshot.get("capabilities", []):
@@ -265,7 +268,8 @@ class CompanionBridge:
                     raise BridgeError("Visit requires a remembered available building ID")
             if op in COUNTED_TARGETS:
                 capability = "storage" if op in {"deposit", "withdraw"} else op
-                expected = {"prefab", "total_count", "task_key"} | ({"container_guid"} if capability == "storage" else set())
+                extra_fields = {"container_guid"} if capability == "storage" else ({"target_buddy_id"} if op == "give_buddy" else set())
+                expected = {"prefab", "total_count", "task_key"} | extra_fields
                 if capability not in snapshot.get("capabilities", []):
                     raise BridgeError("Companion capability unavailable; update the server mod")
                 if (set(args) != expected or not isinstance(args.get("task_key"), str)
@@ -273,6 +277,8 @@ class CompanionBridge:
                         or not isinstance(args.get("prefab"), str) or not re.fullmatch(r"[a-z0-9_]{1,60}", args["prefab"])
                         or type(args.get("total_count")) is not int or not 1 <= args["total_count"] <= 100):
                     raise BridgeError("Invalid counted item action arguments")
+                if op == "give_buddy" and args.get("target_buddy_id") not in {"self", "buddy1", "buddy2"}:
+                    raise BridgeError("give_buddy requires target_buddy_id in self, buddy1, buddy2")
                 if capability == "storage":
                     guid(args["container_guid"])
                     if not any(r["guid"] == args["container_guid"] and r.get("contents_known") for r in snapshot.get("containers", [])):
@@ -299,10 +305,26 @@ class CompanionBridge:
                 if not any(row.get("guid") == args["target_guid"] for row in nearby):
                     raise BridgeError("Target was not offered in the current companion snapshot")
             if op == "work":
-                if type(args.get("target_guid")) is not int or args.get("work") not in {"CHOP", "MINE"}:
-                    raise BridgeError("work requires target_guid and CHOP/MINE")
+                if type(args.get("target_guid")) is not int or args.get("work") not in {"CHOP", "MINE", "DIG"}:
+                    raise BridgeError("work requires target_guid and CHOP/MINE/DIG")
                 if not any(r.get("guid") == args["target_guid"] and r.get("work") == args["work"] for r in snapshot.get("work_targets", [])):
                     raise BridgeError("Work target was not offered")
+            if op == "deploy":
+                if (not isinstance(args.get("prefab"), str) or not re.fullmatch(r"[a-z0-9_]{1,60}", args["prefab"])
+                        or ("x" in args and (type(args["x"]) not in (int, float) or not math.isfinite(args["x"])))
+                        or ("z" in args and (type(args["z"]) not in (int, float) or not math.isfinite(args["z"])))
+                        or ("radius" in args and (type(args["radius"]) not in (int, float) or not 2 <= args["radius"] <= 12))):
+                    raise BridgeError("Invalid deploy arguments")
+            if op == "fertilize":
+                if (type(args.get("target_guid")) is not int or args["target_guid"] < 1
+                        or not isinstance(args.get("fertilizer_prefab"), str)
+                        or not re.fullmatch(r"[a-z0-9_]{1,60}", args["fertilizer_prefab"])):
+                    raise BridgeError("Invalid fertilize arguments")
+            if op in {"dry_meat", "harvest_rack"}:
+                if not isinstance(args.get("building_id"), str) or not re.fullmatch(r"building:[0-9]{1,30}", args["building_id"]):
+                    raise BridgeError(f"{op} requires an observed meatrack building_id")
+                if op == "dry_meat" and (not isinstance(args.get("prefab"), str) or not re.fullmatch(r"[a-z0-9_]{1,60}", args["prefab"])):
+                    raise BridgeError("dry_meat requires a dryable meat prefab")
             if op == "equip":
                 if type(args.get("item_guid")) is not int or not any(
                         r.get("guid") == args["item_guid"] and r.get("usable") for r in snapshot.get("equipment", [])):

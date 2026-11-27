@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from common import autonomy
 from common.companion_transfer import COUNTED_TARGETS, STORAGE_TARGETS, TRANSFER_TARGETS
+from common.task_board import TEAM_DEP_RE
 from common.task_timing import PHASES, TERMINAL_TASKS
 from executor.compact_tasks import expand_tasks
 from executor.companion_tasks import (
@@ -214,6 +215,47 @@ def validate_team_plan(raw, context, catalogs=None):
             raise ValueError(f"assignments[{identity}].plan.reply: provide this companion's own first-person reply")
         clean.append({"buddy_id": identity, "plan": plan})
         seen.add(identity)
+    # Validate cross-actor depends_on (Team DAG): existence + global acyclicity.
+    team_tasks = {}
+    for member_id, actor in (context.get("members") or {}).items():
+        for row in ((actor.get("current_task_board") or {}).get("tasks") or []):
+            if isinstance(row, dict) and isinstance(row.get("id"), str):
+                team_tasks[f"{member_id}:{row['id']}"] = list(row.get("depends_on") or [])
+    for item in clean:
+        mid, plan = item["buddy_id"], item["plan"]
+        if plan.get("kind") == "task_board":
+            for row in plan.get("tasks", []):
+                team_tasks[f"{mid}:{row['id']}"] = list(row.get("depends_on") or [])
+    team_deps = {}
+    for fq_id, deps in team_tasks.items():
+        mid = fq_id.split(":", 1)[0]
+        resolved = []
+        for dep in deps:
+            m = TEAM_DEP_RE.fullmatch(dep)
+            if m:
+                if m.group(1) == mid:
+                    raise ValueError(f"{fq_id}: use unqualified local task id for same-actor dependency '{dep}'")
+                if dep not in team_tasks:
+                    raise ValueError(f"{fq_id}: unknown cross-actor dependency '{dep}'")
+                resolved.append(dep)
+            else:
+                resolved.append(f"{mid}:{dep}")
+        team_deps[fq_id] = resolved
+    visited_t, active_t = set(), set()
+
+    def _visit_team(node):
+        if node in active_t:
+            raise ValueError(f"Cyclic cross-actor task dependency involving '{node}'")
+        if node in visited_t or node not in team_deps:
+            return
+        active_t.add(node)
+        for dep in team_deps[node]:
+            _visit_team(dep)
+        active_t.remove(node)
+        visited_t.add(node)
+
+    for fq_id in team_deps:
+        _visit_team(fq_id)
     outcome = raw.get("outcome", "working")
     if outcome not in ("working", "completed", "blocked", "reply"):
         raise ValueError("Invalid team outcome")

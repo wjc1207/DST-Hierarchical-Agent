@@ -108,7 +108,7 @@ def progress_signatures_match(left, right):
     if all(target.get("type") == "refuel" for target in targets):
         return all(targets[0].get(k) == targets[1].get(k) for k in ("building_id", "fuel_prefab"))
     return (targets[0].get("type") in TRANSFER_TARGETS
-            and all(targets[0].get(k) == targets[1].get(k) for k in ("type", "building_id", "container_guid", "prefab")))
+            and all(targets[0].get(k) == targets[1].get(k) for k in ("type", "building_id", "container_guid", "target_buddy_id", "prefab")))
 
 
 def merge_goals(previous, incoming, *, target_validator=None):
@@ -270,8 +270,9 @@ class PriorityBoardExecutor:
                     self.stale_observations_ignored += 1
                 else:
                     self.latest_observed_state = state
+        team_done = set(state.get("_team_completed_tasks") or ())
         result = board_view(board, state, target_evaluator=self.target_evaluator,
-                            completed_task_ids={task["id"] for task in board["tasks"] if self._record(task).get("done")})
+                            completed_task_ids=team_done | {task["id"] for task in board["tasks"] if self._record(task).get("done")})
         now, position = self.clock(), state.get("player", {}).get("position")
         emergency = heat_risk(state) or any(e.get("activeThreat") for e in state.get("nearby", []))
         if self.navigation and self.selected in self.records and self.last_tick is not None and not emergency:
@@ -328,18 +329,18 @@ class PriorityBoardExecutor:
                 task.update(status="failed", blocked_reason=record["camp_error"])
             elif self.progress_evaluator is not None and (task["status"] != "blocked" or (
                     task.get("blocked_reason", "").startswith("dependencies:") and
-                    all(self.records.get(d, {}).get("done") for d in task["depends_on"]))):
+                    all(d in team_done or self.records.get(d, {}).get("done") for d in task["depends_on"]))):
                 self.progress_evaluator(task, record, state)
             elif task["target"]["type"] in CAMP_TARGETS and (task["status"] != "blocked" or (
                     task.get("blocked_reason", "").startswith("dependencies:") and
-                    all(self.records.get(d, {}).get("done") for d in task["depends_on"]))):
+                    all(d in team_done or self.records.get(d, {}).get("done") for d in task["depends_on"]))):
                 if task["status"] == "blocked":
                     task.update(status="ready", blocked_reason="")
                 camp_execution.progress(task, record, state)
             elif task["target"]["type"] in {"eat", "drop_item"} and self.progress_evaluator is None and (
                     task["status"] != "blocked" or (
                         task.get("blocked_reason", "").startswith("dependencies:") and
-                        all(self.records.get(d, {}).get("done") for d in task["depends_on"]))):
+                        all(d in team_done or self.records.get(d, {}).get("done") for d in task["depends_on"]))):
                 done_count = record.get("camp_count", 0)
                 required = task["target"]["count"]
                 task.update(progress={"current": done_count, "required": required},
@@ -367,7 +368,7 @@ class PriorityBoardExecutor:
         # Dependencies use latched observed completion, never a historical 'entered' flag.
         for _ in result["tasks"]:
             for task in result["tasks"]:
-                missing = [d for d in task["depends_on"] if by_id[d]["status"] != "done"]
+                missing = [d for d in task["depends_on"] if d not in team_done and (d not in by_id or by_id[d]["status"] != "done")]
                 if missing and task["status"] not in TERMINAL_TASKS | {"scheduled"}:
                     task.update(status="blocked", blocked_reason="dependencies: " + ",".join(missing))
                 elif (not missing and task["status"] == "blocked" and task.get("blocked_reason", "").startswith("dependencies:")
@@ -378,7 +379,7 @@ class PriorityBoardExecutor:
         # A completed residence may release dependent work in this same observation.
         for task in result["tasks"]:
             if task.get("blocked_reason", "").startswith("dependencies:") and all(
-                    by_id[d]["status"] == "done" for d in task["depends_on"]) and not self.records[task["id"]]["blocked"]:
+                    d in team_done or (d in by_id and by_id[d]["status"] == "done") for d in task["depends_on"]) and not self.records[task["id"]]["blocked"]:
                 task.update(status="ready", blocked_reason="")
         result["status"] = ("completed" if all(t["status"] == "done" for t in result["tasks"])
                             else "failed" if all(t["status"] in TERMINAL_TASKS for t in result["tasks"])

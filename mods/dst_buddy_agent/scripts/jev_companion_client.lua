@@ -163,8 +163,8 @@ function M.new(env)
             save_result(command.id,"interrupted","client_intent_changed",command.revision);return
         end
         if not ({summon=true,bind=true,move=true,collect=true,follow=true,stay=true,stop=true,
-            recipes=true,equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,
-            refuel=true,set_home=true,cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true})[command.op] then
+            recipes=true,equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,search=true,give_owner=true,give_buddy=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,
+            refuel=true,set_home=true,cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true,deploy=true,fertilize=true,dry_meat=true,harvest_rack=true})[command.op] then
             save_result(command.id,"failed","unsupported_action",command.revision);return
         end
         self:send(command.op,command.args,nil,command.id)
@@ -237,9 +237,9 @@ end
 
 local TEAM_ACTIVITY={
     collect="采集",search="探索",equip="装备工具",unequip="收起工具",work="工作",CHOP="砍树",MINE="挖矿",
-    craft="制作",place="建造",visit_building="前往建筑",move="移动",give_owner="交付物品",
+    craft="制作",place="建造",visit_building="前往建筑",move="移动",give_owner="交付物品",give_buddy="交给队友",
     eat="进食",heal="治疗",drop_item="放下物品",deposit="存放物品",withdraw="取出物品",
-    refuel="添燃料",set_home="设置家",cook_load="放食材",start_meal="开始烹饪",harvest_meal="收获料理",ignite_tree="点火烧炭",attack="战斗",
+    refuel="添燃料",set_home="设置家",cook_load="放食材",start_meal="开始烹饪",harvest_meal="收获料理",ignite_tree="点火烧炭",attack="战斗",deploy="种植",fertilize="施肥",dry_meat="晾肉",harvest_rack="收肉干",
 }
 
 function M.new_team(env)
@@ -372,7 +372,7 @@ function M.new_team(env)
     function self:skin(raw)
         local text=type(raw)=="string" and raw:match("^%s*(.-)%s*$") or ""
         if text=="" then
-            notice("用法：/buddy skin [self|伙伴名] <deepseek|off>")
+            notice("用法：/buddy skin [self|伙伴名] <deepseek|gemini|off>")
             return
         end
         local first,second=text:match("^(%S+)%s+(%S+)$")
@@ -588,7 +588,7 @@ function M.new_team(env)
         end)
         elseif name=="ai" then self:set_listening(body:lower()~="off")
         elseif name=="skin" then self:skin(body)
-        else notice("用法：/buddy setup | pair <token> [8766] | unpair | self [on|off] | summon 名字 | skin [对象] <deepseek|off> | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
+        else notice("用法：/buddy setup | pair <token> [8766] | unpair | self [on|off] | summon 名字 | skin [对象] <deepseek|gemini|off> | list | do [@名字] 需求 | auto [长期目标|off] | stop [@名字] | follow | stay | release | ai [off]") end
     end
     function self:accepts_chat(text)
         if not self.listening then return false end

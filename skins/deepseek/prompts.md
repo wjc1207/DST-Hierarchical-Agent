@@ -262,7 +262,7 @@ Do NOT add neighboring body parts, full bodies, extra props, lightning/electric 
 
 ### 3.2 最终生效槽位来源与核心 `offsets.json` 映射表
 
-打包管线（`pack_skin`）按“**3 张母表打底 → `rework1..rework33` 按自然数字顺序增量覆盖 → 程序化派生件 → `skins/deepseek/offsets.json` 锚点微调**”生成最终 [skin_deepseek.zip](file:///c:/Users/16425/Documents/Codex-workspace/DST-Hierarchical-Agent/jev_dst_agent/mods/dst_buddy_agent/anim/skin_deepseek.zip)：
+打包管线（`pack_skin`）按“**3 张母表打底 → `rework1..rework35` 按自然数字顺序增量覆盖 → 程序化派生件 → `skins/deepseek/offsets.json` 锚点微调**”生成最终 [skin_deepseek.zip](file:///c:/Users/16425/Documents/Codex-workspace/DST-Hierarchical-Agent/jev_dst_agent/mods/dst_buddy_agent/anim/skin_deepseek.zip)：
 
 | 槽位组 | 最终生效数据源 | 关键 `offsets.json` 锁定参数 | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -276,13 +276,13 @@ Do NOT add neighboring body parts, full bodies, extra props, lightning/electric 
 | `skirt:3` | `rework25_ai.png`（`sheet2` `skirt:0` 2× 超采样扇形展开） | `skirt:3: [-5, -10, 0.94]` | `542×244`（`2.221:1`）宽矮飘扬弧裙，彻底消除侧跑穿模 |
 | `face:0, 9, 10` | `rework14_ai.png`（基于 `rework11` 上收嘴距 `15 px`） | `0: [-11.5, 11, 0.9]`, `9: [-11.5, 8.42, 0.9]`, `10: [-11.5, 8.8, 0.9]` | 三口型像素级锁眼，高频率说话零眼闪，张嘴收于下巴内 |
 | `face:28` | `rework26_ai.png`（基于 `rework14` `face:0` 直改） | `face:28: [-10.93, 11.35, 0.8571]` | 右眼/右眉/鼻与 `face:0` 100% 一致（中心误差 `<0.01 px`），仅左眼眯小 |
-| `face:2, 6` / `12` / `20` / `23` / `25` / `26` / `27` / `31` | `rework9` (`2,6`) + `rework33` (`12`) + `rework31` (`20`) + `rework7` (`23`) + `rework30` (`25,26`) + `rework29` (`27`) + `rework19` (`31`) | `12: [-10, 9.5, 0.85]`, `20: [-12.73, -1.22, 0.8221]`, `25: [-9.0, 29.5, 0.8869]`, `26: [-12.0, 16.5, 0.8557]`, `27: [-9.56, -8.7, 1.2505]` | `12` 为正视受惊缩瞳（紧凑宽高比 `1.583`）；`20` 基于 `face:0` 直改紧凑半睁眼+小下撇嘴（100% 锁瞳色）；`25/26/27/31` 全无灰圈 |
+| `face:2, 6` / `12` / `20` / `22` / `23` / `25` / `26` / `27` / `29` / `31` | `rework9` (`2,6`) + `rework33` (`12`) + `rework35` (`20,22`) + `rework7` (`23`) + `rework30` (`25`) + `rework34` (`26,27,29`) + `rework19` (`31`) | `12: [-10, 9.5, 0.9]`, `20: [-12.73, 4.39, 0.8282]`, `22: [-12.73, 2.17, 0.7951]`, `25: [-9, 29.5, 0.887]`, `26: [-9, 23.87, 0.8757]`, `27: [-9, 36.99, 0.8939]`, `29: [-9.38, 44.77, 0.9619]` | `12` 为正视受惊缩瞳（宽高比 `1.583`）；`20/22` 复用 `rework31`（源自 `face:0`）半睁垂眼（消灭下睫毛/眼眶闪跳，瞳孔中心对齐 `face:0`），分别配 AI 小张口微叹嘴（`20`）与 `rework31` 闭口下撇弧嘴（`22`）；同视图派生（`30 -> 28`, `1/3 -> 0`）零眼跳；`25/26/27` 锁同一 `> <` 怒眼组；`29` 为弯眉闭眼泣嘴；全无灰圈 |
 | `cheeks:0, 1` | `rework12_ai.png`（4× 超采样） | `0: [-0.5, 6.5, 0.65]`, `1: [-23.5, 12.5, 0.65]` | 朝嘴开口的 C 形鼓腮，对齐 `#FFD6BD` 肤色 |
 | `arm_upper_skin:0, 1` | `rework28_ai.png`（`0` 复用 `sheet3` `arm_upper:0`，`1` 4× 超采样） | `arm_upper_skin:0: [-0.55, 0.07, 1.9333]` | `0` 直接复用深蓝泡泡袖 `arm_upper:0`（全角色/动作质感统一）；`1` 为 `#2E3A67` 光滑短袖管 |
 | `arm_lower:6` | `rework1_ai.png` | 无 | 修正原 Sheet 3 误画的骨骼为正常深蓝袖+白袖口 |
-| `hand:0..19` | `rework3` → `rework4` → `rework5` (`3`) → `rework6` (`11`) → `rework27` (`15`) | `0/2/3/5/6/8/10/13/14` 微调 | `hand:3` 掌心朝前；`hand:15` 为 4× 超采样瓦楞纸板白粉笔涂鸦骨锯 |
+| `hand:0..19` | `rework3` → `rework4` → `rework5` (`3`) → `rework6` (`11`) → `rework27` (`15`) → `rework34` (`17`) | `0/2/3/5/8/10/13/14/17` 微调 | `hand:3` 掌心朝前；`hand:15` 为 4× 超采样瓦楞纸板涂鸦骨锯；`hand:17` 切除多余腕臂残段并重描弧底边 |
 
-### 3.3 精简迭代日志（v1–v6 & Rework 1–33）
+### 3.3 精简迭代日志（v1–v6 & Rework 1–35）
 
 - **母表架构阶段（v1–v6）**：确立宝蓝→冰青发色、侧面朝右、短波波头 `headbase`、`face` 纯绿悬浮贴纸；v4 从 Sheet 1 拆出 `headbase_hat` 改由管线裁剪派生；v5/v6 补全三张表全部 X-ray 槽位并清除所有闪电/电击关键词，明确 `arm_lower:6` 为普通水平袖。
 - **Rework 1–5（修坏格 & 全手重构）**：`Rework 1` 去除 X-ray 闪电并修回 `arm_lower:6`；`Rework 2` 净空 `headbase:0` 下巴下方纯绿；`Rework 3–5` 重绘全套 20 帧 Q 版手部并修正畸形手指与 `hand:3` 掌心朝前握拳。
@@ -300,4 +300,6 @@ Do NOT add neighboring body parts, full bodies, extra props, lightning/electric 
   - `Rework 30`：重绘 `face:25`（`emote_fistshake` 去眼泪的挫败愤怒无奈大喊，保留中心锁定确保继承 `face:29`/`32` 不漂移）与 `face:26`（`refuse_eat` 眼睛紧闭、嘴巴微张的抗拒嫌弃神态，无眼泪），实机复检 `refuseeat` 与 `emote_fistshake` 全部贴合；
   - `Rework 31`：改用 `rework14` 的高清 `face:0` 直接 4× 超采样合成 `face:20`（`dozy` 昏昏欲睡），100% 锁定 `face:0` 宝蓝→冰青虹膜色板、压平上眼睑遮去高光、下移贴合眉毛并替换为极小下垂嘴（`110.4 × 47.4` 紧凑比例），实机复检 `dozy` 第 8 帧眼色与紧凑度彻底统一；
   - `Rework 32`：用 `rework32_template.png`（1×1 原版 `face:12`）与 `deepseek_ref_expressions.png` 重绘 `face:12` 探索缩瞳受惊与紧凑间距；
-  - `Rework 33`：接入用户网页版生成的正视受惊缩瞳定稿（无侧偏、自然紧凑五官 `801×506` / 宽高比 `1.583`，对齐贴合 `rework33_ai.png` `346×372`，打包尺寸 `176×111` / 逻辑 `100.83×63.58`），实机复检 `034` (`bite_light_loop`) 与 `idle_inaction_sanity` 第 5 帧均干净无杂边。
+  - `Rework 33`：接入用户网页版生成的正视受惊缩瞳定稿（无侧偏、自然紧凑五官 `801×506` / 宽高比 `1.583`，对齐贴合 `rework33_ai.png` `346×372`，打包尺寸 `176×111` / 逻辑 `100.83×63.58`），实机复检 `034` (`bite_light_loop`) 与 `idle_inaction_sanity` 第 5 帧均干净无杂边；
+  - `Rework 34`：4× 超采样切除 `hand:17` 腕部多余残段并重描弧形底边（配 `hand:17: [0, 0, 0.85]`）；修正 `DEFAULT_FACE_MAP`（`22 -> 20`、`30 -> 28`）并去除同视图派生表情继承原版 Wendy bbox 偏移，消灭 `emote_sad` 第 52–53 帧、`idle_inaction`（发呆）眼睛下掉与 `dozy` 闪现怒脸；像素级锁定 `face:26/27` 与 `face:25` 的 `> <` 怒眼组（`< 0.1 px`），并将 `face:29` 设为哭泣弯眼悲伤嘴；
+  - `Rework 35`：提取 AI 生图（`image-generator` + `deepseek_ref_expressions.png`）中的可爱小张口微叹嘴与 `rework31`（直接源自 `face:0`）半睁垂眼以 Pillow 合成 `face:20`，并与 `rework31` 闭口版 `face:22` 像素级锁眼（瞳孔中心对齐 `face:0`、彻底消灭下睫毛与眼眶过渡闪光，`20/22` 误差 `< 0.05 px`）。

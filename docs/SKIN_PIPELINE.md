@@ -1,6 +1,8 @@
 # DST Buddy Agent 角色皮肤制作工具链
 
-本工具链用于将角色参考图转换为轻量级 `OverrideSymbol` 角色外观包（单皮肤约 1.8 MB，无需修改 200+ 原版 `player_*.zip` 动作文件）。
+> **推荐新皮肤复用入口（v2 六表零耦合方案）**：做下一套新角色皮肤（如 Claude / ChatGPT）时，请直接按 **[skins/SKIN_GENERATION_PLAYBOOK.md](../skins/SKIN_GENERATION_PLAYBOOK.md)** 执行（基于 [python/tools/gemini_skin_pipeline.py](../python/tools/gemini_skin_pipeline.py) 复制独立管线，完整包含 6 表拆分、Pillow 4× 派生、`hairpigtails` 单侧化与自动后处理避坑）；全量原版槽位语义见 **[skins/SPRITE_ATLAS_GUIDE.md](../skins/SPRITE_ATLAS_GUIDE.md)**。
+
+本工具链用于将角色参考图转换为轻量级 `OverrideSymbol` 角色外观包（无需修改 200+ 原版 `player_*.zip` 动作文件）。
 
 ## 工具文件
 

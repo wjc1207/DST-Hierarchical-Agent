@@ -390,9 +390,12 @@ function M.new(G,reply,validate_text,encoded_size,trace,options)
         state.capabilities[#state.capabilities+1]="refuel"
         state.capabilities[#state.capabilities+1]="cook_meal"
         state.capabilities[#state.capabilities+1]="ignite_tree"
+        state.capabilities[#state.capabilities+1]="deploy"
+        state.capabilities[#state.capabilities+1]="fertilize"
+        state.capabilities[#state.capabilities+1]="dry_meat"
         if c.combat then state.capabilities[#state.capabilities+1]="combat" end
         for name,value in pairs(storage.snapshot(a,entities,r)) do state[name]=value end
-        for _,name in ipairs(is_self and {"storage","drop_item"} or {"storage","give_owner","drop_item"}) do state.capabilities[#state.capabilities+1]=name end
+        for _,name in ipairs(is_self and {"storage","give_buddy","drop_item"} or {"storage","give_owner","give_buddy","drop_item"}) do state.capabilities[#state.capabilities+1]=name end
         if not is_self and c.trader then state.capabilities[#state.capabilities+1]="receive_item" end
         state.capabilities[#state.capabilities+1]="equip";state.capabilities[#state.capabilities+1]="unequip";state.capabilities[#state.capabilities+1]="work"
         if c.builder then for _,name in ipairs({"recipes","craft","place"}) do state.capabilities[#state.capabilities+1]=name end end

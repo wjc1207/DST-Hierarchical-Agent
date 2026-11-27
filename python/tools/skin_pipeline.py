@@ -46,8 +46,8 @@ DEFAULT_FACE_MAP: dict[int, int] = {
     11: 11, 12: 13, 13: 13,
     14: 14,
     15: 15, 16: 9, 17: 11, 18: 11, 19: 0,
-    20: 21, 21: 21, 22: 21, 23: 25, 24: 9,
-    25: 25, 26: 25, 27: 25, 28: 0, 29: 25, 30: 21, 31: 13, 32: 25,
+    20: 21, 21: 21, 22: 20, 23: 25, 24: 9,
+    25: 25, 26: 25, 27: 25, 28: 0, 29: 25, 30: 28, 31: 13, 32: 25,
 }
 
 # DeepSeek skin palette target (warm fair skin matching assets/deepseek-1.png)
@@ -1262,20 +1262,19 @@ def pack_skin(
                 cropped = _feather_top_alpha(cropped, 0.24, smoothstep=True)
             add_frame(sym, idx, f"{sym}:{idx}", cropped, cx, cy, dw, dh)
 
-    # 2. Faces: align the 10 key generated expressions, then map all 33 vanilla face slots
+    # 2. Faces: align all generated/reworked expressions, then derive remaining vanilla face slots
     face_aligned: dict[int, tuple[Image.Image, float, float, float, float]] = {}
-    for key_idx in manifest["key_faces"]:
-        orig = manifest_symbols["face"][key_idx]
-        clean_cell, cell_meta = sliced_clean[("face", key_idx)]
-        off = _parse_offset_entry(extra_offsets.get(f"face:{key_idx}", extra_offsets.get("face", (0.0, 0.0, 1.0))))
-        face_aligned[key_idx] = _align_sprite_to_vanilla(clean_cell, cell_meta, orig, "face", key_idx, extra_offset=off)
-
     for idx, orig in enumerate(manifest_symbols["face"]):
-        if ("face", idx) in sliced_clean and idx not in manifest["key_faces"]:
+        if idx in manifest["key_faces"] or ("face", idx) in sliced_clean:
             clean_cell, cell_meta = sliced_clean[("face", idx)]
             off = _parse_offset_entry(extra_offsets.get(f"face:{idx}", extra_offsets.get("face", (0.0, 0.0, 1.0))))
-            img, cx, cy, dw, dh = _align_sprite_to_vanilla(clean_cell, cell_meta, orig, "face", idx, extra_offset=off)
+            aligned = _align_sprite_to_vanilla(clean_cell, cell_meta, orig, "face", idx, extra_offset=off)
+            face_aligned[idx] = aligned
+            img, cx, cy, dw, dh = aligned
             add_frame("face", idx, f"face:{idx}", img, cx, cy, dw, dh)
+
+    for idx, orig in enumerate(manifest_symbols["face"]):
+        if idx in face_aligned:
             continue
         if idx == 14 and 14 not in manifest["key_faces"]:
             # Preserve soft vanilla glow eyes (frame 14) directly without green-screen roundtrip.
@@ -1294,25 +1293,20 @@ def pack_skin(
         if mapped_key not in face_aligned:
             mapped_key = manifest["key_faces"][0]
         img, cx, cy, dw, dh = face_aligned[mapped_key]
-        # Preserve each vanilla face slot's own relative offset (e.g. side vs front face position)
-        ref_orig = manifest_symbols["face"][mapped_key]
-        dx = float(orig["cx"]) - float(ref_orig["cx"])
-        dy = float(orig["cy"]) - float(ref_orig["cy"])
-        scale_w = float(orig["w"]) / max(1.0, float(ref_orig["w"]))
-        scale_h = float(orig["h"]) / max(1.0, float(ref_orig["h"]))
-        # Apply per-slot offset override for derived face frames (idempotent with skin_tuner.py)
+        # Every mapped pair in DEFAULT_FACE_MAP is same-view (front->front or side->side);
+        # copy the source face anchor/size verbatim so vanilla bbox deltas never make eyes bounce.
         slot_dx, slot_dy, slot_sc = (0.0, 0.0, 1.0)
-        if idx != mapped_key and f"face:{idx}" in extra_offsets:
+        if f"face:{idx}" in extra_offsets:
             slot_dx, slot_dy, slot_sc = _parse_offset_entry(extra_offsets[f"face:{idx}"])
         add_frame(
             "face",
             idx,
             f"face:{mapped_key}",
             img,
-            cx + dx + slot_dx,
-            cy + dy + slot_dy,
-            dw * scale_w * slot_sc,
-            dh * scale_h * slot_sc,
+            cx + slot_dx,
+            cy + slot_dy,
+            dw * slot_sc,
+            dh * slot_sc,
         )
 
     # 3. Procedural wide-body slots reusing generated torso/pelvis/skirt tiles with vanilla wide scale

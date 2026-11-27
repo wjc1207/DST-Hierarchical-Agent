@@ -140,6 +140,33 @@ class SkinPipelineCodecTests(unittest.TestCase):
         self.assertGreater(hair_hat_frames[2]["w"], 50.0)
         self.assertGreater(hair_hat_frames[2]["h"], 50.0)
 
+        # Face alignment stability: derived same-view faces share exact source anchors (zero blink/eye jump),
+        # and angry shouting group (25, 26, 27) shares the exact top eye edge & horizontal center.
+        self.assertEqual(skin_pipeline.DEFAULT_FACE_MAP[22], 20)
+        self.assertEqual(skin_pipeline.DEFAULT_FACE_MAP[30], 28)
+        face_frames = {f["framenum"]: f for f in parsed["symbols"]["face"]}
+        for src_idx, dst_idx in ((0, 1), (28, 30), (25, 32)):
+            for attr in ("cx", "cy", "w", "h"):
+                self.assertAlmostEqual(
+                    face_frames[dst_idx][attr],
+                    face_frames[src_idx][attr],
+                    places=2,
+                    msg=f"face:{dst_idx}.{attr} drifted from face:{src_idx}",
+                )
+        # Bored/drowsy pair (20=small open sighing mouth, 22=closed frown) share identical upper eyes
+        top_20 = face_frames[20]["cy"] - face_frames[20]["h"] * 0.5
+        top_22 = face_frames[22]["cy"] - face_frames[22]["h"] * 0.5
+        self.assertLess(abs(face_frames[20]["cx"] - face_frames[22]["cx"]), 0.15)
+        self.assertLess(abs(top_20 - top_22), 0.15)
+        self.assertLess(abs(face_frames[20]["w"] - face_frames[22]["w"]), 0.20)
+        self.assertGreater(face_frames[20]["h"], face_frames[22]["h"])
+        top_25 = face_frames[25]["cy"] - face_frames[25]["h"] * 0.5
+        for grp_idx in (26, 27):
+            top_g = face_frames[grp_idx]["cy"] - face_frames[grp_idx]["h"] * 0.5
+            self.assertLess(abs(face_frames[grp_idx]["cx"] - face_frames[25]["cx"]), 0.15)
+            self.assertLess(abs(top_g - top_25), 0.15)
+            self.assertLess(abs(face_frames[grp_idx]["w"] - face_frames[25]["w"]), 0.20)
+
     def test_remove_green_screen_despills_2px_dark_green_fringe(self) -> None:
         img = Image.new("RGBA", (24, 24), (0, 255, 0, 255))
         # Dark outline interior with a 2px greenish spill border

@@ -15,6 +15,7 @@ from common.exploration_metrics import survey_cells, observed_cells
 
 MAX_TASKS = 6
 MAX_FOCUS_TASKS = 2
+TEAM_DEP_RE = re.compile(r"^(self|buddy1|buddy2):([A-Za-z0-9_-]{1,40})$")
 
 
 def focus_scope(board):
@@ -211,6 +212,8 @@ def validate_board(raw: dict, day: int, *, target_validator=None) -> dict:
             return
         active.add(identity)
         for dependency in by_id[identity]["depends_on"]:
+            if TEAM_DEP_RE.fullmatch(dependency):
+                continue
             visit(dependency)
         active.remove(identity)
         visited.add(identity)
@@ -350,7 +353,7 @@ def board_view(board: dict, state: dict, *, verified_structures=None, target_eva
     confirmed = set(completed_task_ids)
     for _ in result["tasks"]:
         for task in result["tasks"]:
-            waiting = [d for d in task["depends_on"] if d not in confirmed and by_id[d]["status"] != "done"]
+            waiting = [d for d in task["depends_on"] if d not in confirmed and (d not in by_id or by_id[d]["status"] != "done")]
             if task["status"] not in {"failed", "expired", "scheduled"} and waiting:
                 task["status"], task["blocked_reason"] = "blocked", "dependencies: " + ",".join(waiting)
     for task in result["tasks"]:

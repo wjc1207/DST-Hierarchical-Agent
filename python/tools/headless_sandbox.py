@@ -34,6 +34,7 @@ if str(PYTHON_ROOT) not in sys.path:
 from common.pairing import ensure_bridge_token
 from executor.board_contract import validate_plan
 from executor.companion_tasks import CompanionTasks, capabilities
+from executor.world_graph import WorldGraph
 from mcp_server.companion_bridge import CompanionTeamBridge
 from transport.http_bridge import serve_bridge
 
@@ -547,6 +548,114 @@ class HeadlessDSTSandbox:
             f"Timed out after {timeout:.1f}s running tasks (last_reason={last_reason}, "
             f"active={active}, active_res={active_res}, sim_time={observed.get('sampled_at')}, "
             f"lua_action={observed.get('action')}, view={scheduler.view(observed)['tasks']})"
+        )
+
+    def run_team_plan_tasks(
+        self,
+        member_boards: dict[str, tuple[str, list[dict[str, Any]]]],
+        *,
+        timeout: float = 65.0,
+    ) -> dict[str, Any]:
+        """Run multiple actors concurrently with shared Team DAG completion state."""
+        assert self.bridge is not None
+        team_done: set[str] = set()
+        shared_graph = WorldGraph()
+        schedulers: dict[str, CompanionTasks] = {}
+        actives: dict[str, dict[str, Any] | None] = {}
+        latest_obs: dict[str, dict[str, Any]] = {}
+
+        def _positions() -> dict[str, tuple[float, float]]:
+            out = {}
+            for mid, obs in latest_obs.items():
+                pos = (obs.get("buddy") or {}).get("position") or {}
+                if isinstance(pos.get("x"), (int, float)) and isinstance(pos.get("z"), (int, float)):
+                    out[mid] = (float(pos["x"]), float(pos["z"]))
+            return out
+
+        for mid, (goal_text, tasks) in member_boards.items():
+            pkt = self.activate_instruction(goal_text, member_id=mid)
+            obs = pkt["state"]["companion"]
+            latest_obs[mid] = obs
+            sched = CompanionTasks(
+                clock=lambda m=mid: float(latest_obs[m].get("sampled_at") or time.monotonic()),
+                graph=shared_graph,
+                team_completed_provider=lambda: team_done,
+                team_positions_provider=_positions,
+            )
+            plan = validate_plan(
+                {"kind": "task_board", "goal": goal_text, "reply": goal_text[:60], "tasks": tasks},
+                {"interaction": {"mode": "instruction"}, "observation": obs},
+            )
+            sched.adopt(plan, obs)
+            schedulers[mid] = sched
+            actives[mid] = None
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._lua_errors:
+                raise RuntimeError(f"Lua error during team plan: {self._lua_errors[0]}")
+            all_done = True
+            for mid, sched in schedulers.items():
+                packet = self.bridge.member_call("observe", mid)
+                state = packet["state"]
+                obs_id = packet["observation_id"]
+                observed = state.get("companion") or {}
+                if not observed:
+                    all_done = False
+                    continue
+                latest_obs[mid] = observed
+                act = actives[mid]
+                if act is not None:
+                    res = self.bridge.member_call("result", mid, act["action_id"])
+                    status = res.get("status")
+                    if status in {"completed", "failed", "interrupted"}:
+                        reason = res.get("reason") or status
+                        if self.verbose:
+                            print(f"  [{mid}:DONE] {act['op']} -> {status} ({reason})", flush=True)
+                        sched.on_result(act["task_id"], {**res, "op": act["op"]}, observed)
+                        actives[mid] = None
+                    else:
+                        all_done = False
+                        continue
+                if not state.get("ready"):
+                    all_done = False
+                    continue
+                view = sched.view(observed)
+                for row in view["tasks"]:
+                    if row["status"] == "done":
+                        team_done.add(f"{mid}:{row['id']}")
+                if view["status"] == "completed" or all(row["status"] == "done" for row in view["tasks"]):
+                    continue
+                all_done = False
+                task, op, args = sched.next_action(observed)
+                if op in {"completed", "waiting", "waiting_storage", "awaiting_items", "waiting_resource", "idle"}:
+                    continue
+                if op in {"blocked", "unsupported", "needs_replan"}:
+                    # Cross-actor dependency waiting shows as blocked/idle until teammate finishes
+                    if any("dependencies:" in (r.get("blocked_reason") or "") for r in view["tasks"]):
+                        continue
+                    raise AssertionError(f"[{mid}] stopped with op={op} args={args} view={view['tasks']}")
+                if self.verbose:
+                    print(f"  [{mid}:START] task={task['id']} op={op} args={args}", flush=True)
+                try:
+                    rec = self.bridge.member_call("action", mid, op, obs_id, args)
+                except ValueError as exc:
+                    if "stale" in str(exc).lower() or "ready" in str(exc).lower():
+                        continue
+                    raise
+                sched.note_action(task, op, args)
+                actives[mid] = {"action_id": rec["id"], "task_id": task["id"], "op": op, "args": args}
+            if all_done:
+                return {
+                    "views": {mid: sched.view(latest_obs[mid]) for mid, sched in schedulers.items()},
+                    "observed": latest_obs,
+                    "team_done": sorted(team_done),
+                }
+            time.sleep(0.08)
+
+        raise TimeoutError(
+            f"Team plan timed out after {timeout:.1f}s (team_done={sorted(team_done)}, "
+            f"views={{mid: sched.view(latest_obs[mid])['tasks'] for mid, sched in schedulers.items()}})"
         )
 
 
@@ -1197,6 +1306,7 @@ def run_suite(args: argparse.Namespace) -> int:
             "spawns": [
                 {"prefab": "evergreen_short", "dx": 4, "dz": 0},
                 {"prefab": "deciduoustree_tall", "dx": 7, "dz": 2},
+                {"prefab": "pigking", "dx": -6, "dz": 0},
             ],
             "give_buddy": [{"prefab": "axe", "count": 1}],
         })
@@ -1204,6 +1314,14 @@ def run_suite(args: argparse.Namespace) -> int:
         snap = sb.bridge.member_call("observe", "buddy1")["state"]["companion"]
         assert snap.get("work_targets_complete") is True, (
             f"Expected work_targets_complete=True in real Lua snapshot, got {snap.get('work_targets_complete')!r}"
+        )
+        land_cells = [c for c in ((snap.get("perception") or {}).get("cells") or []) if c.get("land")]
+        assert any(isinstance(c.get("node_id"), str) and c["node_id"] for c in land_cells), (
+            f"Expected topology node_id on real Lua perception land cells, got {land_cells[:3]}"
+        )
+        pois = (snap.get("perception") or {}).get("pois") or []
+        assert any(p.get("prefab") == "pigking" and p.get("kind") == "landmark" for p in pois), (
+            f"Expected pigking POI in real Lua perception.pois, got {pois}"
         )
         wt_by_prefab = {r.get("prefab"): r for r in (snap.get("work_targets") or [])}
         assert "evergreen" in wt_by_prefab and "deciduoustree" in wt_by_prefab, (
@@ -1243,6 +1361,625 @@ def run_suite(args: argparse.Namespace) -> int:
         assert inv.get("log", 0) >= 2, f"Expected >=2 log after chopping birch, got {inv}"
         return f"work_targets_complete=True, stages=(ev:{ev_stage},dc:{dc_stage}), logs={inv.get('log', 0)}, explore_east=done"
 
+    def scenario_explore_stop_on_poi_and_long_move_to(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.setup_arena({
+            "tag": "explore_poi_long_move",
+            "reset_buddy": True,
+            "clear_radius": 40,
+            "spawns": [
+                # Outside 20-unit initial scan_radius so buddy must explore east to discover pigking
+                {"prefab": "pigking", "dx": 32, "dz": 0},
+            ],
+        })
+        time.sleep(0.5)
+        snap = sb.bridge.member_call("observe", "buddy1")["state"]["companion"]
+        start_pos = (snap.get("buddy") or {}).get("position") or {}
+        sx, sz = float(start_pos["x"]), float(start_pos["z"])
+        init_pois = (snap.get("perception") or {}).get("pois") or []
+        assert not any(p.get("prefab") == "pigking" for p in init_pois), (
+            f"pigking should start outside 20u scan_radius, got {init_pois}"
+        )
+        # Pick a verified observed land cell on the west side of start so return move_to is >20 units away
+        west_cells = [
+            c for c in ((snap.get("perception") or {}).get("cells") or [])
+            if c.get("land") and c["gx"] * 4 <= sx - 6
+        ]
+        if west_cells:
+            west = min(west_cells, key=lambda c: c["gx"])
+            rx, rz = float(west["gx"] * 4), float(west["gz"] * 4)
+        else:
+            rx, rz = sx, sz
+
+        res = sb.run_plan_tasks(
+            "向东探索找到猪王，再长距离返回西侧起点",
+            [
+                {
+                    "id": "find_pigking",
+                    "title": "Explore east for Pig King",
+                    "priority": 1,
+                    "target": {
+                        "type": "explore",
+                        "cells": 80,
+                        "direction": "east",
+                        "stop_on_pois": ["pigking"],
+                    },
+                },
+                {
+                    "id": "return_west",
+                    "title": "Long move_to back west",
+                    "priority": 2,
+                    "depends_on": ["find_pigking"],
+                    "target": {"type": "move_to", "x": rx, "z": rz, "arrival_radius": 4.0},
+                },
+            ],
+            timeout=65.0,
+        )
+        view = res["view"]
+        t_find = next(t for t in view["tasks"] if t["id"] == "find_pigking")
+        assert (t_find.get("found_poi") or {}).get("prefab") == "pigking", (
+            f"Expected explore to stop early on pigking POI, got {t_find}"
+        )
+        wmap = view.get("world_map") or {}
+        assert any(p.get("prefab") == "pigking" for p in (wmap.get("pois") or [])), (
+            f"Expected pigking recorded in world_map.pois, got {wmap}"
+        )
+        final_pos = (res["observed"].get("buddy") or {}).get("position") or {}
+        final_dist = math.hypot(final_pos["x"] - rx, final_pos["z"] - rz)
+        assert final_dist <= 4.5, f"Expected buddy returned within 4.5u of ({rx},{rz}), got dist={final_dist:.1f}"
+        return f"discovered pigking POI -> long move_to returned dist={final_dist:.1f}u, world_map_nodes={wmap.get('total_nodes')}"
+
+    def scenario_home_tree_protection_and_known_revisit(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        arena = sb.setup_arena({
+            "tag": "home_protect_revisit",
+            "reset_buddy": True,
+            "clear_radius": 32,
+            "spawns": [
+                {"prefab": "firepit", "dx": 0, "dz": 2},
+                # Inside 10u home protection radius (should be protected by default heuristic!)
+                {"prefab": "evergreen_short", "dx": 3, "dz": 2},
+                # Outside 10u home protection radius (within 20u scan_radius)
+                {"prefab": "evergreen_tall", "dx": 13, "dz": 2},
+                # Observed at start on the west side; after chopping at dx=13 it is ~25u away (known_source revisit!)
+                {"prefab": "grass", "dx": -11, "dz": 0},
+            ],
+            "give_buddy": [{"prefab": "axe", "count": 1}],
+        })
+        home_tree_guid = next(r["guid"] for r in arena["spawned"] if r.get("tag") == "evergreen_short")
+        obs0 = sb.wait_observed(
+            lambda o: _find_building_id(o, "firepit") is not None
+            and any(n.get("product") == "cutgrass" for n in (o.get("nearby") or []))
+            and len(o.get("work_targets") or []) >= 2,
+            timeout=12.0,
+        )
+        firepit_id = _find_building_id(obs0, "firepit")
+        assert firepit_id, "Expected firepit building_id in places"
+
+        res = sb.run_plan_tasks(
+            "设家、避开家门口矮树去砍外围大树、再回访记忆中的西侧草丛",
+            [
+                {
+                    "id": "set_camp",
+                    "title": "Set home at firepit",
+                    "priority": 1,
+                    "target": {"type": "set_home", "anchor_id": firepit_id},
+                },
+                {
+                    "id": "chop_wood",
+                    "title": "Chop wood outside camp",
+                    "priority": 2,
+                    "depends_on": ["set_camp"],
+                    "target": {"type": "inventory", "prefab": "log", "count": 2},
+                },
+                {
+                    "id": "revisit_grass",
+                    "title": "Revisit remembered west grass",
+                    "priority": 3,
+                    "depends_on": ["chop_wood"],
+                    "search_budget_distance": 8,
+                    "target": {"type": "inventory", "prefab": "cutgrass", "count": 1},
+                },
+            ],
+            timeout=75.0,
+        )
+        truth = sb.inspect("after_home_protect_revisit")
+        inv = truth["buddy"]["inventory"]
+        assert inv.get("log", 0) >= 2 and inv.get("cutgrass", 0) >= 1, (
+            f"Expected >=2 log and >=1 cutgrass, got {inv}"
+        )
+        # Verify the short evergreen next to home firepit is still standing (not chopped!)
+        t_revisit = next(t for t in res["view"]["tasks"] if t["id"] == "revisit_grass")
+        # Revisit via known_source must not exhaust the tiny 8-unit blind-search budget
+        assert (t_revisit.get("search_spent") or {}).get("distance", 0) <= 8.0, (
+            f"Expected known_source revisit not to burn blind budget, got {t_revisit.get('search_spent')}"
+        )
+        return (
+            f"home_tree_guid={home_tree_guid} protected, logs={inv.get('log', 0)}, "
+            f"cutgrass={inv.get('cutgrass', 0)}, revisit_blind_dist={t_revisit.get('search_spent', {}).get('distance')}"
+        )
+
+    def scenario_auto_craft_dag_and_kiting_hound(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        arena = sb.setup_arena({
+            "tag": "craft_dag_kiting",
+            "reset_buddy": True,
+            "clear_radius": 28,
+            "spawns": [
+                {"prefab": "researchlab", "dx": 2, "dz": 0},
+                {"prefab": "hound", "dx": -8, "dz": 0},
+            ],
+            "give_buddy": [
+                # Raw materials for rope (cutgrass x3) + spear (twigs x2, flint x1) — NO pre-crafted rope!
+                {"prefab": "cutgrass", "count": 3},
+                {"prefab": "twigs", "count": 2},
+                {"prefab": "flint", "count": 1},
+                {"prefab": "armorwood", "count": 1},
+                {"prefab": "footballhat", "count": 1},
+            ],
+        })
+        hound_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "hound")
+        sb.wait_observed(
+            lambda o: "craft" in (o.get("capabilities") or [])
+            and ((o.get("buddy") or {}).get("inventory") or {}).get("cutgrass", 0) >= 3
+            and any(e.get("guid") == hound_guid for e in (o.get("enemies") or [])),
+            timeout=12.0,
+        )
+        sb.run_plan_tasks(
+            "自动展开中间配方搓绳造长矛，并风筝击杀猎犬",
+            [
+                {
+                    "id": "craft_spear",
+                    "title": "Craft spear (auto rope)",
+                    "priority": 1,
+                    "target": {"type": "inventory", "prefab": "spear", "count": 1, "recipe_id": "spear"},
+                },
+                {
+                    "id": "slay_hound",
+                    "title": "Kite and slay hound",
+                    "priority": 2,
+                    "depends_on": ["craft_spear"],
+                    "target": {"type": "attack", "target_guid": hound_guid},
+                },
+            ],
+            timeout=50.0,
+        )
+        truth = sb.inspect("after_craft_dag_kiting")
+        inv = truth["buddy"]["inventory"]
+        hp = float((truth.get("buddy") or {}).get("health") or 0)
+        assert inv.get("spear", 0) >= 1, f"Expected spear crafted via auto rope DAG, got {inv}"
+        assert hp > 60, f"Expected buddy healthy after kiting hound, got hp={hp}"
+        return f"auto-crafted rope->spear, hound_guid={hound_guid} slain with adaptive kiting, buddy_hp={hp:.1f}"
+
+    def scenario_team_give_buddy_handoff(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            sb.setup_arena({
+                "tag": "give_buddy_handoff",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "reset_buddy": True,
+                "give_owner": [{"prefab": "goldnugget", "count": 2}],
+            })
+            sb.wait_observed(
+                lambda o: "give_buddy" in (o.get("capabilities") or [])
+                and ((o.get("buddy") or {}).get("inventory") or {}).get("goldnugget", 0) >= 2,
+                member_id="self",
+                timeout=12.0,
+            )
+            sb.run_plan_tasks(
+                "主角将 2 块金块直接递交给伙伴 buddy1",
+                [
+                    {
+                        "id": "hand_gold",
+                        "title": "Give gold to buddy1",
+                        "priority": 1,
+                        "target": {"type": "give_buddy", "target_buddy_id": "buddy1", "prefab": "goldnugget", "count": 2},
+                    }
+                ],
+                member_id="self",
+                timeout=25.0,
+            )
+            truth = sb.inspect("after_give_buddy")
+            buddy_gold = (truth["buddy"]["inventory"] or {}).get("goldnugget", 0)
+            owner_gold = _as_dict(truth["owner"].get("inventory")).get("goldnugget", 0)
+            assert buddy_gold == 2 and owner_gold == 0, (
+                f"Expected buddy_gold=2, owner_gold=0 after give_buddy, got buddy={buddy_gold}, owner={owner_gold}"
+            )
+            return f"self -> buddy1 give_buddy confirmed: buddy_gold={buddy_gold}, owner_gold={owner_gold}"
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if "self" not in (sb.bridge.observe()["state"].get("members") or {}):
+                    break
+                time.sleep(0.15)
+
+    def scenario_transplant_deploy_fertilize_and_meatrack(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.setup_arena({
+            "tag": "midgame_camp",
+            "reset_buddy": True,
+            "clear_radius": 24,
+            "spawns": [
+                {"prefab": "grass", "dx": 4, "dz": 0},
+                {"prefab": "meatrack", "dx": -4, "dz": 0},
+                {"prefab": "firesuppressor", "dx": -4, "dz": 4, "fuel": 0.25},
+            ],
+            "give_buddy": [
+                {"prefab": "shovel", "count": 1},
+                {"prefab": "poop", "count": 1},
+                {"prefab": "meat", "count": 1},
+                {"prefab": "log", "count": 2},
+            ],
+        })
+        obs0 = sb.wait_observed(
+            lambda o: _find_building_id(o, "firesuppressor") is not None
+            and _find_building_id(o, "meatrack") is not None
+            and any(w.get("work") == "DIG" for w in (o.get("work_targets") or [])),
+            timeout=12.0,
+        )
+        flingo_id = _find_building_id(obs0, "firesuppressor")
+        assert flingo_id, "Expected firesuppressor building_id"
+
+        res = sb.run_plan_tasks(
+            "挖草移植、种植、施肥、晒肉架挂肉、雪球机添燃料",
+            [
+                {"id": "dig_grass", "title": "Dig grass tuft", "priority": 1,
+                 "target": {"type": "inventory", "prefab": "dug_grass", "count": 1}},
+                {"id": "plant_grass", "title": "Deploy grass tuft", "priority": 2, "depends_on": ["dig_grass"],
+                 "target": {"type": "deploy", "prefab": "dug_grass", "count": 1}},
+                {"id": "fert_grass", "title": "Fertilize transplanted grass", "priority": 3, "depends_on": ["plant_grass"],
+                 "target": {"type": "fertilize", "count": 1}},
+                {"id": "hang_meat", "title": "Dry meat on rack", "priority": 4,
+                 "target": {"type": "dry_meat", "prefab": "meat"}},
+                {"id": "fuel_flingo", "title": "Refuel firesuppressor", "priority": 5,
+                 "target": {"type": "refuel", "building_id": flingo_id, "fuel_prefab": "log", "count": 1}},
+            ],
+            timeout=65.0,
+        )
+        obs_end = res["observed"]
+        racks = [f for f in (obs_end.get("camp_work") or {}).get("fixtures", []) if f.get("prefab") == "meatrack"]
+        assert any(r.get("phase") in {"drying", "empty"} for r in racks), f"Expected meatrack active, got {racks}"
+        truth = sb.inspect("after_midgame_camp")
+        assert (truth["buddy"]["inventory"] or {}).get("meat", 0) == 0, f"Expected meat hung on rack, got {truth['buddy']['inventory']}"
+        flingo_rows = [r for r in (obs_end.get("refueling") or {}).get("targets", []) if r.get("building_id") == flingo_id]
+        assert flingo_rows and (flingo_rows[0].get("fuel_percent") or 0) > 0.25, f"Expected firesuppressor fueled >0.25, got {flingo_rows}"
+        return f"dig+deploy+fertilize=ok, meat_hung=ok, firesuppressor_fuel={flingo_rows[0].get('fuel_percent'):.2f}"
+
+    def scenario_team_dag_relay_handoff_and_auto_craft(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            sb.setup_arena({
+                "tag": "team_dag_relay",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "reset_buddy": True,
+                "spawns": [{"prefab": "researchlab", "dx": 2, "dz": 0}],
+                "give_owner": [{"prefab": "cutgrass", "count": 3}],
+                "give_buddy": [{"prefab": "twigs", "count": 2}, {"prefab": "flint", "count": 1}],
+            })
+            sb.wait_observed(
+                lambda o: ((o.get("buddy") or {}).get("inventory") or {}).get("cutgrass", 0) >= 3,
+                member_id="self",
+                timeout=12.0,
+            )
+            res = sb.run_team_plan_tasks(
+                {
+                    "self": (
+                        "递交3根草给伙伴",
+                        [{
+                            "id": "hand_grass",
+                            "title": "Give cutgrass to buddy1",
+                            "priority": 1,
+                            "target": {"type": "give_buddy", "target_buddy_id": "buddy1", "prefab": "cutgrass", "count": 3},
+                        }],
+                    ),
+                    "buddy1": (
+                        "收到草后自动搓绳造长矛",
+                        [{
+                            "id": "craft_spear",
+                            "title": "Auto-craft rope and spear after handoff",
+                            "priority": 1,
+                            "depends_on": ["self:hand_grass"],
+                            "target": {"type": "inventory", "prefab": "spear", "count": 1, "recipe_id": "spear"},
+                        }],
+                    ),
+                },
+                timeout=55.0,
+            )
+            truth = sb.inspect("after_team_dag_relay")
+            buddy_inv = truth["buddy"]["inventory"] or {}
+            assert buddy_inv.get("spear", 0) >= 1, f"Expected buddy1 crafted spear via Team DAG + auto rope, got {buddy_inv}"
+            assert "self:hand_grass" in res["team_done"] and "buddy1:craft_spear" in res["team_done"]
+            return f"Team DAG self:hand_grass -> buddy1:craft_spear(auto rope) done, buddy_spear={buddy_inv.get('spear')}"
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if "self" not in (sb.bridge.observe()["state"].get("members") or {}):
+                    break
+                time.sleep(0.15)
+
+    def scenario_team_coop_combat_slay_knight(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            arena = sb.setup_arena({
+                "tag": "team_coop_knight",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "reset_buddy": True,
+                "owner_invincible": False,
+                "clear_radius": 28,
+                "spawns": [{"prefab": "knight", "dx": -5, "dz": 0}],
+                "give_owner": [
+                    {"prefab": "spear", "count": 1},
+                    {"prefab": "armorwood", "count": 1},
+                    {"prefab": "footballhat", "count": 1},
+                ],
+                "give_buddy": [
+                    {"prefab": "spear", "count": 1},
+                    {"prefab": "armorwood", "count": 1},
+                    {"prefab": "footballhat", "count": 1},
+                ],
+            })
+            knight_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "knight")
+            sb.wait_observed(
+                lambda o: any(e.get("guid") == knight_guid for e in (o.get("enemies") or [])),
+                member_id="buddy1",
+                timeout=12.0,
+            )
+            sb.run_team_plan_tasks(
+                {
+                    "self": (
+                        "协同击杀发条骑士",
+                        [{"id": "self_kill", "title": "Coop slay knight", "priority": 1,
+                          "target": {"type": "attack", "target_guid": knight_guid}}],
+                    ),
+                    "buddy1": (
+                        "协同击杀发条骑士",
+                        [{"id": "buddy_kill", "title": "Coop slay knight", "priority": 1,
+                          "target": {"type": "attack", "target_guid": knight_guid}}],
+                    ),
+                },
+                timeout=55.0,
+            )
+            truth = sb.inspect("after_team_coop_knight")
+            owner_hp = float((truth.get("owner") or {}).get("health") or 0)
+            buddy_hp = float((truth.get("buddy") or {}).get("health") or 0)
+            assert owner_hp > 60 and buddy_hp > 60, f"Expected both actors healthy after coop knight, got owner={owner_hp}, buddy={buddy_hp}"
+            return f"knight_guid={knight_guid} (900HP) slain by self+buddy1 coop, owner_hp={owner_hp:.1f}, buddy_hp={buddy_hp:.1f}"
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if "self" not in (sb.bridge.observe()["state"].get("members") or {}):
+                    break
+                time.sleep(0.15)
+
+    def scenario_harvest_ready_meatrack_and_magic_tech_build(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        arena = sb.setup_arena({
+            "tag": "meatrack_harvest_magic",
+            "reset_buddy": True,
+            "clear_radius": 26,
+            "spawns": [
+                {"prefab": "researchlab", "dx": 2, "dz": 0},
+                {"prefab": "meatrack", "dx": -5, "dz": 0},
+            ],
+            "give_buddy": [
+                # Raw logs x16 -> auto-craft boards x4 + rabbit x4 + tophat x1 -> build researchlab4 (Prestihatitator)
+                {"prefab": "log", "count": 16},
+                {"prefab": "rabbit", "count": 4},
+                {"prefab": "tophat", "count": 1},
+            ],
+        })
+        rack_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "meatrack")
+        # Populate the meatrack with a ready meat_dried item via real server component
+        sb.send_lua(
+            f'local r=Ents[{rack_guid}]; if r and r.components then '
+            f'if r.components.container then local j=SpawnPrefab("meat_dried"); if j then r.components.container:GiveItem(j, 1) end '
+            f'elseif r.components.dryer then r.components.dryer.product="meat_dried"; r.components.dryer.done=true end end'
+        )
+        obs0 = sb.wait_observed(
+            lambda o: any(
+                f.get("prefab") == "meatrack" and f.get("phase") == "ready"
+                for f in (o.get("camp_work") or {}).get("fixtures", [])
+            ) and ((o.get("buddy") or {}).get("inventory") or {}).get("log", 0) >= 16,
+            timeout=12.0,
+        )
+        bx = float(((obs0.get("buddy") or {}).get("position") or {}).get("x", 0))
+        bz = float(((obs0.get("buddy") or {}).get("position") or {}).get("z", 0))
+
+        res = sb.run_plan_tasks(
+            "收获就绪肉干，并自动搓4块木板建造灵子分解器",
+            [
+                {"id": "get_jerky", "title": "Harvest ready meat_dried", "priority": 1,
+                 "target": {"type": "inventory", "prefab": "meat_dried", "count": 1}},
+                {"id": "build_magic", "title": "Build Prestihatitator (auto boards)", "priority": 2,
+                 "target": {"type": "structure", "prefab": "researchlab4", "recipe_id": "researchlab4",
+                            "x": round(bx + 3.0, 1), "z": round(bz + 3.0, 1), "radius": 8}},
+            ],
+            timeout=65.0,
+        )
+        truth = sb.inspect("after_meatrack_magic")
+        inv = truth["buddy"]["inventory"] or {}
+        assert inv.get("meat_dried", 0) >= 1, f"Expected meat_dried harvested from meatrack, got {inv}"
+        buildings = (res["observed"].get("places") or {}).get("buildings") or []
+        assert any(b.get("prefab") == "researchlab4" for b in buildings), (
+            f"Expected researchlab4 in places.buildings, got {[b.get('prefab') for b in buildings]}"
+        )
+        return f"harvest_rack meat_dried={inv.get('meat_dried')}, auto-crafted 4x boards -> researchlab4 built"
+
+    def scenario_team_shared_scout_and_long_range_handoff(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        sb.send_lua('HEADLESS.command("self on")')
+        try:
+            sb.wait_observed(lambda o: bool(o.get("bound") and o.get("token")), member_id="self", timeout=15.0)
+            sb.setup_arena({
+                "tag": "shared_scout_handoff",
+                "clear_owner_inventory": True,
+                "reset_owner": True,
+                "reset_buddy": True,
+                "clear_radius": 42,
+                "spawns": [
+                    # Outside 20u initial scan_radius: self explores east to discover pigking,
+                    # then buddy1 crosses >20u via shared WorldGraph + team_positions to hand off gold.
+                    {"prefab": "pigking", "dx": 32, "dz": 0},
+                ],
+                "give_buddy": [{"prefab": "goldnugget", "count": 2}],
+            })
+            sb.wait_observed(
+                lambda o: ((o.get("buddy") or {}).get("inventory") or {}).get("goldnugget", 0) >= 2
+                and "give_buddy" in (o.get("capabilities") or []),
+                member_id="buddy1",
+                timeout=12.0,
+            )
+            res = sb.run_team_plan_tasks(
+                {
+                    "self": (
+                        "向东探索找到猪王后原地等候补给",
+                        [{
+                            "id": "scout_pigking",
+                            "title": "Explore east for Pig King",
+                            "priority": 1,
+                            "target": {
+                                "type": "explore",
+                                "cells": 80,
+                                "direction": "east",
+                                "stop_on_pois": ["pigking"],
+                            },
+                        }],
+                    ),
+                    "buddy1": (
+                        "等主角找到猪王后长途奔袭递交2块金块",
+                        [{
+                            "id": "deliver_gold",
+                            "title": "Long-range give_buddy gold to self",
+                            "priority": 1,
+                            "depends_on": ["self:scout_pigking"],
+                            "target": {
+                                "type": "give_buddy",
+                                "target_buddy_id": "self",
+                                "prefab": "goldnugget",
+                                "count": 2,
+                            },
+                        }],
+                    ),
+                },
+                timeout=75.0,
+            )
+            self_task = next(t for t in res["views"]["self"]["tasks"] if t["id"] == "scout_pigking")
+            assert (self_task.get("found_poi") or {}).get("prefab") == "pigking", (
+                f"Expected self to stop on pigking POI, got {self_task}"
+            )
+            buddy_wmap = res["views"]["buddy1"].get("world_map") or {}
+            assert any(p.get("prefab") == "pigking" for p in (buddy_wmap.get("pois") or [])), (
+                f"Expected buddy1 to see pigking via shared WorldGraph, got {buddy_wmap}"
+            )
+            truth = sb.inspect("after_shared_scout_handoff")
+            owner_gold = _as_dict(truth["owner"].get("inventory")).get("goldnugget", 0)
+            buddy_gold = (truth["buddy"].get("inventory") or {}).get("goldnugget", 0)
+            assert owner_gold == 2 and buddy_gold == 0, (
+                f"Expected owner_gold=2, buddy_gold=0 after long-range handoff, got owner={owner_gold}, buddy={buddy_gold}"
+            )
+            return f"self found pigking -> shared WorldGraph + long-range buddy1->self give_buddy gold={owner_gold}"
+        finally:
+            sb.send_lua('HEADLESS.command("self off")')
+            sb.send_lua("HEADLESS.set_owner_invincible(true)")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if "self" not in (sb.bridge.observe()["state"].get("members") or {}):
+                    break
+                time.sleep(0.15)
+
+    def scenario_auto_craft_hambat_and_icebox_midgame(sb: HeadlessDSTSandbox) -> str:
+        sb.ensure_summoned("小威")
+        arena = sb.setup_arena({
+            "tag": "midgame_hambat_icebox",
+            "reset_buddy": True,
+            "clear_radius": 28,
+            "spawns": [
+                {"prefab": "researchlab2", "dx": 2, "dz": 0},
+                {"prefab": "hound", "dx": -11, "dz": 0},
+            ],
+            "give_buddy": [
+                # Raw rocks x6 -> auto-craft cutstone x2 + gold x2 + gears x1 -> build icebox
+                {"prefab": "rocks", "count": 6},
+                {"prefab": "goldnugget", "count": 2},
+                {"prefab": "gears", "count": 1},
+                # Raw materials for hambat (pigskin x1, twigs x2, meat x2)
+                {"prefab": "pigskin", "count": 1},
+                {"prefab": "twigs", "count": 2},
+                {"prefab": "meat", "count": 2},
+                {"prefab": "armorwood", "count": 1},
+                {"prefab": "footballhat", "count": 1},
+            ],
+        })
+        hound_guid = next(r["guid"] for r in arena["spawned"] if r["prefab"] == "hound")
+        obs0 = sb.wait_observed(
+            lambda o: "craft" in (o.get("capabilities") or [])
+            and ((o.get("buddy") or {}).get("inventory") or {}).get("rocks", 0) >= 6
+            and any(e.get("guid") == hound_guid for e in (o.get("enemies") or [])),
+            timeout=12.0,
+        )
+        bx = float(((obs0.get("buddy") or {}).get("position") or {}).get("x", 0))
+        bz = float(((obs0.get("buddy") or {}).get("position") or {}).get("z", 0))
+
+        res = sb.run_plan_tasks(
+            "做火腿棒击杀猎犬，并自动合石砖建造冰箱",
+            [
+                {
+                    "id": "craft_hambat",
+                    "title": "Craft hambat",
+                    "priority": 1,
+                    "target": {"type": "inventory", "prefab": "hambat", "count": 1, "recipe_id": "hambat"},
+                },
+                {
+                    "id": "slay_hound",
+                    "title": "Slay hound with hambat",
+                    "priority": 2,
+                    "depends_on": ["craft_hambat"],
+                    "target": {"type": "attack", "target_guid": hound_guid},
+                },
+                {
+                    "id": "build_icebox",
+                    "title": "Build icebox (auto cutstone)",
+                    "priority": 3,
+                    "depends_on": ["slay_hound"],
+                    "target": {
+                        "type": "structure",
+                        "prefab": "icebox",
+                        "recipe_id": "icebox",
+                        "x": round(bx + 3.0, 1),
+                        "z": round(bz + 3.0, 1),
+                        "radius": 8,
+                    },
+                },
+            ],
+            timeout=70.0,
+        )
+        obs_end = res["observed"]
+        buildings = (obs_end.get("places") or {}).get("buildings") or []
+        assert any(b.get("prefab") == "icebox" for b in buildings), (
+            f"Expected icebox in places.buildings, got {[b.get('prefab') for b in buildings]}"
+        )
+        equipped = {r["prefab"] for r in (obs_end.get("equipment") or []) if r.get("equipped")}
+        assert "hambat" in equipped, f"Expected hambat equipped for combat, got {equipped}"
+        truth = sb.inspect("after_midgame_hambat_icebox")
+        hp = float((truth.get("buddy") or {}).get("health") or 0)
+        assert hp > 70, f"Expected buddy healthy after hambat combat, got hp={hp}"
+        return f"hambat crafted+equipped, hound_guid={hound_guid} slain (hp={hp:.1f}), auto 2x cutstone -> icebox built"
+
     scenarios = [
         ("1. pairing_lua_engine", scenario_pairing),
         ("2. summon_collect_and_work", scenario_collect_and_work),
@@ -1258,6 +1995,16 @@ def run_suite(args: argparse.Namespace) -> int:
         ("12. winter_craft_heatrock_hat_and_roast", scenario_winter_craft_heatrock_hat_and_roast),
         ("13. summer_auto_place_coldfire_and_spring_rain", scenario_summer_auto_place_coldfire_and_spring_rain),
         ("14. search_filter_and_explore", scenario_search_filter_and_explore),
+        ("15. explore_stop_on_poi_and_long_move_to", scenario_explore_stop_on_poi_and_long_move_to),
+        ("16. home_tree_protection_and_known_revisit", scenario_home_tree_protection_and_known_revisit),
+        ("17. auto_craft_dag_and_kiting_hound", scenario_auto_craft_dag_and_kiting_hound),
+        ("18. team_give_buddy_handoff", scenario_team_give_buddy_handoff),
+        ("19. transplant_deploy_fertilize_and_meatrack", scenario_transplant_deploy_fertilize_and_meatrack),
+        ("20. team_dag_relay_handoff_and_auto_craft", scenario_team_dag_relay_handoff_and_auto_craft),
+        ("21. team_coop_combat_slay_knight", scenario_team_coop_combat_slay_knight),
+        ("22. harvest_ready_meatrack_and_magic_tech_build", scenario_harvest_ready_meatrack_and_magic_tech_build),
+        ("23. team_shared_scout_and_long_range_handoff", scenario_team_shared_scout_and_long_range_handoff),
+        ("24. auto_craft_hambat_and_icebox_midgame", scenario_auto_craft_hambat_and_icebox_midgame),
     ]
     if args.only:
         tokens = [t.strip() for t in args.only.split(",") if t.strip()]

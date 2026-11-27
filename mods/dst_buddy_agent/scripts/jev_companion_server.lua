@@ -1,10 +1,10 @@
 -- One authoritative actor/executor per actual RPC sender.
 local M={}
 local OPS={summon=true,bind=true,state=true,intent=true,follow=true,stay=true,stop=true,move=true,collect=true,release=true,say=true,
-    recipes=true,equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,search=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,refuel=true,set_home=true,
-    cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true}
-local NATIVE={equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,give_owner=true,drop_item=true,deposit=true,withdraw=true,refuel=true,set_home=true,
-    cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true}
+    recipes=true,equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,search=true,give_owner=true,give_buddy=true,drop_item=true,deposit=true,withdraw=true,visit_building=true,refuel=true,set_home=true,
+    cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true,deploy=true,fertilize=true,dry_meat=true,harvest_rack=true}
+local NATIVE={equip=true,unequip=true,eat=true,heal=true,work=true,craft=true,place=true,give_owner=true,give_buddy=true,drop_item=true,deposit=true,withdraw=true,refuel=true,set_home=true,
+    cook_load=true,start_meal=true,harvest_meal=true,ignite_tree=true,attack=true,deploy=true,fertilize=true,dry_meat=true,harvest_rack=true}
 local function finite(v) return type(v)=="number" and v==v and math.abs(v)<1e7 end
 local function valid_guid(v) return type(v)=="number" and v==v and v>=1 and v<=9007199254740991 and v%1==0 end
 local function valid_id(v) return type(v)=="string" and #v<=100 and v:match("^[%w:_%-]+$") end
@@ -236,6 +236,7 @@ function M.new(env)
                 req.product=target.product;req.before=env.count(rec.buddy,target.product)
                 if env.collect(rec.buddy,target)==false then return false,"collect_rejected" end
             elseif NATIVE[req.op] then
+                if env.resolve_buddy then rec.resolve_buddy=env.resolve_buddy end
                 local accepted,reason=env.begin(rec.buddy,req,rec)
                 if not accepted then return false,reason or "native_action_rejected" end
                 if req.op=="attack" or (req.op=="equip" and req.combat_gear) then
@@ -452,6 +453,18 @@ function M.new_team(env)
                 if a then a._jev_companion_id=id;a._jev_companion_name=slot.name end
                 return a,reason
             end
+        end
+        wrapped.resolve_buddy=function(target_id)
+            if target_id=="self" then
+                local self_slot=owner.slots["self"]
+                if self_slot and self_slot.actor and self_slot.actor:IsValid() then return self_slot.actor end
+                local own_r=slot.engine.owners[owner.userid]
+                return own_r and own_r.player or nil
+            end
+            local other=owner.slots[target_id]
+            if other and other.actor and other.actor:IsValid() then return other.actor end
+            local r=other and other.engine and other.engine.owners[owner.userid]
+            return r and r.buddy or nil
         end
         if env.visit_start then wrapped.visit_start=function(a,q) share(a);return env.visit_start(a,q) end end
         if env.search_found then

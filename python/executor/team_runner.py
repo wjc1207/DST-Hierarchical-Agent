@@ -13,12 +13,14 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from common.paths import DATA_DIR
 from common.task_board import format_board
 from common.task_timing import number
 from common.thermal import seasonal_gear_equip
 from executor.board_contract import recent_exchanges, validate_reply, validate_team_plan
 from executor.companion_tasks import RETURN_ALERTS, CompanionTasks, capabilities, collection_prefab
 from executor.priority_board import idle_review_marker, idle_review_reason
+from executor.world_graph import WorldGraph
 from transport.metrics import TransportRecorder
 
 AUTONOMY_REVIEW_SECONDS = 30
@@ -115,10 +117,14 @@ class CycleDiagnostics:
 
 
 class ActorRunner:
-    def __init__(self, client, planner, *, execute=False, log_path=None, buddy_id=None, external_board=False):
+    def __init__(self, client, planner, *, execute=False, log_path=None, buddy_id=None, external_board=False,
+                 world_graph=None, team_completed_provider=None, team_positions_provider=None):
         self.client, self.planner, self.execute = client, planner, execute
         self.buddy_id = buddy_id
         self.external_board = external_board
+        self.world_graph = world_graph
+        self.team_completed_provider = team_completed_provider
+        self.team_positions_provider = team_positions_provider
         self.external_review_reason = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="companion-ds")
         self.future = None
@@ -126,7 +132,11 @@ class ActorRunner:
         self.basis = None
         self.dialogue_revision = None
         self.plan = self.previous = None
-        self.tasks = CompanionTasks(clock=lambda: self.task_time())
+        self.tasks = CompanionTasks(
+            clock=lambda: self.task_time(), graph=self.world_graph,
+            team_completed_provider=self.team_completed_provider,
+            team_positions_provider=self.team_positions_provider,
+        )
         self.observed = None
         self.sampled_at = None
         self.idle_marker = None
@@ -273,7 +283,11 @@ class ActorRunner:
             if same_goal:
                 self.tasks.clear_task_deferrals()
             else:
-                self.tasks = CompanionTasks(clock=lambda: self.task_time())
+                self.tasks = CompanionTasks(
+                    clock=lambda: self.task_time(), graph=self.world_graph,
+                    team_completed_provider=self.team_completed_provider,
+                    team_positions_provider=self.team_positions_provider,
+                )
                 self.history = []
             self.plan, self.active = None, None
             self.basis = basis
@@ -728,7 +742,9 @@ class TeamRunner:
         self.history = []
         self.claims = {}
         self.member_bases = {}
+        self.completed_team_tasks = set()
         self.dispatched_revision = None
+        self.world_graph = WorldGraph(persist_root=DATA_DIR / "agent_memory")
         if hasattr(planner, "set_error_handler"):
             planner.set_error_handler(lambda stage, detail: self.trace("planning_detail", stage=stage, detail=detail))
         if hasattr(planner, "set_query_handler"):
@@ -893,6 +909,25 @@ class TeamRunner:
         self.dispatched_revision = self.state["control"]["revision"]
         self.trace("team_plan_requested", buddy_ids=list(requests), reasons=self.context["replan_reasons"])
 
+    def member_positions(self):
+        positions = {}
+        for mid, entry in ((self.state or {}).get("members") or {}).items():
+            pos = ((entry.get("companion") or {}).get("buddy") or {}).get("position") or {}
+            if number(pos.get("x")) and number(pos.get("z")):
+                positions[mid] = (float(pos["x"]), float(pos["z"]))
+        return positions
+
+    def _refresh_completed_team_tasks(self):
+        done = set()
+        for mid, agent in self.agents.items():
+            board = agent.board()
+            if not board:
+                continue
+            for task in board.get("tasks") or []:
+                if task.get("status") == "done" and isinstance(task.get("id"), str):
+                    done.add(f"{mid}:{task['id']}")
+        self.completed_team_tasks = done
+
     async def cycle(self):
         packet = await self.rpc("buddy_observe")
         if packet["state"].get("team") is not True:
@@ -908,8 +943,13 @@ class TeamRunner:
         for identity in self.state["members"]:
             if identity not in self.agents:
                 self.agents[identity] = ActorRunner(ActorClient(self, identity), PlanningProxy(self, identity) if self.planner else None, execute=self.execute,
-                                                    log_path=self.log_path, buddy_id=identity, external_board=self.planner is None)
+                                                    log_path=self.log_path, buddy_id=identity, external_board=self.planner is None,
+                                                    world_graph=self.world_graph,
+                                                    team_completed_provider=lambda: self.completed_team_tasks,
+                                                    team_positions_provider=self.member_positions)
+        self._refresh_completed_team_tasks()
         results = await asyncio.gather(*(agent.cycle() for agent in self.agents.values()), return_exceptions=True)
+        self._refresh_completed_team_tasks()
         for identity, result in zip(self.agents, results):
             if isinstance(result, Exception):
                 self.trace("member_cycle_error", buddy_id=identity, kind=type(result).__name__, detail=str(result)[:250])
@@ -924,6 +964,7 @@ class TeamRunner:
                 ticket.finish(error=RuntimeError("Team host stopped"))
             self.pending.clear()
         await asyncio.gather(*(a.close() for a in self.agents.values()), return_exceptions=True)
+        self.world_graph.save()
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 

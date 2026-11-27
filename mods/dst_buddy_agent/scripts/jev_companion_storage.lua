@@ -1,6 +1,6 @@
 -- Local chest facts and explicit outgoing handoffs. Never remove owner items.
 local M={}
-M.ops={give_owner=true,drop_item=true,deposit=true,withdraw=true}
+M.ops={give_owner=true,give_buddy=true,drop_item=true,deposit=true,withdraw=true}
 local CHESTS={treasurechest=true,dragonflychest=true,icebox=true}
 local function guid(v) return type(v)=="number" and v>=1 and v<=9007199254740991 and v%1==0 end
 local function size(item) return item.components.stackable and item.components.stackable:StackSize() or 1 end
@@ -81,11 +81,11 @@ function M.item_receipt(r,args,op)
         or type(args.total_count)~="number" or args.total_count<1 or args.total_count>100 or args.total_count%1~=0 then return nil,"invalid_transfer" end
     r.transfer_totals=r.transfer_totals or {};r.transfer_order=r.transfer_order or {}
     local row=r.transfer_totals[args.task_key]
-    if row and (row.op~=op or row.prefab~=args.prefab or row.container_guid~=args.container_guid) then return nil,"transfer_identity_changed" end
+    if row and (row.op~=op or row.prefab~=args.prefab or row.container_guid~=args.container_guid or row.target_buddy_id~=args.target_buddy_id) then return nil,"transfer_identity_changed" end
     if not row then
         -- Do not evict receipts: forgetting one would permit replaying its quantity.
         if #r.transfer_order>=128 then return nil,"transfer_receipt_limit" end
-        row={op=op,prefab=args.prefab,container_guid=args.container_guid,count=0}
+        row={op=op,prefab=args.prefab,container_guid=args.container_guid,target_buddy_id=args.target_buddy_id,count=0}
         r.transfer_totals[args.task_key]=row
     end
     for i,key in ipairs(r.transfer_order) do if key==args.task_key then table.remove(r.transfer_order,i);break end end
@@ -115,6 +115,13 @@ function M.new(G,E)
         elseif q.op=="give_owner" then
             if not r.player:IsValid() or E.dead(r.player) or E.distance(a,r.player)>20 then return false,"owner_out_of_range_or_dead" end
             q.transfer_target=r.player
+        elseif q.op=="give_buddy" then
+            local tid=q.args.target_buddy_id
+            if tid~="self" and tid~="buddy1" and tid~="buddy2" then return false,"invalid_target_buddy" end
+            local target=r.resolve_buddy and r.resolve_buddy(tid)
+            if not target or not target:IsValid() or target==a or E.dead(target) then return false,"target_buddy_unavailable" end
+            if E.distance(a,target)>20 then return false,"target_buddy_out_of_range" end
+            q.transfer_target=target
         end
         local row;row,reason=M.item_receipt(r,q.args,q.op)
         if not row then return false,reason end
@@ -129,6 +136,8 @@ function M.new(G,E)
         local target=q.transfer_target
         if q.op=="give_owner" then
             if not target:IsValid() or target~=r.player or E.dead(target) then return "failed","owner_unavailable",data() end
+        elseif q.op=="give_buddy" then
+            if not target or not target:IsValid() or target==a or E.dead(target) then return "failed","target_buddy_unavailable",data() end
         elseif target then
             local e,reason=chest(a,q.args.container_guid)
             if not e or e~=target then return "failed",reason or "chest_changed",data() end
@@ -145,7 +154,7 @@ function M.new(G,E)
         local src,item,srcslot=source(q.op=="withdraw" and {target.components.container} or stores(inv),q.args.prefab)
         if not item then return "failed","transfer_source_missing",data() end
         local before=inventory_count(inv,q.args.prefab)
-        if q.op=="give_owner" then
+        if q.op=="give_owner" or q.op=="give_buddy" then
             local receiver=target.components.inventory
             if not receiver or not target.components.trader or receiver:CanAcceptCount(item,1)<1 then return "failed","recipient_full_or_unavailable",data() end
             local owner_before=inventory_count(receiver,q.args.prefab)

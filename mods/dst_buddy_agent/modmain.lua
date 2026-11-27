@@ -11,6 +11,7 @@ local MOD_DIR=type(MODROOT)=="string" and MODROOT or ""
 local NS="jev_ai_companion"
 Assets={
     Asset("ANIM","anim/skin_deepseek.zip"),
+    Asset("ANIM","anim/skin_gemini.zip"),
 }
 local config={}
 local pairing_version=0
