@@ -11,7 +11,7 @@ Unified server-side DST AI agent mod: pilot your own character (/buddy self, @è‡
 Open-source repo: https://github.com/wjc1207/DST-Hierarchical-Agent
 ]]
 author = "Retard Wang"
-version = "0.11.0"
+version = "0.11.1"
 forumthread = ""
 
 icon_atlas = "modicon.xml"

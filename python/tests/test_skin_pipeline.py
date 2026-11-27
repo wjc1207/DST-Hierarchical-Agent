@@ -145,7 +145,7 @@ class SkinPipelineCodecTests(unittest.TestCase):
         self.assertEqual(skin_pipeline.DEFAULT_FACE_MAP[22], 20)
         self.assertEqual(skin_pipeline.DEFAULT_FACE_MAP[30], 28)
         face_frames = {f["framenum"]: f for f in parsed["symbols"]["face"]}
-        for src_idx, dst_idx in ((0, 1), (28, 30), (25, 32)):
+        for src_idx, dst_idx in ((0, 1), (28, 30)):
             for attr in ("cx", "cy", "w", "h"):
                 self.assertAlmostEqual(
                     face_frames[dst_idx][attr],
@@ -161,11 +161,49 @@ class SkinPipelineCodecTests(unittest.TestCase):
         self.assertLess(abs(face_frames[20]["w"] - face_frames[22]["w"]), 0.20)
         self.assertGreater(face_frames[20]["h"], face_frames[22]["h"])
         top_25 = face_frames[25]["cy"] - face_frames[25]["h"] * 0.5
-        for grp_idx in (26, 27):
+        for grp_idx in (26,):
             top_g = face_frames[grp_idx]["cy"] - face_frames[grp_idx]["h"] * 0.5
             self.assertLess(abs(face_frames[grp_idx]["cx"] - face_frames[25]["cx"]), 0.15)
             self.assertLess(abs(top_g - top_25), 0.15)
             self.assertLess(abs(face_frames[grp_idx]["w"] - face_frames[25]["w"]), 0.20)
+
+        def atlas_rect(sym: str, fnum: int) -> tuple[int, int, int, int]:
+            for fr in parsed["symbols"][sym]:
+                if int(fr["framenum"]) == fnum:
+                    quad = parsed["verts"][fr["vstart"]:fr["vstart"] + 6]
+                    us = [round(v[3] * atlas.width) for v in quad]
+                    vs = [round((1.0 - v[4]) * atlas.height) for v in quad]
+                    return (min(us), min(vs), max(us), max(vs))
+            raise AssertionError(f"Missing {sym}:{fnum}")
+
+        # 5 identical limb/hand reuse pairs share identical atlas tile rects
+        self.assertEqual(atlas_rect("arm_lower", 6), atlas_rect("arm_lower", 2))
+        self.assertEqual(atlas_rect("hand", 14), atlas_rect("hand", 4))
+        self.assertEqual(atlas_rect("hand", 16), atlas_rect("hand", 8))
+        self.assertEqual(atlas_rect("hand", 17), atlas_rect("hand", 13))
+        self.assertEqual(atlas_rect("leg", 5), atlas_rect("leg", 2))
+
+        # tail:6 X-ray matches tail:0 world dimensions
+        tail_frames = {f["framenum"]: f for f in parsed["symbols"]["tail"]}
+        self.assertLess(abs(tail_frames[6]["w"] - tail_frames[0]["w"]), 0.5)
+        self.assertLess(abs(tail_frames[6]["h"] - tail_frames[0]["h"]), 0.5)
+
+        # face:0 front-expression group (9, 10, 16, 24, 28, 30) matches face:0 top/center/width
+        top_0 = face_frames[0]["cy"] - face_frames[0]["h"] * 0.5
+        for grp_idx in (9, 10, 16, 24, 28, 30):
+            top_g = face_frames[grp_idx]["cy"] - face_frames[grp_idx]["h"] * 0.5
+            self.assertLess(abs(face_frames[grp_idx]["cx"] - face_frames[0]["cx"]), 0.25)
+            self.assertLess(abs(top_g - top_0), 0.25)
+            self.assertLess(abs(face_frames[grp_idx]["w"] - face_frames[0]["w"]), 0.25)
+
+        # face:32 shares atlas tile rect with face:25 while using Layer 66 offset
+        self.assertEqual(atlas_rect("face", 32), atlas_rect("face", 25))
+
+        # face:29 (Layer 66 emoteXL_sad) keeps face:25 width while aligning vertically near face:0
+        top_29 = face_frames[29]["cy"] - face_frames[29]["h"] * 0.5
+        self.assertLess(abs(face_frames[29]["w"] - face_frames[25]["w"]), 0.25)
+        self.assertLess(abs(face_frames[29]["cx"] - face_frames[0]["cx"]), 0.25)
+        self.assertLess(abs(top_29 - top_0), 2.0)
 
     def test_remove_green_screen_despills_2px_dark_green_fringe(self) -> None:
         img = Image.new("RGBA", (24, 24), (0, 255, 0, 255))

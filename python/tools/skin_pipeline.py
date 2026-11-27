@@ -50,6 +50,15 @@ DEFAULT_FACE_MAP: dict[int, int] = {
     25: 25, 26: 25, 27: 25, 28: 0, 29: 25, 30: 28, 31: 13, 32: 25,
 }
 
+# Identical vanilla sprite pairs that should share a single atlas tile & geometry
+PIXEL_REUSE_MAP: dict[tuple[str, int], tuple[str, int]] = {
+    ("arm_lower", 6): ("arm_lower", 2),
+    ("hand", 14): ("hand", 4),
+    ("hand", 16): ("hand", 8),
+    ("hand", 17): ("hand", 13),
+    ("leg", 5): ("leg", 2),
+}
+
 # DeepSeek skin palette target (warm fair skin matching assets/deepseek-1.png)
 TARGET_SKIN_RGB = (247, 221, 208)
 
@@ -1230,6 +1239,26 @@ def pack_skin(
     # 1. Core AI-generated symbols
     for sym in ("headbase", "headbase_hat", "hairpigtails", "torso", "torso_pelvis", "skirt", "arm_upper", "arm_lower", "leg", "foot", "cheeks"):
         for idx, orig in enumerate(manifest_symbols[sym]):
+            if (sym, idx) in PIXEL_REUSE_MAP:
+                src_sym, src_idx = PIXEL_REUSE_MAP[(sym, idx)]
+                src_frame = build_symbols[src_sym][src_idx]
+                src_img = preview_sprites[(src_sym, src_idx)]
+                dx_off, dy_off, extra_scale = (
+                    _parse_offset_entry(extra_offsets[f"{sym}:{idx}"])
+                    if f"{sym}:{idx}" in extra_offsets
+                    else (0.0, 0.0, 1.0)
+                )
+                add_frame(
+                    sym,
+                    idx,
+                    f"{src_sym}:{src_idx}",
+                    src_img,
+                    src_frame["cx"] + dx_off,
+                    src_frame["cy"] + dy_off,
+                    src_frame["w"] * extra_scale,
+                    src_frame["h"] * extra_scale,
+                )
+                continue
             if sym == "headbase_hat" and (sym, idx) not in sliced_clean:
                 # Derive headbase_hat directly from headbase by cropping the top headband/ahoge region
                 base_frame = build_symbols["headbase"][idx]
@@ -1399,6 +1428,26 @@ def pack_skin(
     # 4. Hand & arm_upper_skin: prefer AI-generated rework cells when provided, else recolor vanilla
     for skin_sym in ("hand", "arm_upper_skin"):
         for idx, orig in enumerate(manifest_symbols[skin_sym]):
+            if (skin_sym, idx) in PIXEL_REUSE_MAP:
+                src_sym, src_idx = PIXEL_REUSE_MAP[(skin_sym, idx)]
+                src_frame = build_symbols[src_sym][src_idx]
+                src_img = preview_sprites[(src_sym, src_idx)]
+                dx_off, dy_off, extra_scale = (
+                    _parse_offset_entry(extra_offsets[f"{skin_sym}:{idx}"])
+                    if f"{skin_sym}:{idx}" in extra_offsets
+                    else (0.0, 0.0, 1.0)
+                )
+                add_frame(
+                    skin_sym,
+                    idx,
+                    f"{src_sym}:{src_idx}",
+                    src_img,
+                    src_frame["cx"] + dx_off,
+                    src_frame["cy"] + dy_off,
+                    src_frame["w"] * extra_scale,
+                    src_frame["h"] * extra_scale,
+                )
+                continue
             if (skin_sym, idx) in sliced_clean:
                 clean_cell, cell_meta = sliced_clean[(skin_sym, idx)]
                 off = _parse_offset_entry(
